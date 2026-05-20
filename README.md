@@ -15,6 +15,7 @@ This project is built for local incident response and home-network forensics. It
 - Provides backend full-text search across logs, hosts, WiFi records, entities, and timeline rows.
 - Shows an analyst dashboard with stored-evidence review, explicit acquisition runs, sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, and raw evidence drawers.
 - Exports raw artifacts and a forensic acquisition package for offline review.
+- Imports previously exported forensic packages as separate analysis profiles, so analysts can switch between multiple FRITZ!Boxes without merging evidence into one dataset.
 - Preserves evidence confidence labels so exact log entries are not confused with inferred observations.
 
 ## Forensic Scope
@@ -52,6 +53,8 @@ fritzbox-forensics-dashboard --host 127.0.0.1 --port 8765
 Open `http://127.0.0.1:8765`.
 
 The UI only requires the FRITZ!Box IP address and admin password. It auto-detects the remaining connection settings where possible.
+
+Use **Forensic Package** to export a full analysis package. Use **Import Package** to load that ZIP later as a separate profile, then switch between profiles from the router/profile selector in the header.
 
 ## CLI Export
 

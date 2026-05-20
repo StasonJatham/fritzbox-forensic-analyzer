@@ -1,5 +1,7 @@
 const state = {
   latest: null,
+  profiles: [],
+  profile: "local",
   data: null,
   analysis: null,
   view: "timeline",
@@ -75,7 +77,7 @@ function isExact(value) {
 
 async function loadStored({ quiet = false } = {}) {
   if (!quiet) $("status").textContent = "Loading stored evidence...";
-  const response = await fetch("/api/latest");
+  const response = await fetch(`/api/latest?profile=${encodeURIComponent(state.profile)}`);
   if (!response.ok) {
     $("status").textContent = await readError(response);
     return;
@@ -90,6 +92,8 @@ async function loadStored({ quiet = false } = {}) {
 }
 
 async function runAcquisition() {
+  state.profile = "local";
+  $("profile").value = "local";
   $("status").textContent = "Running FRITZ!Box acquisition...";
   const hours = $("hours").value;
   const response = await fetch(`/api/export?hours=${encodeURIComponent(hours)}&include_disconnects=true`);
@@ -100,7 +104,44 @@ async function runAcquisition() {
   state.data = await response.json();
   $("subtitle").textContent = `${display(state.data.router?.address, "FRITZ!Box")} - acquired ${formatTime(state.data.generated_at)}`;
   await loadStored({ quiet: true });
+  await loadProfiles();
   $("status").textContent = "Acquisition complete. Stored evidence reloaded.";
+}
+
+async function loadProfiles(selected = state.profile) {
+  const response = await fetch("/api/profiles");
+  if (!response.ok) return;
+  const payload = await response.json();
+  state.profiles = payload.profiles || [];
+  $("profile").innerHTML = state.profiles.map((profile) => `
+    <option value="${escapeHtml(profile.id)}">${escapeHtml(profile.label || profile.id)}</option>
+  `).join("");
+  if (state.profiles.some((profile) => profile.id === selected)) {
+    state.profile = selected;
+  } else {
+    state.profile = "local";
+  }
+  $("profile").value = state.profile;
+}
+
+async function importPackage(file) {
+  if (!file) return;
+  $("status").textContent = `Importing ${file.name}...`;
+  const response = await fetch(`/api/import/package?filename=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/zip" },
+    body: await file.arrayBuffer()
+  });
+  $("import-file").value = "";
+  if (!response.ok) {
+    $("status").textContent = await readError(response);
+    return;
+  }
+  const payload = await response.json();
+  const imported = payload.profile || {};
+  await loadProfiles(imported.id || "local");
+  await loadStored({ quiet: true });
+  $("status").textContent = `Imported ${imported.label || imported.id || "package"}.`;
 }
 
 async function loadSettings() {
@@ -182,7 +223,7 @@ function renderAcquisitionStatus() {
 }
 
 async function loadAnalysis() {
-  const params = new URLSearchParams({ start: state.rangeStart, end: state.rangeEnd });
+  const params = new URLSearchParams({ start: state.rangeStart, end: state.rangeEnd, profile: state.profile });
   const response = await fetch(`/api/analysis?${params.toString()}`);
   if (!response.ok) return;
   state.analysis = await response.json();
@@ -190,7 +231,7 @@ async function loadAnalysis() {
 }
 
 async function loadEntities() {
-  const params = new URLSearchParams({ q: state.query, limit: "40" });
+  const params = new URLSearchParams({ q: state.query, limit: "40", profile: state.profile });
   const response = await fetch(`/api/entities?${params.toString()}`);
   if (!response.ok) return;
   const payload = await response.json();
@@ -205,6 +246,7 @@ async function loadSideTimeline() {
     end: state.rangeEnd,
     evidence_level: state.evidenceLevel,
     time_type: state.timeType,
+    profile: state.profile,
     limit: "8",
     offset: "0"
   });
@@ -235,7 +277,8 @@ async function loadRows(reset = false) {
     limit: String(state.limit),
     offset: String(state.offset),
     sort_by: state.sortBy,
-    sort_dir: state.sortDir
+    sort_dir: state.sortDir,
+    profile: state.profile
   });
   let endpoint = "/api/search";
   if (state.view === "timeline") {
@@ -425,7 +468,9 @@ function defaultSortForView(view) {
 
 async function openEvidence(type, id) {
   if (!type || !id) return;
-  const response = await fetch(`/api/evidence?record_type=${encodeURIComponent(type)}&record_id=${encodeURIComponent(id)}`);
+  const response = await fetch(
+    `/api/evidence?record_type=${encodeURIComponent(type)}&record_id=${encodeURIComponent(id)}&profile=${encodeURIComponent(state.profile)}`
+  );
   if (!response.ok) return;
   const payload = await response.json();
   $("drawer-body").innerHTML = `
@@ -442,7 +487,7 @@ async function openEvidence(type, id) {
 
 async function openEntity(value) {
   if (!value) return;
-  const response = await fetch(`/api/entity?value=${encodeURIComponent(value)}`);
+  const response = await fetch(`/api/entity?value=${encodeURIComponent(value)}&profile=${encodeURIComponent(state.profile)}`);
   if (!response.ok) return;
   const payload = await response.json();
   $("drawer-body").innerHTML = `
@@ -562,11 +607,19 @@ $("apply-range").addEventListener("click", async () => {
 
 $("refresh").addEventListener("click", () => loadStored());
 $("run-acquisition").addEventListener("click", runAcquisition);
+$("profile").addEventListener("change", async (event) => {
+  state.profile = event.target.value || "local";
+  await loadStored();
+});
+$("import-package").addEventListener("click", () => $("import-file").click());
+$("import-file").addEventListener("change", (event) => {
+  importPackage(event.target.files?.[0]);
+});
 $("download-raw").addEventListener("click", () => {
-  window.location.href = "/api/raw-artifacts/download";
+  window.location.href = `/api/raw-artifacts/download?profile=${encodeURIComponent(state.profile)}`;
 });
 $("download-package").addEventListener("click", () => {
-  window.location.href = "/api/acquisition-package/download";
+  window.location.href = `/api/acquisition-package/download?profile=${encodeURIComponent(state.profile)}`;
 });
 $("save-settings").addEventListener("click", saveSettings);
 $("toggle-poll").addEventListener("click", togglePolling);
@@ -599,4 +652,7 @@ $("drawer-body").addEventListener("click", (event) => {
 $("drawer-close").addEventListener("click", () => $("drawer").classList.remove("open"));
 $("drawer-close-backdrop").addEventListener("click", () => $("drawer").classList.remove("open"));
 $("category").disabled = false;
-loadSettings().then(() => loadStored());
+loadSettings().then(async () => {
+  await loadProfiles();
+  await loadStored();
+});

@@ -21,6 +21,9 @@
       </div>
       <div class="controls">
         <input class="search" id="search" placeholder="Search evidence, host, MAC, IP">
+        <select id="profile">
+          <option value="local">Local workspace</option>
+        </select>
         <select id="category">
           <option value="all">All categories</option>
           <option value="wifi">WiFi</option>
@@ -42,6 +45,8 @@
           <option value="mesh_last_observed">Mesh observed</option>
         </select>
         <button id="refresh">Load Stored</button>
+        <button id="import-package" type="button">Import Package</button>
+        <input id="import-file" class="hidden-file" type="file" accept=".zip,application/zip">
         <button id="download-raw">Download Raw</button>
         <button id="download-package">Forensic Package</button>
       </div>

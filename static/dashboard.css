@@ -178,6 +178,10 @@
 
     .search { min-width: min(320px, 60vw); }
 
+    .hidden-file {
+      display: none;
+    }
+
     button {
       padding: 0 14px;
       background: var(--surface-1);

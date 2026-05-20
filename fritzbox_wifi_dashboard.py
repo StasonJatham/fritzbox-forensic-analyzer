@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import io
 import json
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -27,11 +29,12 @@ from fritzbox_log_store import (
     evidence_for_record,
     get_settings,
     ingest_dataset,
+    init_db,
+    latest_snapshot,
     query_entities,
     query_records,
     query_timeline,
     save_settings,
-    latest_snapshot,
 )
 
 
@@ -40,6 +43,100 @@ def load_app_html() -> str:
         if path.exists():
             return path.read_text(encoding="utf-8")
     raise RuntimeError("static/dashboard.html was not found")
+
+
+PROFILE_LOCAL = "local"
+
+
+def profile_dir() -> Path:
+    root = DEFAULT_DB.parent if DEFAULT_DB.parent != Path("") else Path(".")
+    path = root / "imports"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_profile_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._").lower()
+    return cleaned or "imported-fritzbox"
+
+
+def db_for_profile(profile: str = PROFILE_LOCAL) -> Path:
+    profile = safe_profile_id(profile or PROFILE_LOCAL)
+    if profile == PROFILE_LOCAL:
+        return DEFAULT_DB
+    path = profile_dir() / f"{profile}.sqlite3"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Analysis profile not found: {profile}")
+    return path
+
+
+def profile_summary(profile: str, path: Path, label: str | None = None) -> dict[str, Any]:
+    snapshot = latest_snapshot(path)
+    run = snapshot.get("latest_run") or {}
+    router = run.get("router_address") or "unknown"
+    return {
+        "id": profile,
+        "label": label or (f"{router} ({profile})" if profile != PROFILE_LOCAL else f"Local workspace ({router})"),
+        "router_address": router,
+        "has_data": snapshot.get("has_data", False),
+        "latest_run": run.get("generated_at"),
+        "counts": snapshot.get("counts") or {},
+    }
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    profiles = [profile_summary(PROFILE_LOCAL, DEFAULT_DB, "Local workspace")]
+    for path in sorted(profile_dir().glob("*.sqlite3")):
+        profile = safe_profile_id(path.stem)
+        try:
+            profiles.append(profile_summary(profile, path))
+        except sqlite3.DatabaseError:
+            profiles.append(
+                {
+                    "id": profile,
+                    "label": f"{profile} (unreadable)",
+                    "router_address": "unknown",
+                    "has_data": False,
+                    "latest_run": "",
+                    "counts": {},
+                }
+            )
+    return profiles
+
+
+def import_acquisition_package_bytes(payload: bytes, filename: str = "import.zip") -> dict[str, Any]:
+    if not payload:
+        raise HTTPException(status_code=400, detail="Import file is empty.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            db_members = [name for name in archive.namelist() if name == "database/fritzbox-analysis.sqlite3"]
+            if not db_members:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported import. Upload a FRITZ!Box forensic package ZIP exported by this tool.",
+                )
+            with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as tmp:
+                tmp.write(archive.read(db_members[0]))
+                temp_path = Path(tmp.name)
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Import file is not a valid ZIP package.") from exc
+
+    try:
+        init_db(temp_path).close()
+        snapshot = latest_snapshot(temp_path)
+        run = snapshot.get("latest_run") or {}
+        router = safe_profile_id(str(run.get("router_address") or Path(filename).stem or "imported-fritzbox"))
+        generated = safe_profile_id(str(run.get("generated_at") or datetime.now().astimezone().isoformat()))
+        digest = hashlib.sha256(payload).hexdigest()[:10]
+        profile = safe_profile_id(f"{router}-{generated}-{digest}")
+        target = profile_dir() / f"{profile}.sqlite3"
+        shutil.copyfile(temp_path, target)
+        summary = profile_summary(profile, target)
+        return {"imported": True, "profile": summary}
+    except sqlite3.DatabaseError as exc:
+        raise HTTPException(status_code=400, detail="Import package database is unreadable.") from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 class Poller:
@@ -118,8 +215,8 @@ def json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
 
-def build_raw_artifacts_zip() -> bytes:
-    conn = sqlite3.connect(DEFAULT_DB)
+def build_raw_artifacts_zip(path: Path = DEFAULT_DB) -> bytes:
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     rows = [
         dict(row)
@@ -159,8 +256,8 @@ def build_raw_artifacts_zip() -> bytes:
     return buffer.getvalue()
 
 
-def build_forensic_acquisition_zip() -> bytes:
-    conn = sqlite3.connect(DEFAULT_DB)
+def build_forensic_acquisition_zip(path: Path = DEFAULT_DB) -> bytes:
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     tables = {
         "export_runs": "SELECT * FROM export_runs ORDER BY id",
@@ -194,7 +291,7 @@ def build_forensic_acquisition_zip() -> bytes:
             created = safe_artifact_name(str(row["created_at"] or "unknown")).replace("T", "_")
             filename = f"raw_artifacts/run-{row['run_id']}/{row['id']:06d}_{created}_{artifact_name}{extension}"
             archive.writestr(filename, str(row["content"] or ""))
-        archive.writestr("database/fritzbox-analysis.sqlite3", sqlite_backup_bytes(DEFAULT_DB))
+        archive.writestr("database/fritzbox-analysis.sqlite3", sqlite_backup_bytes(path))
     return buffer.getvalue()
 
 
@@ -307,8 +404,17 @@ def create_app() -> FastAPI:
         return load_app_html()
 
     @app.get("/api/latest")
-    def api_latest() -> JSONResponse:
-        return JSONResponse(json_safe(latest_snapshot(DEFAULT_DB)))
+    def api_latest(profile: str = PROFILE_LOCAL) -> JSONResponse:
+        return JSONResponse(json_safe(latest_snapshot(db_for_profile(profile))))
+
+    @app.get("/api/profiles")
+    def api_profiles() -> JSONResponse:
+        return JSONResponse(json_safe({"profiles": list_profiles()}))
+
+    @app.post("/api/import/package")
+    async def api_import_package(request: Request, filename: str = "import.zip") -> JSONResponse:
+        payload = await request.body()
+        return JSONResponse(json_safe(import_acquisition_package_bytes(payload, filename)))
 
     @app.get("/api/export")
     def api_export(
@@ -325,8 +431,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"FRITZ!Box export failed: {type(exc).__name__}: {exc}") from exc
 
     @app.get("/api/raw-artifacts/download")
-    def api_download_raw_artifacts() -> Response:
-        payload = build_raw_artifacts_zip()
+    def api_download_raw_artifacts(profile: str = PROFILE_LOCAL) -> Response:
+        payload = build_raw_artifacts_zip(db_for_profile(profile))
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
         return Response(
             payload,
@@ -335,8 +441,8 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/acquisition-package/download")
-    def api_download_acquisition_package() -> Response:
-        payload = build_forensic_acquisition_zip()
+    def api_download_acquisition_package(profile: str = PROFILE_LOCAL) -> Response:
+        payload = build_forensic_acquisition_zip(db_for_profile(profile))
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
         return Response(
             payload,
@@ -355,11 +461,12 @@ def create_app() -> FastAPI:
         sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
         evidence_level: str = Query(default="all"),
         time_type: str = Query(default="all"),
+        profile: str = PROFILE_LOCAL,
     ) -> JSONResponse:
         return JSONResponse(
             json_safe(
                 query_records(
-                    DEFAULT_DB,
+                    db_for_profile(profile),
                     q,
                     view,
                     limit,
@@ -383,29 +490,37 @@ def create_app() -> FastAPI:
         offset: int = Query(default=0, ge=0),
         evidence_level: str = Query(default="all"),
         time_type: str = Query(default="all"),
+        profile: str = PROFILE_LOCAL,
     ) -> JSONResponse:
         return JSONResponse(
-            json_safe(query_timeline(DEFAULT_DB, q, category, start, end, limit, offset, evidence_level, time_type))
+            json_safe(
+                query_timeline(db_for_profile(profile), q, category, start, end, limit, offset, evidence_level, time_type)
+            )
         )
 
     @app.get("/api/analysis")
-    def api_analysis(start: str = "", end: str = "") -> JSONResponse:
-        return JSONResponse(json_safe(analysis_snapshot(DEFAULT_DB, start, end)))
+    def api_analysis(start: str = "", end: str = "", profile: str = PROFILE_LOCAL) -> JSONResponse:
+        return JSONResponse(json_safe(analysis_snapshot(db_for_profile(profile), start, end)))
 
     @app.get("/api/entities")
-    def api_entities(q: str = "", limit: int = Query(default=100, ge=1, le=500)) -> JSONResponse:
-        return JSONResponse(json_safe(query_entities(DEFAULT_DB, q, limit)))
+    def api_entities(
+        q: str = "",
+        limit: int = Query(default=100, ge=1, le=500),
+        profile: str = PROFILE_LOCAL,
+    ) -> JSONResponse:
+        return JSONResponse(json_safe(query_entities(db_for_profile(profile), q, limit)))
 
     @app.get("/api/entity")
-    def api_entity(value: str = "") -> JSONResponse:
-        return JSONResponse(json_safe(entity_pivot(DEFAULT_DB, value)))
+    def api_entity(value: str = "", profile: str = PROFILE_LOCAL) -> JSONResponse:
+        return JSONResponse(json_safe(entity_pivot(db_for_profile(profile), value)))
 
     @app.get("/api/evidence")
     def api_evidence(
         record_type: str = Query(default=""),
         record_id: int = Query(default=0, ge=0),
+        profile: str = PROFILE_LOCAL,
     ) -> JSONResponse:
-        return JSONResponse(json_safe(evidence_for_record(DEFAULT_DB, record_type, record_id)))
+        return JSONResponse(json_safe(evidence_for_record(db_for_profile(profile), record_type, record_id)))
 
     @app.get("/api/polling")
     def api_get_polling() -> JSONResponse:

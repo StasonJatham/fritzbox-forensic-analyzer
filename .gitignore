@@ -17,6 +17,7 @@ fritzbox-analysis.sqlite3-*
 fritzbox_raw_exports/
 raw_artifacts/
 exports/
+imports/
 fritzbox-export*.json
 fritzbox-wifi-history*.json
 forensic-package*.zip

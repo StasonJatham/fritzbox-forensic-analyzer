@@ -2,7 +2,7 @@
 
 ## Sensitive Data
 
-This tool is designed to collect router logs, device identifiers, hostnames, IP addresses, MAC addresses, and local credential settings. Treat every SQLite database, raw artifact archive, CSV export, JSON export, and forensic package as sensitive evidence.
+This tool is designed to collect router logs, device identifiers, hostnames, IP addresses, MAC addresses, and local credential settings. Treat every SQLite database, imported profile, raw artifact archive, CSV export, JSON export, and forensic package as sensitive evidence.
 
 Do not attach real FRITZ!Box exports, screenshots, databases, forensic packages, credentials, public IP addresses, MAC addresses, hostnames, or home-network diagrams to public issues.
 
