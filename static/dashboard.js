@@ -37,6 +37,29 @@ function display(value, fallback = "-") {
     : rendered;
 }
 
+function evidenceLabel(value) {
+  const labels = {
+    parsed_from_raw: "parsed raw",
+    enriched_from_current_host_table: "host context",
+    inferred: "inferred",
+    exact_wifi_connection: "exact WiFi log",
+    retained_log_match: "router log match",
+    wifi_event: "WiFi log",
+    mesh_last_observed: "mesh observed",
+    active_host_snapshot: "active at fetch",
+    fritzbox_landevice_lastused: "FRITZ!Box last used",
+    landevice_query_json: "LAN device state",
+    device_log_xml: "device log",
+    host_list_xml: "host list",
+    mesh_list: "mesh list",
+    wlan_device_list_xml: "WLAN device list",
+    high: "high",
+    medium: "medium",
+    low: "low"
+  };
+  return labels[value] || display(value);
+}
+
 function cleanRecord(value) {
   if (Array.isArray(value)) return value.map(cleanRecord);
   if (value && typeof value === "object") {
@@ -214,7 +237,10 @@ function currentSummary() {
     event_log_entries: counts.event_log || 0,
     known_hosts: counts.hosts || 0,
     active_hosts: counts.active_hosts || 0,
+    hosts_with_last_connected: counts.hosts_with_last_connected || 0,
+    hosts_with_first_seen: counts.hosts_with_first_seen || 0,
     last_wifi_connection: state.latest?.last_exact_wifi || "",
+    last_device_connected: state.latest?.last_device_connected || state.latest?.last_exact_wifi || "",
     oldest_event: retained.oldest_event || "",
     newest_event: retained.newest_event || ""
   };
@@ -226,10 +252,11 @@ function setMetrics() {
   $("m-log").textContent = summary.event_log_entries ?? 0;
   $("m-hosts").textContent = summary.known_hosts ?? 0;
   $("m-active").textContent = summary.active_hosts ?? 0;
-  $("m-last").textContent = summary.last_wifi_connection ? formatTime(summary.last_wifi_connection) : "None retained";
+  $("m-last").textContent = summary.last_device_connected ? formatTime(summary.last_device_connected) : "None retained";
   const oldest = summary.oldest_event ? formatTime(summary.oldest_event) : "unknown";
   const newest = summary.newest_event ? formatTime(summary.newest_event) : "unknown";
-  $("forensic-notice").innerHTML = `<strong>Evidence model:</strong> retained log window ${escapeHtml(oldest)} to ${escapeHtml(newest)}. Rows marked <strong>parsed_from_raw</strong> come from retained FRITZ!Box logs; <strong>inferred</strong> mesh rows are context, not exact WiFi join times. Absence of a row is not proof an event did not happen.`;
+  const warnings = state.latest?.source_coverage?.warnings || [];
+  $("forensic-notice").innerHTML = `<strong>Evidence model:</strong> retained log window ${escapeHtml(oldest)} to ${escapeHtml(newest)}. <strong>Last device use</strong> comes from FRITZ!Box device state when available; it is not a full session log. Absence of a row is not proof an event did not happen.${warnings.length ? ` <strong>Coverage:</strong> ${escapeHtml(warnings[0])}` : ""}`;
 }
 
 function renderAcquisitionStatus() {
@@ -242,11 +269,16 @@ function renderAcquisitionStatus() {
   const windowText = retained.oldest_event || retained.newest_event
     ? `${formatTime(retained.oldest_event)} to ${formatTime(retained.newest_event)}`
     : "No retained log window";
+  const coverage = latest.source_coverage || {};
+  const missing = coverage.missing_raw_artifacts || [];
+  const coverageText = missing.length ? `missing ${missing.map(evidenceLabel).join(", ")}` : "all expected raw sources";
   $("acquisition-status").innerHTML = `
     <span>Latest run<strong>${escapeHtml(generated)}</strong></span>
     <span>Router<strong>${escapeHtml(router)}</strong></span>
     <span>Retained window<strong>${escapeHtml(windowText)}</strong></span>
     <span>Stored records<strong>${escapeHtml((counts.event_log || 0) + " logs / " + (counts.wifi_connections || 0) + " wifi / " + (counts.hosts || 0) + " hosts")}</strong></span>
+    <span>Device timestamps<strong>${escapeHtml((counts.hosts_with_last_connected || 0) + " last-used / " + (counts.hosts_with_first_seen || 0) + " first-seen")}</strong></span>
+    <span>Source coverage<strong>${escapeHtml(coverageText)}</strong></span>
   `;
   $("subtitle").textContent = latest.has_data ? `Stored evidence from ${display(router, "FRITZ!Box")}` : "No stored evidence yet";
 }
@@ -465,7 +497,7 @@ function ensureScrollable() {
 }
 
 function pill(label, cls) {
-  return `<span class="pill ${escapeHtml(cssToken(cls || label))}">${escapeHtml(display(label, "unknown"))}</span>`;
+  return `<span class="pill ${escapeHtml(cssToken(cls || label))}">${escapeHtml(evidenceLabel(display(label, "unknown")))}</span>`;
 }
 
 function confidenceBadge(row) {
@@ -504,7 +536,7 @@ function table(headers, rows, sourceRows = []) {
 }
 
 function defaultSortForView(view) {
-  if (view === "hosts") return "last_seen";
+  if (view === "hosts") return "last_activity";
   if (view === "log") return "timestamp";
   if (view === "timeline") return "timestamp";
   if (view === "entities") return "last_seen";

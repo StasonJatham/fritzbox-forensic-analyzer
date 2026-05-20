@@ -10,12 +10,12 @@ This project is built for local incident response and home-network forensics. It
 
 ## What It Does
 
-- Pulls retained FRITZ!Box logs and current router state through FRITZ!Box APIs.
+- Pulls retained FRITZ!Box logs, host tables, mesh state, WLAN association snapshots, and FRITZ!Box web UI LAN-device state when available.
 - Stores raw artifacts, parsed events, host records, WiFi observations, and run metadata in SQLite.
 - Provides backend full-text search across logs, hosts, WiFi records, entities, and timeline rows.
 - Shows an analyst dashboard with stored-evidence review, explicit acquisition runs, sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, and raw evidence drawers.
 - Exports raw artifacts and a forensic acquisition package for offline review.
-- Imports previously exported forensic packages as separate analysis profiles, so analysts can switch between multiple FRITZ!Boxes without merging evidence into one dataset.
+- Imports previously exported forensic packages or JSON datasets as separate analysis profiles, so analysts can switch between multiple FRITZ!Boxes without merging evidence into one dataset.
 - Preserves evidence confidence labels so exact log entries are not confused with inferred observations.
 
 ## Forensic Scope
@@ -33,6 +33,8 @@ The analyzer is useful for FRITZ!Box forensic triage when the router is the only
 A FRITZ!Box does not always retain exact WiFi association and disassociation rows for every client. If the raw retained log does not contain an exact connection row, this tool cannot prove an exact WiFi join or disconnect time.
 
 Low-confidence rows such as `mesh_last_observed` are contextual observations, not proof of a precise connection timestamp. Absence from the retained log is not proof that an event did not happen. Packet-level broadcast traffic attribution is outside the scope of FRITZ!Box API export data.
+
+FRITZ!Box web UI device-state values such as `firstused` and `lastused` can provide valuable "first seen" and "last connected/used" timestamps. These values are retained router state, not a complete per-session connection log. The dashboard shows source coverage so analysts can see whether that internal LAN-device artifact was collected for a run.
 
 ## Quick Start
 
@@ -54,7 +56,7 @@ Open `http://127.0.0.1:8765`.
 
 The UI only requires the FRITZ!Box IP address and admin password. It auto-detects the remaining connection settings where possible.
 
-Use **Forensic Package** to export a full analysis package. Use **Import Package** to load that ZIP later as a separate profile, then switch between profiles from the router/profile selector in the header.
+Use **Forensic Package** to export a full analysis package. Use **Import Package** to load that ZIP, or a CLI JSON dataset, later as a separate profile, then switch between profiles from the router/profile selector in the header.
 
 ## CLI Export
 

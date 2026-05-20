@@ -461,7 +461,7 @@ def acquisition_metadata(dataset: dict[str, Any], acquired_at: str) -> dict[str,
         "source_endpoints": dataset.get("source_endpoints")
         or {
             "tr064": ["DeviceInfo:GetDeviceLog", "Hosts:GetGenericHostEntry"],
-            "avm_exports": ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml"],
+            "avm_exports": ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml", "landevice_query_json"],
         },
     }
 
@@ -943,11 +943,14 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             ),
             "hosts": int(conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]),
             "active_hosts": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE active_now = 1").fetchone()[0]),
+            "hosts_with_last_connected": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE last_connected IS NOT NULL AND last_connected != ''").fetchone()[0]),
+            "hosts_with_first_seen": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE first_seen IS NOT NULL AND first_seen != ''").fetchone()[0]),
         }
         last_exact_wifi = conn.execute(
             "SELECT MAX(derived_connected_at) FROM wifi_connections WHERE exact_connection_time_available = 1 AND "
             + WIFI_DEDUPE_SQL
         ).fetchone()[0]
+        last_device_connected = conn.execute("SELECT MAX(last_connected) FROM hosts").fetchone()[0]
     else:
         selected_run = conn.execute("SELECT * FROM export_runs WHERE id = ?", [scoped_run_id]).fetchone()
         retained = dict(
@@ -967,6 +970,12 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             "wifi_connections": _run_record_count(conn, scoped_run_id, "wifi_connection", "wifi_connections"),
             "hosts": _run_record_count(conn, scoped_run_id, "host", "hosts"),
             "active_hosts": _run_record_count(conn, scoped_run_id, "host", "hosts", "t.active_now = 1"),
+            "hosts_with_last_connected": _run_record_count(
+                conn, scoped_run_id, "host", "hosts", "t.last_connected IS NOT NULL AND t.last_connected != ''"
+            ),
+            "hosts_with_first_seen": _run_record_count(
+                conn, scoped_run_id, "host", "hosts", "t.first_seen IS NOT NULL AND t.first_seen != ''"
+            ),
         }
         last_exact_wifi = conn.execute(
             """
@@ -980,6 +989,17 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             """,
             [scoped_run_id],
         ).fetchone()[0]
+        last_device_connected = conn.execute(
+            """
+            SELECT MAX(t.last_connected)
+            FROM hosts t
+            WHERE t.id IN (
+                SELECT record_table_id FROM record_observations
+                WHERE run_id = ? AND record_type = 'host' AND record_table_id IS NOT NULL
+            )
+            """,
+            [scoped_run_id],
+        ).fetchone()[0]
     latest = dict(selected_run) if selected_run else None
     if latest:
         for key in (
@@ -990,6 +1010,7 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             "source_endpoints_json",
         ):
             latest[key.removesuffix("_json")] = _decode_json(latest.pop(key, None))
+    source_coverage = acquisition_source_coverage(conn, scoped_run_id)
     conn.close()
     return {
         "has_data": counts["runs"] > 0 or counts["event_log"] > 0 or counts["wifi_connections"] > 0 or counts["hosts"] > 0,
@@ -999,6 +1020,46 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
         "retained": retained,
         "counts": counts,
         "last_exact_wifi": last_exact_wifi,
+        "last_device_connected": last_device_connected,
+        "source_coverage": source_coverage,
+    }
+
+
+def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
+    expected = ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml", "landevice_query_json"]
+    params: list[Any] = []
+    if run_id is None:
+        where = "WHERE record_type = 'raw_artifact'"
+    else:
+        where = "WHERE record_type = 'raw_artifact' AND run_id = ?"
+        params.append(run_id)
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT json_extract(content_json, '$.name') AS name, COUNT(*) AS observations,
+                   MAX(observed_at) AS last_observed
+            FROM record_observations
+            {where}
+            GROUP BY name
+            ORDER BY name
+            """,
+            params,
+        )
+    ]
+    present = {str(row["name"]): row for row in rows if row.get("name")}
+    warnings = []
+    if "landevice_query_json" not in present:
+        warnings.append("FRITZ!Box web UI LAN-device state was not collected; Host Table last-connected values may be unavailable.")
+    if "device_log_xml" not in present:
+        warnings.append("Retained device log XML was not collected; timeline completeness is reduced.")
+    if "host_list_xml" not in present:
+        warnings.append("Host list XML was not collected; device attribution is reduced.")
+    return {
+        "expected_raw_artifacts": expected,
+        "present_raw_artifacts": rows,
+        "missing_raw_artifacts": [name for name in expected if name not in present],
+        "warnings": warnings,
     }
 
 

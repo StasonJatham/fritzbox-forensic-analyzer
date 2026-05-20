@@ -108,6 +108,15 @@ def list_profiles() -> list[dict[str, Any]]:
 def import_acquisition_package_bytes(payload: bytes, filename: str = "import.zip") -> dict[str, Any]:
     if not payload:
         raise HTTPException(status_code=400, detail="Import file is empty.")
+    if filename.lower().endswith(".json") or payload.lstrip().startswith(b"{"):
+        try:
+            dataset = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Import JSON is not a valid FRITZ!Box dataset.") from exc
+        if not isinstance(dataset, dict) or not {"generated_at", "known_hosts", "event_log"}.intersection(dataset):
+            raise HTTPException(status_code=400, detail="Import JSON does not look like a FRITZ!Box acquisition dataset.")
+        return import_dataset_profile(dataset, filename)
+
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             db_members = [name for name in archive.namelist() if name == "database/fritzbox-analysis.sqlite3"]
@@ -136,6 +145,27 @@ def import_acquisition_package_bytes(payload: bytes, filename: str = "import.zip
         return {"imported": True, "profile": summary}
     except sqlite3.DatabaseError as exc:
         raise HTTPException(status_code=400, detail="Import package database is unreadable.") from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def import_dataset_profile(dataset: dict[str, Any], filename: str) -> dict[str, Any]:
+    with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as tmp:
+        temp_path = Path(tmp.name)
+    try:
+        ingest_dataset(dataset, temp_path)
+        snapshot = latest_snapshot(temp_path)
+        run = snapshot.get("latest_run") or {}
+        router = safe_profile_id(str((dataset.get("router") or {}).get("address") or run.get("router_address") or Path(filename).stem))
+        generated = safe_profile_id(str(dataset.get("generated_at") or run.get("generated_at") or datetime.now().astimezone().isoformat()))
+        digest = hashlib.sha256(json.dumps(dataset, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:10]
+        profile = safe_profile_id(f"{router}-{generated}-{digest}")
+        target = profile_dir() / f"{profile}.sqlite3"
+        shutil.copyfile(temp_path, target)
+        summary = profile_summary(profile, target)
+        return {"imported": True, "profile": summary}
+    except sqlite3.DatabaseError as exc:
+        raise HTTPException(status_code=400, detail="Import JSON could not be stored as an analysis profile.") from exc
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -326,6 +356,7 @@ def forensic_manifest(
         "generated_at": generated_at,
         "latest_run": dict(latest_run) if latest_run else None,
         "retained_event_window": dict(retained) if retained else None,
+        "source_coverage": source_coverage_for_package(conn, latest_run),
         "record_counts": {name: len(rows) for name, rows in table_rows.items()},
         "raw_artifacts": raw_manifest,
         "hashes": {
@@ -347,6 +378,13 @@ def forensic_manifest(
             "initial_acquisition_should_be_distinguished_from_monitoring": True,
         },
     }
+
+
+def source_coverage_for_package(conn: sqlite3.Connection, latest_run: sqlite3.Row | None) -> dict[str, Any]:
+    from fritzbox_log_store import acquisition_source_coverage
+
+    run_id = int(latest_run["id"]) if latest_run else None
+    return acquisition_source_coverage(conn, run_id)
 
 
 def sqlite_backup_bytes(path: Path) -> bytes:

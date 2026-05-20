@@ -1,4 +1,5 @@
 import io
+import json
 from pathlib import Path
 import zipfile
 
@@ -45,3 +46,18 @@ def test_import_acquisition_package_creates_switchable_profile(tmp_path: Path, m
     assert imported["profile"]["router_address"] == "192.0.2.1"
     assert any(profile["id"] == imported["profile"]["id"] for profile in profiles)
     assert latest_snapshot(imported_db)["counts"]["event_log"] == 1
+
+
+def test_import_json_dataset_creates_switchable_profile(tmp_path: Path, monkeypatch) -> None:
+    target_db = tmp_path / "target.sqlite3"
+    payload = json.dumps(sample_dataset("192.0.2.55")).encode("utf-8")
+
+    monkeypatch.setattr(dashboard, "DEFAULT_DB", target_db)
+    imported = dashboard.import_acquisition_package_bytes(payload, "router-two.json")
+    imported_db = dashboard.db_for_profile(imported["profile"]["id"])
+    snapshot = latest_snapshot(imported_db)
+
+    assert imported["imported"] is True
+    assert imported["profile"]["router_address"] == "192.0.2.55"
+    assert snapshot["counts"]["event_log"] == 1
+    assert snapshot["source_coverage"]["missing_raw_artifacts"]

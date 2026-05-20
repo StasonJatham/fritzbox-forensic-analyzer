@@ -48,8 +48,8 @@
           <option value="mesh_last_observed">Mesh observed</option>
         </select>
         <button id="refresh">Load Stored</button>
-        <button id="import-package" type="button">Import Package</button>
-        <input id="import-file" class="hidden-file" type="file" accept=".zip,application/zip">
+        <button id="import-package" type="button">Import ZIP/JSON</button>
+        <input id="import-file" class="hidden-file" type="file" accept=".zip,.json,application/zip,application/json">
         <button id="download-raw">Download Raw</button>
         <button id="download-package">Forensic Package</button>
       </div>
@@ -92,11 +92,11 @@
       <button id="toggle-poll">Start Polling</button>
     </section>
     <section class="metrics">
-      <div class="metric"><div class="label">WiFi Observed</div><div class="value" id="m-wifi">0</div><div class="accent"></div></div>
+      <div class="metric"><div class="label">WiFi Rows</div><div class="value" id="m-wifi">0</div><div class="accent"></div></div>
       <div class="metric"><div class="label">Retained Logs</div><div class="value" id="m-log">0</div><div class="accent"></div></div>
       <div class="metric"><div class="label">Known Hosts</div><div class="value" id="m-hosts">0</div><div class="accent"></div></div>
       <div class="metric"><div class="label">Active Hosts</div><div class="value" id="m-active">0</div><div class="accent"></div></div>
-      <div class="metric"><div class="label">Last Exact WiFi</div><div class="value small" id="m-last">None retained</div><div class="accent"></div></div>
+      <div class="metric"><div class="label">Last Device Use</div><div class="value small" id="m-last">None retained</div><div class="accent"></div></div>
     </section>
     <section class="charts">
       <div class="chart-panel">
