@@ -564,7 +564,9 @@ def test_additional_evidence_extracts_from_raw_artifacts(tmp_path: Path) -> None
             "host_filter_profiles": {
                 "ok": True,
                 "response": {"NewProfileList": [{"id": "guest", "name": "Guest", "access_mode": "limited"}]},
-            }
+            },
+            "wan_common_bytes_sent": {"ok": True, "response": {"NewTotalBytesSent": "123456"}},
+            "wan_dsl_stats": {"ok": True, "response": {"NewFECErrors": "7"}},
         },
         "wlan": [
             {
@@ -638,6 +640,22 @@ def test_additional_evidence_extracts_from_raw_artifacts(tmp_path: Path) -> None
             "raw_exports": {
                 "tr064_snapshot_json": json.dumps(tr064_snapshot),
                 "mesh_list": json.dumps(mesh_list),
+                "acquisition_manifest_json": json.dumps(
+                    {
+                        "attempt_count": 2,
+                        "successful_count": 1,
+                        "failed_count": 1,
+                        "attempts": [
+                            {
+                                "artifact": "support_data_txt",
+                                "surface": "support_data",
+                                "ok": False,
+                                "error": "HTTP 403",
+                            },
+                            {"artifact": "tr064_snapshot_json", "surface": "tr064_snapshot", "ok": True},
+                        ],
+                    }
+                ),
             },
             "event_log": [],
             "available_wifi_connections": [],
@@ -661,6 +679,11 @@ def test_additional_evidence_extracts_from_raw_artifacts(tmp_path: Path) -> None
     assert query_records(db, "51820", "wan_port_mappings")["rows"][0]["internal_client"] == "192.0.2.99"
     assert query_records(db, "LabNet", "wlan_radio")["rows"][0]["total_associations"] == "1"
     assert query_records(db, "AA:BB:CC:DD:EE:99", "wlan_association")["total"] == 1
+    assert query_records(db, "NewTotalBytesSent", "network_status")["rows"][0]["unit"] == "bytes"
+    assert query_records(db, "NewFECErrors", "dsl_stats")["rows"][0]["area"] == "dsl"
+    coverage = latest_snapshot(db)["source_coverage"]
+    assert coverage["attempted_artifacts"]["support_data_txt"]["failed"] == 1
+    assert coverage["attempted_artifacts"]["tr064_snapshot_json"]["successful"] == 1
     risk = query_records(db, "UPnP", "device_risk")
     assert risk["total"] == 1
     assert risk["rows"][0]["risk_level"] == "medium"

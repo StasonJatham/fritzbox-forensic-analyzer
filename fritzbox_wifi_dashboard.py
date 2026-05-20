@@ -520,6 +520,7 @@ def create_app() -> FastAPI:
                 "mesh|mesh_links|mesh_topology_links|wan|wan_exposure|port_mappings|wan_port_mappings|"
                 "wlan_radios|wlan_radio|wlan_associations|wlan_association|"
                 "advertisements|advertisement|advertisement_hints|advertising|broadcasts|broadcast_hints|"
+                "network_status|network_counters|network_status_snapshots|wan_stats|dsl_stats|lan_stats|"
                 "device_risks|device_risk|device_risk_summaries)$"
             ),
         ),

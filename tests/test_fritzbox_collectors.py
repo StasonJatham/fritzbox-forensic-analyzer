@@ -3,19 +3,23 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from fritzbox_collectors import (
+    MAX_WEBUI_ARTIFACT_BYTES,
     fetch_aha_artifacts,
     fetch_avm_path,
     fetch_support_data,
+    fetch_webui_readonly_artifacts,
+    fetch_webui_readonly_endpoint,
     is_read_only_action,
     is_support_data_response,
 )
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, content: bytes) -> None:
+    def __init__(self, status_code: int, content: bytes, headers: dict[str, str] | None = None) -> None:
         self.status_code = status_code
         self.content = content
         self.text = content.decode("utf-8", errors="replace")
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -94,6 +98,46 @@ def test_fetch_avm_path_prefers_authenticated_session() -> None:
     assert content == "<root>secret</root>"
     assert session.gets[0]["url"] == "http://192.0.2.1/secure/path.lua"
     assert session.gets[0]["timeout"] == 15
+
+
+def test_fetch_webui_readonly_artifacts_collects_structured_get_results() -> None:
+    session = FakeSession(FakeResponse(200, b"<payload>state</payload>"))
+    fc = SimpleNamespace(http_interface=FakeHttp(session))
+
+    artifacts = fetch_webui_readonly_artifacts(fc)
+
+    assert artifacts["schema_version"] == 1
+    assert artifacts["endpoints"]["juis_boxinfo_xml"]["ok"]
+    assert artifacts["endpoints"]["juis_boxinfo_xml"]["raw"] == "<payload>state</payload>"
+    assert session.gets[0]["url"] == "http://192.0.2.1/juis_boxinfo.xml"
+    assert "sid" not in session.gets[0]["params"]
+    assert session.gets[1]["url"] == "http://192.0.2.1/login_sid.lua"
+    assert session.gets[1]["params"]["sid"] == "0123456789abcdef"
+    assert artifacts["endpoints"]["login_sid_v2"]["params"]["sid"] == "<redacted>"
+
+
+def test_fetch_webui_readonly_artifacts_records_html_as_failure() -> None:
+    response = FakeResponse(200, b"<!doctype html><html>Login</html>", {"content-type": "text/html"})
+    session = FakeSession(response)
+    fc = SimpleNamespace(http_interface=FakeHttp(session))
+
+    artifacts = fetch_webui_readonly_artifacts(fc)
+
+    first = artifacts["endpoints"]["juis_boxinfo_xml"]
+    assert not first["ok"]
+    assert first["error"] == "HTML response instead of raw API payload"
+    assert "raw" not in first
+
+
+def test_fetch_webui_readonly_endpoint_truncates_large_payloads() -> None:
+    session = FakeSession(FakeResponse(200, b"x" * (MAX_WEBUI_ARTIFACT_BYTES + 1)))
+
+    result = fetch_webui_readonly_endpoint(session, "http://192.0.2.1", "/juis_boxinfo.xml", {})
+
+    assert result["ok"]
+    assert result["truncated"]
+    assert result["body_bytes"] == MAX_WEBUI_ARTIFACT_BYTES + 1
+    assert len(result["raw"]) == MAX_WEBUI_ARTIFACT_BYTES
 
 
 def test_fetch_aha_artifacts_collects_switch_stats() -> None:

@@ -52,6 +52,7 @@ function evidenceLabel(value) {
     landevice_query_json: "LAN device state",
     query_lua_artifacts_json: "Web UI query.lua",
     data_lua_pages_json: "Web UI data.lua",
+    webui_readonly_artifacts_json: "Web UI read-only probes",
     device_log_xml: "device log",
     host_list_xml: "host list",
     mesh_list: "mesh list",
@@ -64,12 +65,15 @@ function evidenceLabel(value) {
     aha_switch_list_txt: "AHA switch list",
     aha_device_stats_json: "AHA device stats",
     config_export_file: "config export",
+    support_lua_page_html: "support.lua page",
+    acquisition_manifest_json: "acquisition manifest",
     host_filter_profiles: "host filters",
     mesh_topology_links: "mesh links",
     wan_port_mappings: "WAN exposure",
     wlan_radios: "WLAN radios",
     wlan_associations: "WLAN associations",
     advertisement_hints: "ad/broadcast hints",
+    network_status_snapshots: "network status",
     device_risk_summaries: "device risk",
     UPnP: "UPnP",
     PCP: "PCP",
@@ -459,6 +463,7 @@ function renderSourceCoverage(coverage) {
         ${(row.artifacts || []).map((artifact) => `
           <span class="${artifact.present ? "present" : "missing"}" title="${escapeHtml(formatTime(artifact.last_observed))}">
             ${escapeHtml(evidenceLabel(artifact.name))}
+            ${artifact.attempted && !artifact.present ? ` (${escapeHtml(artifact.failed_attempts || 0)} failed)` : ""}
           </span>
         `).join("")}
       </div>
@@ -730,6 +735,14 @@ function renderTable() {
       rowAction(row), formatTime(row.observed_at), pill(row.protocol, row.protocol), row.hostname,
       row.mac, row.ip, row.direction, confidenceBadge(row), row.source, row.summary
     ]), rows);
+  } else if (state.view === "network_status_snapshots") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Observed", "observed_at"], ["Area", "area"], ["Metric", "metric"],
+      ["Value", "value"], ["Unit", "unit"], ["Confidence", "confidence"], ["Source", "source"]
+    ], rows.map((row) => [
+      rowAction(row), formatTime(row.observed_at), pill(row.area, row.area), row.metric,
+      row.value, row.unit, confidenceBadge(row), row.source
+    ]), rows);
   } else if (state.view === "host_filter_profiles") {
     $("table").innerHTML = table([
       ["Action", ""], ["Profile", "name"], ["ID", "profile_id"], ["Access", "access_mode"],
@@ -853,6 +866,7 @@ function defaultSortForView(view) {
   if (view === "wlan_radios") return "radio_index";
   if (view === "wlan_associations") return "observed_at";
   if (view === "advertisement_hints") return "observed_at";
+  if (view === "network_status_snapshots") return "observed_at";
   if (view === "host_filter_profiles") return "name";
   if (view === "device_risk_summaries") return "risk_score";
   return "derived_connected_at";
@@ -885,6 +899,7 @@ function additionalEvidenceView(view) {
     "wlan_radios",
     "wlan_associations",
     "advertisement_hints",
+    "network_status_snapshots",
     "host_filter_profiles",
     "device_risk_summaries"
   ].includes(view);

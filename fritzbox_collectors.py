@@ -125,11 +125,48 @@ DATA_LUA_PAGES = (
     "kids",
     "userSettings",
     "remoteAccess",
+    "support",
+    "diagnosis",
+    "energy",
+    "energyStat",
+    "wlanSta",
+    "wlanMonitor",
+    "wlanRadar",
+    "wlanRepeater",
+    "wlanGuest",
+    "wlanWps",
+    "meshSet",
+    "netOverview",
+    "netRoute",
+    "netNeighbor",
+    "netDhcp",
+    "netDns",
+    "netShares",
+    "dslStat",
+    "dslSpectrum",
+    "dslFeedback",
+    "internet",
+    "onlineMoni",
+    "pushService",
+    "system",
+    "systemBackup",
+    "update",
+    "diagnosisSecurity",
+    "diagnosisFunction",
+)
+MAX_WEBUI_ARTIFACT_BYTES = 2_000_000
+WEBUI_READONLY_ENDPOINTS = (
+    ("juis_boxinfo_xml", "/juis_boxinfo.xml", {}),
+    ("login_sid_v2", "/login_sid.lua", {"version": "2"}),
+    ("menu_data_lua", "/menus/menu_data.lua", {}),
+    ("inetstat_monitor_lua", "/internet/inetstat_monitor.lua", {}),
+    ("inetstat_counter_lua", "/internet/inetstat_counter.lua", {}),
 )
 
 
 def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | None = None) -> dict[str, Any]:
     exports: dict[str, Any] = {}
+    manifest = AcquisitionManifest()
     path_specs = [
         ("device_log_xml", "DeviceInfo:1", "X_AVM-DE_GetDeviceLogPath", "NewDeviceLogPath"),
         ("mesh_list", "Hosts:1", "X_AVM-DE_GetMeshListPath", "NewX_AVM-DE_MeshListPath"),
@@ -138,32 +175,59 @@ def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | N
     for key, service, action, field in path_specs:
         try:
             path = fc.call_action(service, action).get(field)
-        except Exception:
+        except Exception as exc:
+            manifest.add(key, "tr064_export_path", ok=False, service=service, action=action, error=exc)
             continue
         if not path:
+            manifest.add(key, "tr064_export_path", ok=False, service=service, action=action, error="empty path")
             continue
         content = fetch_avm_path(address, port, str(path), fc=fc)
         if content is not None:
             exports[key] = content
+        manifest.add(key, "tr064_export_path", ok=content is not None, service=service, action=action, path=str(path))
 
     wlan_device_lists: dict[str, str] = {}
     for index in range(1, 5):
+        key = f"wlan_device_list_xml_{index}"
         try:
             path = fc.call_action(f"WLANConfiguration:{index}", "X_AVM-DE_GetWLANDeviceListPath").get(
                 "NewX_AVM-DE_WLANDeviceListPath"
             )
-        except Exception:
+        except Exception as exc:
+            manifest.add(
+                key,
+                "tr064_export_path",
+                ok=False,
+                service=f"WLANConfiguration:{index}",
+                action="X_AVM-DE_GetWLANDeviceListPath",
+                error=exc,
+            )
             continue
         if not path:
+            manifest.add(
+                key,
+                "tr064_export_path",
+                ok=False,
+                service=f"WLANConfiguration:{index}",
+                action="X_AVM-DE_GetWLANDeviceListPath",
+                error="empty path",
+            )
             continue
         content = fetch_avm_path(address, port, str(path), fc=fc)
-        if content is None:
-            continue
-        key = f"wlan_device_list_xml_{index}"
-        exports[key] = content
-        wlan_device_lists[str(index)] = content
+        if content is not None:
+            exports[key] = content
+            wlan_device_lists[str(index)] = content
+        manifest.add(
+            key,
+            "tr064_export_path",
+            ok=content is not None,
+            service=f"WLANConfiguration:{index}",
+            action="X_AVM-DE_GetWLANDeviceListPath",
+            path=str(path),
+        )
     if wlan_device_lists:
         exports["wlan_device_list_xml"] = json.dumps(wlan_device_lists, sort_keys=True)
+        manifest.add("wlan_device_list_xml", "combined_artifact", ok=True, count=len(wlan_device_lists))
 
     if "device_log_xml" in exports:
         parsed_log = parse_device_log_xml(exports["device_log_xml"])
@@ -172,25 +236,94 @@ def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | N
     data_lua_pages = fetch_data_lua_pages(fc)
     if data_lua_pages:
         exports["data_lua_pages_json"] = json.dumps(data_lua_pages, sort_keys=True, default=str)
+        manifest.extend_from_result_map("data_lua_pages_json", "webui_data_lua", data_lua_pages)
     landevice_query = fetch_landevice_query(fc)
     if landevice_query:
         exports["landevice_query_json"] = landevice_query
+    manifest.add("landevice_query_json", "webui_query_lua", ok=bool(landevice_query), query="landevice list")
     query_artifacts = fetch_query_lua_artifacts(fc)
     if query_artifacts:
         exports["query_lua_artifacts_json"] = json.dumps(query_artifacts, sort_keys=True, default=str)
+        manifest.extend_from_result_map("query_lua_artifacts_json", "webui_query_lua", query_artifacts)
+    webui_artifacts = fetch_webui_readonly_artifacts(fc)
+    if webui_artifacts:
+        exports["webui_readonly_artifacts_json"] = json.dumps(webui_artifacts, sort_keys=True, default=str)
+        manifest.extend_from_result_map(
+            "webui_readonly_artifacts_json",
+            "webui_readonly_get",
+            webui_artifacts.get("endpoints") or {},
+        )
     tr064_snapshot = collect_tr064_snapshot(fc)
     if tr064_snapshot:
         exports["tr064_snapshot_json"] = json.dumps(tr064_snapshot, sort_keys=True, default=str)
-    exports.update(fetch_telephony_exports(fc, address, port))
-    exports.update(fetch_aha_artifacts(fc))
+        manifest.add(
+            "tr064_snapshot_json",
+            "tr064_snapshot",
+            ok=True,
+            dynamic_readonly=len(tr064_snapshot.get("dynamic_readonly") or {}),
+            services=len(tr064_snapshot.get("service_inventory") or []),
+        )
+    telephony = fetch_telephony_exports(fc, address, port)
+    exports.update(telephony)
+    for key in ("call_list_xml", "phonebooks_xml_json"):
+        manifest.add(key, "telephony_export", ok=key in telephony)
+    aha = fetch_aha_artifacts(fc)
+    exports.update(aha)
+    for key in ("aha_device_list_xml", "aha_switch_list_txt", "aha_device_stats_json"):
+        manifest.add(key, "aha_http", ok=key in aha)
     if export_password:
         config_export = fetch_config_export(fc, address, port, export_password)
         if config_export:
             exports["config_export_file"] = config_export
+        manifest.add("config_export_file", "device_config_export", ok=bool(config_export))
+    else:
+        manifest.add("config_export_file", "device_config_export", ok=False, error="no export password")
+    support_lua = fetch_support_lua_page(fc)
+    if support_lua:
+        exports["support_lua_page_html"] = support_lua
+    manifest.add("support_lua_page_html", "webui_support_lua", ok=bool(support_lua))
     support_data = fetch_support_data(fc)
     if support_data:
         exports["support_data_txt"] = support_data
+    manifest.add("support_data_txt", "support_data", ok=bool(support_data))
+    exports["acquisition_manifest_json"] = json.dumps(manifest.as_dict(), sort_keys=True, default=str)
     return exports
+
+
+class AcquisitionManifest:
+    def __init__(self) -> None:
+        self.attempts: list[dict[str, Any]] = []
+
+    def add(self, artifact: str, surface: str, ok: bool, **details: Any) -> None:
+        normalized: dict[str, Any] = {"artifact": artifact, "surface": surface, "ok": bool(ok)}
+        for key, value in details.items():
+            if isinstance(value, Exception):
+                normalized[key] = f"{type(value).__name__}: {value}"
+            else:
+                normalized[key] = value
+        self.attempts.append(normalized)
+
+    def extend_from_result_map(self, artifact: str, surface: str, result_map: dict[str, Any]) -> None:
+        for name, result in result_map.items():
+            if isinstance(result, dict):
+                self.add(
+                    artifact,
+                    surface,
+                    ok=bool(result.get("ok")),
+                    name=name,
+                    error=result.get("error"),
+                    query=result.get("query"),
+                )
+            else:
+                self.add(artifact, surface, ok=True, name=name)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_count": len(self.attempts),
+            "successful_count": sum(1 for item in self.attempts if item.get("ok")),
+            "failed_count": sum(1 for item in self.attempts if not item.get("ok")),
+            "attempts": self.attempts,
+        }
 
 
 def fetch_support_data(fc: Any) -> str | None:
@@ -229,6 +362,41 @@ def fetch_support_data(fc: Any) -> str | None:
         if is_support_data_response(text):
             return text
     return None
+
+
+def fetch_support_lua_page(fc: Any) -> str | None:
+    """Retain the support.lua UI page when the firmware exposes it.
+
+    The page itself is not the support dump, but it is useful coverage evidence:
+    firmware variants expose support controls and diagnostic labels here.
+    """
+    http = getattr(fc, "http_interface", None)
+    if http is None:
+        return None
+    session = getattr(getattr(http, "fc", None), "session", None)
+    if session is None:
+        return None
+    try:
+        sid = next(http._get_sid())
+    except Exception:
+        sid = ""
+    params = f"?sid={sid}" if sid and sid != "0000000000000000" else ""
+    url = f"{http.router_url}/support.lua{params}"
+    try:
+        response = session.get(url, timeout=15)
+    except TypeError:
+        try:
+            response = session.get(url)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if getattr(response, "status_code", None) != 200:
+        return None
+    text = getattr(response, "text", "") or getattr(response, "content", b"").decode("utf-8", errors="replace")
+    if not text or "support" not in text.casefold():
+        return None
+    return text
 
 
 def is_support_data_response(text: str) -> bool:
@@ -332,13 +500,23 @@ def fetch_query_lua_artifacts(fc: Any) -> dict[str, Any]:
     """
     queries = {
         "landevice_all": "landevice:settings/landevice/list(UID,ip,iplist,mac,maclist,name,friendly_name,neighbour_name,vendorname,modelname,parentuid,parentsource,source,flags,modification_flags,interface,wlan_station_type,wlan_UIDs,plc_UIDs,ethernetport,active,online,guest,speed,dhcp,static_dhcp,deleteable,wakeup,auto_wakeup,firstused,lastused,blocked,allow_pcp_and_upnp,igd_fw_cnt_pcp,igd_fw_cnt_upnp,myfritz_enabled,url)",
+        "landevice_topology": "landevice:settings/landevice/list(UID,name,friendly_name,parentuid,parentsource,source,interface,wlan_UIDs,plc_UIDs,ethernetport,active,online,guest,speed,lastused)",
         "hostfilter_profiles": "filter:settings/profile/list(id,name,type,netappsid,blocked,autoupdate,disabled)",
+        "hostfilter_rules": "filter:settings/rule/list(id,name,enabled,profile,device,uid,mac,ip,blocked)",
         "wlan_stations": "wlan:settings/station/list(mac,ip,name,UID,active,guest,ap,ssid,rssi,speed,flags)",
         "wlan_radios": "wlan:settings/radio/list(uid,enabled,ssid,channel,autochannel,standard,mac,guest)",
+        "wlan_known_devices": "wlan:settings/known/list(mac,name,active,guest,ssid,last_connected,rssi,speed)",
+        "wlan_guest": "wlan:settings/guest(enabled,ssid,encrypted,timeout,remaining)",
         "port_sharing": "forwardrules:settings/rule/list(description,enabled,protocol,port,end_port,fwip,fwport,sourceip)",
+        "net_routes": "route:settings/route/list(ip,mask,gateway,metric,active)",
+        "net_dns": "dns:settings/server/list(name,ip,source,active)",
+        "net_dhcp": "dhcp:settings/lease/list(hostname,mac,ip,expires,active)",
         "vpn_users": "vpn:settings/connection/list(name,enabled,type,remote_ip,local_ip,last_connected)",
         "wireguard": "wireguard:settings/peer/list(name,enabled,remote_endpoint,allowed_ips,last_handshake)",
         "user_rights": "user:settings/user/list(name,enabled,box_admin,ftp_access,vpn_access,frominternet)",
+        "myfritz_services": "myfritz:settings/service/list(name,enabled,port,protocol,device)",
+        "usb_devices": "usb:settings/device/list(name,type,connected,manufacturer,product)",
+        "dect_devices": "dect:settings/handset/list(name,intern,manufacturer,model,connected)",
     }
     artifacts: dict[str, Any] = {}
     for name, query in queries.items():
@@ -356,6 +534,112 @@ def fetch_query_lua_artifacts(fc: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             artifacts[name] = {"ok": True, "raw": text, "query": query}
     return artifacts
+
+
+def fetch_webui_readonly_artifacts(fc: Any) -> dict[str, Any]:
+    """Best-effort raw GET snapshots from additional read-only Web UI endpoints."""
+    http = getattr(fc, "http_interface", None)
+    if http is None:
+        return {}
+    session = getattr(getattr(http, "fc", None), "session", None)
+    if session is None:
+        return {}
+
+    sid = get_webui_sid(http)
+    endpoints: dict[str, Any] = {}
+    for name, path, params in WEBUI_READONLY_ENDPOINTS:
+        request_params = dict(params)
+        if sid and path.endswith(".lua"):
+            request_params.setdefault("sid", sid)
+        endpoints[name] = fetch_webui_readonly_endpoint(
+            session,
+            str(getattr(http, "router_url", "")).rstrip("/"),
+            path,
+            request_params,
+        )
+    return {
+        "schema_version": 1,
+        "max_body_bytes": MAX_WEBUI_ARTIFACT_BYTES,
+        "endpoints": endpoints,
+    }
+
+
+def get_webui_sid(http: Any) -> str | None:
+    try:
+        sid = next(http._get_sid())
+    except Exception:
+        return None
+    if not sid or sid == "0000000000000000":
+        return None
+    return str(sid)
+
+
+def fetch_webui_readonly_endpoint(
+    session: Any,
+    router_url: str,
+    path: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    url = path if path.startswith(("http://", "https://")) else f"{router_url}/{path.lstrip('/')}"
+    metadata = {
+        "ok": False,
+        "method": "GET",
+        "path": path,
+        "params": redacted_params(params),
+    }
+    try:
+        response = session.get(url, params=params, timeout=15)
+    except TypeError:
+        try:
+            response = session.get(url, params=params)
+        except Exception as exc:
+            return {**metadata, "error": f"{type(exc).__name__}: {exc}"}
+    except Exception as exc:
+        return {**metadata, "error": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        status_code = getattr(response, "status_code", None)
+        headers = getattr(response, "headers", {}) or {}
+        content_type = headers.get("content-type") or headers.get("Content-Type")
+        content = response_content_bytes(response)
+        raw = content[:MAX_WEBUI_ARTIFACT_BYTES].decode("utf-8", errors="replace")
+        result = {
+            **metadata,
+            "status_code": status_code,
+            "content_type": content_type,
+            "body_bytes": len(content),
+            "truncated": len(content) > MAX_WEBUI_ARTIFACT_BYTES,
+        }
+        if status_code != 200:
+            return {**result, "error": f"HTTP {status_code}"}
+        if is_html_response(raw, content_type):
+            return {**result, "error": "HTML response instead of raw API payload"}
+        return {**result, "ok": True, "raw": raw}
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+
+def response_content_bytes(response: Any) -> bytes:
+    content = getattr(response, "content", b"")
+    if isinstance(content, bytes):
+        return content
+    if isinstance(content, str):
+        return content.encode("utf-8", errors="replace")
+    text = getattr(response, "text", "")
+    return str(text).encode("utf-8", errors="replace")
+
+
+def is_html_response(raw: str, content_type: str | None) -> bool:
+    if content_type and "html" in content_type.casefold():
+        return True
+    sample = raw[:300].casefold()
+    return "<html" in sample or "<!doctype html" in sample
+
+
+def redacted_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {key: "<redacted>" if key.lower() == "sid" else value for key, value in params.items()}
 
 
 def collect_tr064_snapshot(fc: Any) -> dict[str, Any]:

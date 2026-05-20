@@ -106,6 +106,34 @@ def test_landevice_query_derives_ui_last_connected_time() -> None:
     assert host["last_seen"].startswith("2026-05-02T")
     assert host["last_connected"].startswith("2026-05-02T")
     assert host["last_activity_source"] == "fritzbox_landevice_lastused"
+    assert records[0]["firstused_raw"] == 1777272000
+    assert records[0]["lastused_raw"] == 1777725960
+
+
+def test_landevice_query_falls_back_to_query_lua_artifacts() -> None:
+    records = fritzbox_wifi_export.parse_landevice_query(
+        """
+        {
+          "landevice_all": {
+            "ok": true,
+            "data": {
+              "mq_landevices": [
+                {
+                  "UID": "landevice2",
+                  "ip": "192.0.2.45",
+                  "mac": "AA:BB:CC:DD:EE:45",
+                  "name": "fallback-phone",
+                  "lastused": 1777725960
+                }
+              ]
+            }
+          }
+        }
+        """
+    )
+
+    assert records[0]["hostname"] == "fallback-phone"
+    assert records[0]["last_connected"].startswith("2026-05-02T")
 
 
 def test_wlan_device_list_xml_creates_current_association_rows() -> None:

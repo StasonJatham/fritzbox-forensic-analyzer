@@ -33,6 +33,7 @@ EXPECTED_RAW_ARTIFACTS = [
     "landevice_query_json",
     "query_lua_artifacts_json",
     "data_lua_pages_json",
+    "webui_readonly_artifacts_json",
     "tr064_snapshot_json",
     "call_list_xml",
     "phonebooks_xml_json",
@@ -40,7 +41,9 @@ EXPECTED_RAW_ARTIFACTS = [
     "aha_switch_list_txt",
     "aha_device_stats_json",
     "config_export_file",
+    "support_lua_page_html",
     "support_data_txt",
+    "acquisition_manifest_json",
 ]
 WIFI_DEDUPE_SQL = """
     id IN (
@@ -313,6 +316,25 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             summary TEXT,
             source TEXT,
             evidence_level TEXT NOT NULL DEFAULT 'inferred',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS network_status_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            observed_at TEXT,
+            area TEXT,
+            metric TEXT,
+            value TEXT,
+            unit TEXT,
+            source TEXT,
+            confidence TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
             evidence_note TEXT,
             raw_json TEXT NOT NULL,
             searchable TEXT NOT NULL,
@@ -1048,6 +1070,24 @@ ADDITIONAL_EVIDENCE_TABLES: dict[str, dict[str, Any]] = {
             "not packet-level proof of every broadcast."
         ),
     },
+    "network_status_snapshots": {
+        "dataset_keys": ("network_status_snapshots", "network_status", "network_counters"),
+        "record_type": "network_status_snapshot",
+        "fts_type": "network_status_snapshots",
+        "columns": (
+            "observed_at",
+            "area",
+            "metric",
+            "value",
+            "unit",
+            "source",
+            "confidence",
+        ),
+        "record_key_fields": ("observed_at", "area", "metric", "source"),
+        "sort": "COALESCE(t.observed_at, '')",
+        "time_column": "observed_at",
+        "note": "Network/WAN/DSL/LAN counter snapshot parsed from FRITZ!Box TR-064 evidence.",
+    },
     "device_risk_summaries": {
         "dataset_keys": ("device_risk_summaries", "device_risks"),
         "record_type": "device_risk_summary",
@@ -1090,6 +1130,12 @@ ADDITIONAL_RECORD_TYPE_ALIASES: dict[str, str] = {
     "advertising": "advertisement_hints",
     "broadcasts": "advertisement_hints",
     "broadcast_hints": "advertisement_hints",
+    "network_status": "network_status_snapshots",
+    "network_counters": "network_status_snapshots",
+    "network_status_snapshots": "network_status_snapshots",
+    "wan_stats": "network_status_snapshots",
+    "dsl_stats": "network_status_snapshots",
+    "lan_stats": "network_status_snapshots",
     "device_risks": "device_risk_summaries",
     "device_risk": "device_risk_summaries",
     "device_risk_summaries": "device_risk_summaries",
@@ -1182,6 +1228,7 @@ def extract_additional_evidence(dataset: dict[str, Any], generated_at: str) -> d
         rows["wan_port_mappings"].extend(extract_wan_port_mappings(tr064))
         rows["wlan_radios"].extend(extract_wlan_radios(tr064))
         rows["wlan_associations"].extend(extract_wlan_associations(tr064, generated_at))
+        rows["network_status_snapshots"].extend(extract_network_status_snapshots(tr064, generated_at))
 
     mesh_raw = raw_exports.get("mesh_list")
     rows["mesh_topology_links"].extend(extract_mesh_links(mesh_raw))
@@ -1246,6 +1293,14 @@ def normalize_additional_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("confidence", first_value(row, "confidence", "derived_time_confidence"))
         normalized.setdefault("summary", first_value(row, "summary", "message", "raw_text"))
         normalized.setdefault("source", first_value(row, "source", "artifact"))
+    elif table == "network_status_snapshots":
+        normalized.setdefault("observed_at", first_value(row, "observed_at", "timestamp"))
+        normalized.setdefault("area", first_value(row, "area", "section"))
+        normalized.setdefault("metric", first_value(row, "metric", "key", "name"))
+        normalized.setdefault("value", first_value(row, "value"))
+        normalized.setdefault("unit", first_value(row, "unit"))
+        normalized.setdefault("source", first_value(row, "source"))
+        normalized.setdefault("confidence", first_value(row, "confidence"))
     elif table == "device_risk_summaries":
         device_key = first_value(row, "device_key", "mac", "ip", "hostname")
         normalized.setdefault("device_key", device_key)
@@ -1328,6 +1383,96 @@ def extract_wlan_associations(tr064: dict[str, Any], observed_at: str) -> list[d
                     }
                 )
     return rows
+
+
+def extract_network_status_snapshots(tr064: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    actions = tr064.get("actions") or {}
+    action_specs = {
+        "wan_common_link": ("wan", "WANCommonIFC:GetCommonLinkProperties"),
+        "wan_common_bytes_sent": ("wan", "WANCommonIFC:GetTotalBytesSent"),
+        "wan_common_bytes_received": ("wan", "WANCommonIFC:GetTotalBytesReceived"),
+        "wan_common_packets_sent": ("wan", "WANCommonIFC:GetTotalPacketsSent"),
+        "wan_common_packets_received": ("wan", "WANCommonIFC:GetTotalPacketsReceived"),
+        "wan_common_online_monitor": ("wan", "WANCommonIFC:X_AVM-DE_GetOnlineMonitor"),
+        "wan_ip_info": ("wan", "WANIPConn:GetInfo"),
+        "wan_ip_status": ("wan", "WANIPConn:GetStatusInfo"),
+        "wan_ip_external": ("wan", "WANIPConn:GetExternalIPAddress"),
+        "wan_dsl_interface": ("dsl", "WANDSLInterfaceConfig:GetInfo"),
+        "wan_dsl_stats": ("dsl", "WANDSLInterfaceConfig:GetStatisticsTotal"),
+        "wan_dsl_link": ("dsl", "WANDSLLinkConfig:GetInfo"),
+        "lan_host_config": ("lan", "LANHostConfigManagement:GetInfo"),
+        "lan_eth_info": ("lan", "LANEthernetInterfaceConfig:GetInfo"),
+        "lan_eth_stats": ("lan", "LANEthernetInterfaceConfig:GetStatistics"),
+        "time_info": ("router", "Time:GetInfo"),
+        "device_info": ("router", "DeviceInfo:GetInfo"),
+        "user_interface": ("router", "UserInterface:GetInfo"),
+    }
+    for key, (area, source) in action_specs.items():
+        result = actions.get(key) or {}
+        response = result.get("response") or {}
+        if not isinstance(response, dict):
+            continue
+        for metric, value in response.items():
+            if value in (None, ""):
+                continue
+            rows.append(
+                {
+                    "observed_at": observed_at,
+                    "area": area,
+                    "metric": metric,
+                    "value": value,
+                    "unit": metric_unit(metric),
+                    "source": source,
+                    "confidence": "high" if result.get("ok") else "low",
+                    "evidence_level": "parsed_from_raw",
+                    "evidence_note": "Point-in-time TR-064 network/router status value; use repeated acquisitions for deltas.",
+                }
+            )
+    for radio in tr064.get("wlan") or []:
+        if not isinstance(radio, dict):
+            continue
+        radio_index = radio.get("index")
+        for section, result in radio.items():
+            if section == "index" or not isinstance(result, dict):
+                continue
+            response = result.get("response") or {}
+            if not isinstance(response, dict):
+                continue
+            for metric, value in response.items():
+                if value in (None, ""):
+                    continue
+                rows.append(
+                    {
+                        "observed_at": observed_at,
+                        "area": "wlan",
+                        "metric": f"radio_{radio_index}_{metric}",
+                        "value": value,
+                        "unit": metric_unit(metric),
+                        "source": f"WLANConfiguration:{radio_index}:{section}",
+                        "confidence": "high" if result.get("ok") else "low",
+                        "evidence_level": "parsed_from_raw",
+                        "evidence_note": "Point-in-time WLAN radio status/counter value; use repeated acquisitions for deltas.",
+                    }
+                )
+    return rows
+
+
+def metric_unit(metric: str) -> str | None:
+    lower = metric.casefold()
+    if "byte" in lower:
+        return "bytes"
+    if "packet" in lower:
+        return "packets"
+    if "bitrate" in lower or "speed" in lower:
+        return "bit/s"
+    if "snr" in lower or "noise" in lower:
+        return "dB"
+    if "attenuation" in lower:
+        return "dB"
+    if "time" in lower:
+        return "time"
+    return None
 
 
 def extract_mesh_links(content: Any) -> list[dict[str, Any]]:
@@ -2299,6 +2444,8 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
         )
     ]
     present = {str(row["name"]): row for row in rows if row.get("name")}
+    manifest = acquisition_manifest(conn, run_id)
+    attempts_by_artifact = manifest_attempts_by_artifact(manifest)
     warnings = []
     if "landevice_query_json" not in present:
         warnings.append(
@@ -2316,10 +2463,16 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
         warnings.append(
             "Unofficial FRITZ!Box data.lua pages were not collected; UI-only topology/log/counter evidence is reduced."
         )
+    if "webui_readonly_artifacts_json" not in present:
+        warnings.append(
+            "Additional authenticated Web UI read-only probes were not collected; undocumented endpoint coverage is reduced."
+        )
     if "support_data_txt" not in present:
         warnings.append(
             "FRITZ!Box support data was not collected; deep diagnostic settings/service-state evidence is unavailable."
         )
+    if "support_lua_page_html" not in present:
+        warnings.append("support.lua page evidence was not collected; support-workflow coverage is reduced.")
     if "call_list_xml" not in present:
         warnings.append("Telephony call-list XML was not collected; phone/call context is unavailable.")
     if "config_export_file" not in present:
@@ -2329,7 +2482,13 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
     matrix_groups = [
         {
             "area": "Retained logs",
-            "artifacts": ["device_log_xml", "data_lua_pages_json", "support_data_txt"],
+            "artifacts": [
+                "device_log_xml",
+                "data_lua_pages_json",
+                "webui_readonly_artifacts_json",
+                "support_lua_page_html",
+                "support_data_txt",
+            ],
             "detail": "Timeline, event classes, and raw log validation.",
         },
         {
@@ -2368,6 +2527,11 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
                     {
                         "name": name,
                         "present": name in present,
+                        "attempted": name in attempts_by_artifact,
+                        "attempts": attempts_by_artifact.get(name, {}).get("attempts", 0),
+                        "successful_attempts": attempts_by_artifact.get(name, {}).get("successful", 0),
+                        "failed_attempts": attempts_by_artifact.get(name, {}).get("failed", 0),
+                        "last_error": attempts_by_artifact.get(name, {}).get("last_error"),
                         "observations": int((present.get(name) or {}).get("observations") or 0),
                         "last_observed": (present.get(name) or {}).get("last_observed"),
                     }
@@ -2380,9 +2544,66 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
         "expected_raw_artifacts": expected,
         "present_raw_artifacts": rows,
         "missing_raw_artifacts": [name for name in expected if name not in present],
+        "attempted_artifacts": attempts_by_artifact,
+        "acquisition_manifest": manifest,
         "warnings": warnings,
         "matrix": matrix,
     }
+
+
+def acquisition_manifest(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
+    params: list[Any] = []
+    where = "WHERE json_extract(content_json, '$.name') = 'acquisition_manifest_json'"
+    if run_id is not None:
+        where += " AND run_id = ?"
+        params.append(run_id)
+    row = conn.execute(
+        f"""
+        SELECT json_extract(content_json, '$.content') AS content
+        FROM record_observations
+        {where}
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if not row or not row["content"]:
+        return {"attempt_count": 0, "successful_count": 0, "failed_count": 0, "attempts": []}
+    try:
+        manifest = json.loads(str(row["content"]))
+    except json.JSONDecodeError:
+        return {"attempt_count": 0, "successful_count": 0, "failed_count": 0, "attempts": []}
+    if not isinstance(manifest, dict):
+        return {"attempt_count": 0, "successful_count": 0, "failed_count": 0, "attempts": []}
+    manifest.setdefault("attempts", [])
+    manifest.setdefault("attempt_count", len(manifest["attempts"]))
+    manifest.setdefault("successful_count", sum(1 for item in manifest["attempts"] if item.get("ok")))
+    manifest.setdefault("failed_count", sum(1 for item in manifest["attempts"] if not item.get("ok")))
+    return manifest
+
+
+def manifest_attempts_by_artifact(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for attempt in manifest.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        artifact = str(attempt.get("artifact") or "")
+        if not artifact:
+            continue
+        entry = grouped.setdefault(
+            artifact,
+            {"attempts": 0, "successful": 0, "failed": 0, "surfaces": [], "last_error": None},
+        )
+        entry["attempts"] += 1
+        if attempt.get("ok"):
+            entry["successful"] += 1
+        else:
+            entry["failed"] += 1
+            entry["last_error"] = attempt.get("error") or entry["last_error"]
+        surface = attempt.get("surface")
+        if surface and surface not in entry["surfaces"]:
+            entry["surfaces"].append(surface)
+    return grouped
 
 
 def analysis_snapshot(

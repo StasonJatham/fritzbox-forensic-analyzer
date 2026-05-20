@@ -128,7 +128,9 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     wifi_events = sorted(events, key=lambda item: item["timestamp"] or "", reverse=True)
     mesh_wifi_devices = parse_mesh_wifi_devices(avm_exports.get("mesh_list"))
     wlan_associations = parse_wlan_device_lists(avm_exports, generated_at)
-    landevice_records = parse_landevice_query(avm_exports.get("landevice_query_json"))
+    landevice_records = parse_landevice_query(avm_exports.get("landevice_query_json")) or parse_landevice_query(
+        avm_exports.get("query_lua_artifacts_json")
+    )
     support_findings = parse_support_data(avm_exports.get("support_data_txt"), generated_at)
     seen_by_host = build_host_seen_index(
         hosts,

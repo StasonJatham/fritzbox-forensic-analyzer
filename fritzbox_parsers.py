@@ -319,9 +319,7 @@ def parse_landevice_query(content: str | None) -> list[dict[str, Any]]:
         data = json.loads(content)
     except json.JSONDecodeError:
         return []
-    rows = data.get("mq_landevices") or data.get("landevice") or data.get("devices") or []
-    if isinstance(rows, dict):
-        rows = rows.get("list") or rows.get("devices") or []
+    rows = extract_landevice_rows(data)
     if not isinstance(rows, list):
         return []
 
@@ -359,6 +357,8 @@ def parse_landevice_query(content: str | None) -> list[dict[str, Any]]:
                 "pcp_count": row.get("igd_fw_cnt_pcp") or None,
                 "upnp_count": row.get("igd_fw_cnt_upnp") or None,
                 "myfritz_enabled": row.get("myfritz_enabled") or None,
+                "firstused_raw": row.get("firstused"),
+                "lastused_raw": row.get("lastused"),
                 "active_now": truthy(row.get("active")) or truthy(row.get("online")),
                 "online": truthy(row.get("online")),
                 "first_seen": unix_timestamp_to_iso(row.get("firstused")),
@@ -368,6 +368,41 @@ def parse_landevice_query(content: str | None) -> list[dict[str, Any]]:
             }
         )
     return records
+
+
+def extract_landevice_rows(data: Any) -> list[Any]:
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("mq_landevices") or data.get("landevice") or data.get("devices")
+    if isinstance(rows, dict):
+        rows = rows.get("list") or rows.get("devices") or rows.get("landevice")
+    if isinstance(rows, list):
+        return rows
+    for key in ("landevice_all", "landevice_topology", "mq_landevices"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            nested = value.get("data")
+            if isinstance(nested, dict):
+                found = extract_landevice_rows(nested)
+                if found:
+                    return found
+            raw = value.get("raw")
+            if isinstance(raw, str):
+                try:
+                    found = extract_landevice_rows(json.loads(raw))
+                except json.JSONDecodeError:
+                    found = []
+                if found:
+                    return found
+        elif isinstance(value, list):
+            return value
+    for value in data.values():
+        if isinstance(value, dict):
+            nested = value.get("data") if "data" in value else value
+            found = extract_landevice_rows(nested)
+            if found:
+                return found
+    return []
 
 
 def lan_device_host_rows(
