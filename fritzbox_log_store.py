@@ -185,8 +185,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "source_endpoints_json": "TEXT",
         },
     )
-    ensure_columns(conn, "event_log", {"evidence_level": "TEXT NOT NULL DEFAULT 'parsed_from_raw'", "evidence_note": "TEXT"})
-    ensure_columns(conn, "wifi_connections", {"evidence_level": "TEXT NOT NULL DEFAULT 'inferred'", "evidence_note": "TEXT"})
+    ensure_columns(
+        conn, "event_log", {"evidence_level": "TEXT NOT NULL DEFAULT 'parsed_from_raw'", "evidence_note": "TEXT"}
+    )
+    ensure_columns(
+        conn, "wifi_connections", {"evidence_level": "TEXT NOT NULL DEFAULT 'inferred'", "evidence_note": "TEXT"}
+    )
     ensure_columns(
         conn,
         "hosts",
@@ -569,7 +573,9 @@ def acquisition_metadata(dataset: dict[str, Any], acquired_at: str) -> dict[str,
         },
         "timestamp_assumptions": {
             "router_event_timestamps": "Parsed from retained FRITZ!Box log text and interpreted in the collector local timezone unless the raw entry already contains an offset.",
-            "collector_timezone": datetime.now().astimezone().tzinfo.tzname(None) if datetime.now().astimezone().tzinfo else None,
+            "collector_timezone": datetime.now().astimezone().tzinfo.tzname(None)
+            if datetime.now().astimezone().tzinfo
+            else None,
             "router_clock_status": "not independently validated",
             "absence_meaning": "Not observed in retained/exported data does not prove the event did not happen.",
         },
@@ -1008,9 +1014,7 @@ def _timeline_filters(
         where.append(run_sql)
         params.extend(run_params)
     if fts_query:
-        where.append(
-            "t.id IN (SELECT record_id FROM records_fts WHERE record_type = ? AND content MATCH ?)"
-        )
+        where.append("t.id IN (SELECT record_id FROM records_fts WHERE record_type = ? AND content MATCH ?)")
         params.extend([table, fts_query])
     if table == "event_log" and category != "all":
         where.append("t.category = ?")
@@ -1071,8 +1075,16 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             ),
             "hosts": int(conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]),
             "active_hosts": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE active_now = 1").fetchone()[0]),
-            "hosts_with_last_connected": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE last_connected IS NOT NULL AND last_connected != ''").fetchone()[0]),
-            "hosts_with_first_seen": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE first_seen IS NOT NULL AND first_seen != ''").fetchone()[0]),
+            "hosts_with_last_connected": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM hosts WHERE last_connected IS NOT NULL AND last_connected != ''"
+                ).fetchone()[0]
+            ),
+            "hosts_with_first_seen": int(
+                conn.execute("SELECT COUNT(*) FROM hosts WHERE first_seen IS NOT NULL AND first_seen != ''").fetchone()[
+                    0
+                ]
+            ),
         }
         last_exact_wifi = conn.execute(
             "SELECT MAX(derived_connected_at) FROM wifi_connections WHERE exact_connection_time_available = 1 AND "
@@ -1141,7 +1153,10 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
     source_coverage = acquisition_source_coverage(conn, scoped_run_id)
     conn.close()
     return {
-        "has_data": counts["runs"] > 0 or counts["event_log"] > 0 or counts["wifi_connections"] > 0 or counts["hosts"] > 0,
+        "has_data": counts["runs"] > 0
+        or counts["event_log"] > 0
+        or counts["wifi_connections"] > 0
+        or counts["hosts"] > 0,
         "latest_run": latest,
         "selected_run_id": scoped_run_id,
         "run_scope": "all" if scoped_run_id is None else str(scoped_run_id),
@@ -1186,15 +1201,21 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
     present = {str(row["name"]): row for row in rows if row.get("name")}
     warnings = []
     if "landevice_query_json" not in present:
-        warnings.append("FRITZ!Box web UI LAN-device state was not collected; Host Table last-connected values may be unavailable.")
+        warnings.append(
+            "FRITZ!Box web UI LAN-device state was not collected; Host Table last-connected values may be unavailable."
+        )
     if "device_log_xml" not in present:
         warnings.append("Retained device log XML was not collected; timeline completeness is reduced.")
     if "host_list_xml" not in present:
         warnings.append("Host list XML was not collected; device attribution is reduced.")
     if "tr064_snapshot_json" not in present:
-        warnings.append("TR-064 router/WAN/WLAN status snapshot was not collected; network-state visualizations are reduced.")
+        warnings.append(
+            "TR-064 router/WAN/WLAN status snapshot was not collected; network-state visualizations are reduced."
+        )
     if "data_lua_pages_json" not in present:
-        warnings.append("Unofficial FRITZ!Box data.lua pages were not collected; UI-only topology/log/counter evidence is reduced.")
+        warnings.append(
+            "Unofficial FRITZ!Box data.lua pages were not collected; UI-only topology/log/counter evidence is reduced."
+        )
     return {
         "expected_raw_artifacts": expected,
         "present_raw_artifacts": rows,
@@ -1203,7 +1224,9 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
     }
 
 
-def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "", run_id: str | int = "latest") -> dict[str, Any]:
+def analysis_snapshot(
+    path: Path = DEFAULT_DB, start: str = "", end: str = "", run_id: str | int = "latest"
+) -> dict[str, Any]:
     conn = init_db(path)
     scoped_run_id = resolve_run_id(conn, run_id)
     range_filter, params = _time_range_sql("timestamp", start, end)
@@ -1217,8 +1240,19 @@ def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "", r
         )
     ]
     auth_counts = {
-        "failed": _count_like(conn, "event_log", "message", ["falsches", "fehlgeschlagen", "failed"], start, end, "timestamp", scoped_run_id),
-        "successful": _count_like(conn, "event_log", "message", ["erfolgreich", "success"], start, end, "timestamp", scoped_run_id),
+        "failed": _count_like(
+            conn,
+            "event_log",
+            "message",
+            ["falsches", "fehlgeschlagen", "failed"],
+            start,
+            end,
+            "timestamp",
+            scoped_run_id,
+        ),
+        "successful": _count_like(
+            conn, "event_log", "message", ["erfolgreich", "success"], start, end, "timestamp", scoped_run_id
+        ),
         "app": _count_like(conn, "event_log", "message", ["app"], start, end, "timestamp", scoped_run_id),
     }
     hourly = _hourly_counts(conn, start, end, scoped_run_id)
@@ -1274,8 +1308,12 @@ def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "", r
     timestamp_coverage = {
         "first_seen": _host_count(conn, host_filter, host_params, "t.first_seen IS NOT NULL AND t.first_seen != ''"),
         "last_seen": _host_count(conn, host_filter, host_params, "t.last_seen IS NOT NULL AND t.last_seen != ''"),
-        "last_connected": _host_count(conn, host_filter, host_params, "t.last_connected IS NOT NULL AND t.last_connected != ''"),
-        "last_activity": _host_count(conn, host_filter, host_params, "t.last_activity IS NOT NULL AND t.last_activity != ''"),
+        "last_connected": _host_count(
+            conn, host_filter, host_params, "t.last_connected IS NOT NULL AND t.last_connected != ''"
+        ),
+        "last_activity": _host_count(
+            conn, host_filter, host_params, "t.last_activity IS NOT NULL AND t.last_activity != ''"
+        ),
         "active_now": _host_count(conn, host_filter, host_params, "t.active_now = 1"),
         "online": _host_count(conn, host_filter, host_params, "t.online = 1"),
     }
@@ -1370,7 +1408,9 @@ def mesh_summary(content: str | None) -> dict[str, Any]:
                 counts[label] = counts.get(label, 0) + 1
                 links.append(
                     {
-                        "device": node.get("device_name") or node.get("device_friendly_name") or node.get("device_mac_address"),
+                        "device": node.get("device_name")
+                        or node.get("device_friendly_name")
+                        or node.get("device_mac_address"),
                         "interface": interface.get("name") or interface.get("type"),
                         "type": link.get("type") or interface.get("type"),
                         "state": link.get("state"),
@@ -1383,7 +1423,10 @@ def mesh_summary(content: str | None) -> dict[str, Any]:
         "available": True,
         "nodes": len(data.get("nodes") or []),
         "links": links[:20],
-        "link_counts": [{"label": key, "count": value} for key, value in sorted(counts.items(), key=lambda item: item[1], reverse=True)],
+        "link_counts": [
+            {"label": key, "count": value}
+            for key, value in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        ],
     }
 
 
@@ -1395,16 +1438,16 @@ def tr064_summary(content: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"available": False, "wlan_radios": [], "wan": {}}
     actions = data.get("actions") or {}
-    wan_common = ((actions.get("wan_common_link") or {}).get("response") or {})
-    wan_ip = ((actions.get("wan_ip_info") or {}).get("response") or {})
-    wan_status = ((actions.get("wan_ip_status") or {}).get("response") or {})
-    wan_external = ((actions.get("wan_ip_external") or {}).get("response") or {})
+    wan_common = (actions.get("wan_common_link") or {}).get("response") or {}
+    wan_ip = (actions.get("wan_ip_info") or {}).get("response") or {}
+    wan_status = (actions.get("wan_ip_status") or {}).get("response") or {}
+    wan_external = (actions.get("wan_ip_external") or {}).get("response") or {}
     radios = []
     for radio in data.get("wlan") or []:
-        info = ((radio.get("info") or {}).get("response") or {})
-        total = ((radio.get("total_associations") or {}).get("response") or {})
-        channel = ((radio.get("channel_info") or {}).get("response") or {})
-        stats = ((radio.get("statistics") or {}).get("response") or {})
+        info = (radio.get("info") or {}).get("response") or {}
+        total = (radio.get("total_associations") or {}).get("response") or {}
+        channel = (radio.get("channel_info") or {}).get("response") or {}
+        stats = (radio.get("statistics") or {}).get("response") or {}
         radios.append(
             {
                 "index": radio.get("index"),
@@ -1423,8 +1466,10 @@ def tr064_summary(content: str | None) -> dict[str, Any]:
         "wan": {
             "access_type": wan_common.get("NewWANAccessType"),
             "physical_status": wan_common.get("NewPhysicalLinkStatus"),
-            "downstream": wan_common.get("NewLayer1DownstreamMaxBitRate") or wan_common.get("NewX_AVM-DE_DownstreamCurrentMaxSpeed"),
-            "upstream": wan_common.get("NewLayer1UpstreamMaxBitRate") or wan_common.get("NewX_AVM-DE_UpstreamCurrentMaxSpeed"),
+            "downstream": wan_common.get("NewLayer1DownstreamMaxBitRate")
+            or wan_common.get("NewX_AVM-DE_DownstreamCurrentMaxSpeed"),
+            "upstream": wan_common.get("NewLayer1UpstreamMaxBitRate")
+            or wan_common.get("NewX_AVM-DE_UpstreamCurrentMaxSpeed"),
             "connection_status": wan_status.get("NewConnectionStatus") or wan_ip.get("NewConnectionStatus"),
             "external_ip": wan_external.get("NewExternalIPAddress") or wan_ip.get("NewExternalIPAddress"),
         },
@@ -1445,7 +1490,9 @@ def unix_seconds_to_iso(value: Any) -> str | None:
         return None
 
 
-def query_entities(path: Path = DEFAULT_DB, query: str = "", limit: int = 100, run_id: str | int = "latest") -> dict[str, Any]:
+def query_entities(
+    path: Path = DEFAULT_DB, query: str = "", limit: int = 100, run_id: str | int = "latest"
+) -> dict[str, Any]:
     conn = init_db(path)
     scoped_run_id = resolve_run_id(conn, run_id)
     q = f"%{query.casefold()}%" if query else ""
@@ -1488,7 +1535,9 @@ def query_entities(path: Path = DEFAULT_DB, query: str = "", limit: int = 100, r
     return {"rows": list(entities.values()), "total": len(entities)}
 
 
-def entity_pivot(path: Path = DEFAULT_DB, value: str = "", limit: int = 200, run_id: str | int = "latest") -> dict[str, Any]:
+def entity_pivot(
+    path: Path = DEFAULT_DB, value: str = "", limit: int = 200, run_id: str | int = "latest"
+) -> dict[str, Any]:
     conn = init_db(path)
     scoped_run_id = resolve_run_id(conn, run_id)
     needle = value.strip()
@@ -1507,8 +1556,7 @@ def entity_pivot(path: Path = DEFAULT_DB, value: str = "", limit: int = 200, run
     ]
     wifi_run_sql, wifi_run_params = _run_observation_sql("wifi_connection", scoped_run_id)
     wifi_where, wifi_params = _combine_filter(
-        " WHERE t.searchable LIKE ? AND "
-        + ("1=1" if scoped_run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()),
+        " WHERE t.searchable LIKE ? AND " + ("1=1" if scoped_run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()),
         [like],
         wifi_run_sql,
         wifi_run_params,
@@ -1568,7 +1616,13 @@ def entity_pivot(path: Path = DEFAULT_DB, value: str = "", limit: int = 200, run
 
 def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_id: int = 0) -> dict[str, Any]:
     conn = init_db(path)
-    table_map = {"log": "event_log", "event_log": "event_log", "wifi": "wifi_connections", "wifi_connections": "wifi_connections", "hosts": "hosts"}
+    table_map = {
+        "log": "event_log",
+        "event_log": "event_log",
+        "wifi": "wifi_connections",
+        "wifi_connections": "wifi_connections",
+        "hosts": "hosts",
+    }
     table = table_map.get(record_type)
     if not table:
         conn.close()
@@ -1642,16 +1696,20 @@ def _hourly_counts(conn: sqlite3.Connection, start: str, end: str, run_id: int |
     wifi_filter, wifi_params = _time_range_sql("derived_connected_at", start, end)
     wifi_run_sql, wifi_run_params = _run_observation_sql("wifi_connection", run_id)
     wifi_filter, wifi_params = _combine_filter(wifi_filter, wifi_params, wifi_run_sql, wifi_run_params)
-    sql = f"""
+    sql = (
+        f"""
         SELECT hour, SUM(count) AS count FROM (
             SELECT substr(timestamp, 12, 2) AS hour, COUNT(*) AS count FROM event_log t{event_filter} GROUP BY hour
             UNION ALL
-            SELECT substr(derived_connected_at, 12, 2) AS hour, COUNT(*) AS count FROM wifi_connections t{wifi_filter}{' AND ' if wifi_filter else ' WHERE '}""" + ("1=1" if run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()) + """ GROUP BY hour
+            SELECT substr(derived_connected_at, 12, 2) AS hour, COUNT(*) AS count FROM wifi_connections t{wifi_filter}{" AND " if wifi_filter else " WHERE "}"""
+        + ("1=1" if run_id is not None else "t." + WIFI_DEDUPE_SQL.strip())
+        + """ GROUP BY hour
         )
         WHERE hour IS NOT NULL AND hour != ''
         GROUP BY hour
         ORDER BY hour
     """
+    )
     return [dict(row) for row in conn.execute(sql, [*event_params, *wifi_params])]
 
 
@@ -1827,7 +1885,12 @@ def enrich_host_activity(conn: sqlite3.Connection, hosts: list[dict[str, Any]], 
         if host.get("last_activity"):
             continue
         candidates = [
-            (host.get("last_connected"), "exact_wifi_connection", "high", "Retained WLAN connection log entry matched this host."),
+            (
+                host.get("last_connected"),
+                "exact_wifi_connection",
+                "high",
+                "Retained WLAN connection log entry matched this host.",
+            ),
             (host.get("last_seen"), "retained_or_mesh_evidence", "medium", "Last retained evidence matched this host."),
         ]
         if host.get("active_now"):

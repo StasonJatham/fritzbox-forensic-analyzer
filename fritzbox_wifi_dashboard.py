@@ -12,7 +12,6 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-import time
 from types import SimpleNamespace
 from typing import Any
 import zipfile
@@ -40,7 +39,10 @@ from fritzbox_log_store import (
 
 
 def load_app_html() -> str:
-    for path in (Path(__file__).resolve().parent / "static" / "dashboard.html", Path.cwd() / "static" / "dashboard.html"):
+    for path in (
+        Path(__file__).resolve().parent / "static" / "dashboard.html",
+        Path.cwd() / "static" / "dashboard.html",
+    ):
         if path.exists():
             return path.read_text(encoding="utf-8")
     raise RuntimeError("static/dashboard.html was not found")
@@ -114,7 +116,9 @@ def import_acquisition_package_bytes(payload: bytes, filename: str = "import.zip
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail="Import JSON is not a valid FRITZ!Box dataset.") from exc
         if not isinstance(dataset, dict) or not {"generated_at", "known_hosts", "event_log"}.intersection(dataset):
-            raise HTTPException(status_code=400, detail="Import JSON does not look like a FRITZ!Box acquisition dataset.")
+            raise HTTPException(
+                status_code=400, detail="Import JSON does not look like a FRITZ!Box acquisition dataset."
+            )
         return import_dataset_profile(dataset, filename)
 
     try:
@@ -156,8 +160,12 @@ def import_dataset_profile(dataset: dict[str, Any], filename: str) -> dict[str, 
         ingest_dataset(dataset, temp_path)
         snapshot = latest_snapshot(temp_path)
         run = snapshot.get("latest_run") or {}
-        router = safe_profile_id(str((dataset.get("router") or {}).get("address") or run.get("router_address") or Path(filename).stem))
-        generated = safe_profile_id(str(dataset.get("generated_at") or run.get("generated_at") or datetime.now().astimezone().isoformat()))
+        router = safe_profile_id(
+            str((dataset.get("router") or {}).get("address") or run.get("router_address") or Path(filename).stem)
+        )
+        generated = safe_profile_id(
+            str(dataset.get("generated_at") or run.get("generated_at") or datetime.now().astimezone().isoformat())
+        )
         digest = hashlib.sha256(json.dumps(dataset, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:10]
         profile = safe_profile_id(f"{router}-{generated}-{digest}")
         target = profile_dir() / f"{profile}.sqlite3"
@@ -229,9 +237,14 @@ def export_from_stored_settings(hours: int, include_disconnects: bool) -> dict[s
     exporter.load_env_file(Path(".fritzbox.env"))
     stored = get_settings(DEFAULT_DB, include_secret=True)
     args = SimpleNamespace(
-        address=stored.get("address") or exporter.os.getenv("FRITZBOX_ADDRESS") or exporter.os.getenv("FRITZBOX_IP") or "192.168.178.1",
+        address=stored.get("address")
+        or exporter.os.getenv("FRITZBOX_ADDRESS")
+        or exporter.os.getenv("FRITZBOX_IP")
+        or "192.168.178.1",
         user=None,
-        password=stored.get("password") or exporter.os.getenv("FRITZBOX_PASSWORD") or exporter.os.getenv("FRITZBOX_ADMIN_PASS"),
+        password=stored.get("password")
+        or exporter.os.getenv("FRITZBOX_PASSWORD")
+        or exporter.os.getenv("FRITZBOX_ADMIN_PASS"),
         port=49000,
         tls=False,
         hours=hours,
@@ -471,7 +484,9 @@ def create_app() -> FastAPI:
         except SystemExit as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"FRITZ!Box export failed: {type(exc).__name__}: {exc}") from exc
+            raise HTTPException(
+                status_code=500, detail=f"FRITZ!Box export failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     @app.get("/api/raw-artifacts/download")
     def api_download_raw_artifacts(profile: str = PROFILE_LOCAL) -> Response:
@@ -551,7 +566,9 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/analysis")
-    def api_analysis(start: str = "", end: str = "", profile: str = PROFILE_LOCAL, run_id: str = "latest") -> JSONResponse:
+    def api_analysis(
+        start: str = "", end: str = "", profile: str = PROFILE_LOCAL, run_id: str = "latest"
+    ) -> JSONResponse:
         return JSONResponse(json_safe(analysis_snapshot(db_for_profile(profile), start, end, run_id)))
 
     @app.get("/api/entities")
@@ -590,7 +607,9 @@ def create_app() -> FastAPI:
     def api_get_settings() -> JSONResponse:
         settings = get_settings(DEFAULT_DB)
         if not settings.get("address"):
-            settings["address"] = exporter.os.getenv("FRITZBOX_ADDRESS") or exporter.os.getenv("FRITZBOX_IP") or "192.168.178.1"
+            settings["address"] = (
+                exporter.os.getenv("FRITZBOX_ADDRESS") or exporter.os.getenv("FRITZBOX_IP") or "192.168.178.1"
+            )
         return JSONResponse(settings)
 
     @app.post("/api/settings")

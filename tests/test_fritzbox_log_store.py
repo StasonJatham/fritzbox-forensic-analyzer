@@ -1,6 +1,15 @@
 from pathlib import Path
 
-from fritzbox_log_store import get_settings, ingest_dataset, init_db, latest_snapshot, list_runs, query_records, query_timeline, save_settings
+from fritzbox_log_store import (
+    get_settings,
+    ingest_dataset,
+    init_db,
+    latest_snapshot,
+    list_runs,
+    query_records,
+    query_timeline,
+    save_settings,
+)
 
 
 def test_query_records_uses_backend_fts_and_pagination(tmp_path: Path) -> None:
@@ -85,8 +94,20 @@ def test_query_records_sorts_and_pages(tmp_path: Path) -> None:
             "summary": {},
             "raw_exports": {},
             "event_log": [
-                {"timestamp": "2026-05-20T10:00:00+02:00", "category": "system", "ip": None, "mac": None, "message": "older"},
-                {"timestamp": "2026-05-20T11:00:00+02:00", "category": "system", "ip": None, "mac": None, "message": "newer"},
+                {
+                    "timestamp": "2026-05-20T10:00:00+02:00",
+                    "category": "system",
+                    "ip": None,
+                    "mac": None,
+                    "message": "older",
+                },
+                {
+                    "timestamp": "2026-05-20T11:00:00+02:00",
+                    "category": "system",
+                    "ip": None,
+                    "mac": None,
+                    "message": "newer",
+                },
             ],
             "available_wifi_connections": [],
             "known_hosts": [],
@@ -129,7 +150,9 @@ def test_ingest_preserves_repeated_observations_per_run(tmp_path: Path) -> None:
     conn = init_db(db)
     try:
         canonical_events = conn.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]
-        observations = conn.execute("SELECT COUNT(*) FROM record_observations WHERE record_type = 'event_log'").fetchone()[0]
+        observations = conn.execute(
+            "SELECT COUNT(*) FROM record_observations WHERE record_type = 'event_log'"
+        ).fetchone()[0]
         evidence = conn.execute("SELECT evidence_level FROM event_log LIMIT 1").fetchone()[0]
     finally:
         conn.close()
@@ -219,7 +242,7 @@ def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
                     "first_seen": "2026-05-01T12:00:00+02:00",
                     "last_seen": "2026-05-15T12:00:00+02:00",
                     "last_connected": "2026-05-15T12:00:00+02:00",
-                }
+                },
             ],
         },
         db,
@@ -232,7 +255,9 @@ def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
     assert hosts["rows"][0]["last_activity"]
     assert hosts["rows"][0]["last_activity_source"] == "active_host_snapshot"
     assert hosts["rows"][0]["last_activity_confidence"] == "medium"
-    assert query_records(db, "", "hosts", start="2026-05-20T00:00:00+02:00", end="2026-05-21T00:00:00+02:00")["total"] == 2
+    assert (
+        query_records(db, "", "hosts", start="2026-05-20T00:00:00+02:00", end="2026-05-21T00:00:00+02:00")["total"] == 2
+    )
     friday_hosts = query_records(db, "", "hosts", start="2026-05-15T00:00:00+02:00", end="2026-05-16T00:00:00+02:00")
     assert friday_hosts["total"] == 1
     assert friday_hosts["rows"][0]["hostname"] == "returned-phone"

@@ -56,7 +56,13 @@ fritzbox-wifi-export = "fritzbox_wifi_export:main"
 fritzbox-forensics-dashboard = "fritzbox_wifi_dashboard:main"
 
 [tool.setuptools]
-py-modules = ["fritzbox_wifi_export", "fritzbox_log_store", "fritzbox_wifi_dashboard"]
+py-modules = [
+  "fritzbox_collectors",
+  "fritzbox_log_store",
+  "fritzbox_parsers",
+  "fritzbox_wifi_dashboard",
+  "fritzbox_wifi_export"
+]
 include-package-data = true
 
 [tool.pytest.ini_options]
