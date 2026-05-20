@@ -94,6 +94,8 @@ async function loadStored({ quiet = false } = {}) {
 async function runAcquisition() {
   state.profile = "local";
   $("profile").value = "local";
+  const saved = await saveSettings({ quiet: true });
+  if (!saved) return;
   $("status").textContent = "Running FRITZ!Box acquisition...";
   const hours = $("hours").value;
   const response = await fetch(`/api/export?hours=${encodeURIComponent(hours)}&include_disconnects=true`);
@@ -154,7 +156,7 @@ async function loadSettings() {
     : "No password saved yet. Settings are stored locally in fritzbox-analysis.sqlite3.";
 }
 
-async function saveSettings() {
+async function saveSettings({ quiet = false } = {}) {
   $("settings-note").textContent = "Saving settings...";
   const payload = {
     address: $("cfg-address").value.trim(),
@@ -170,11 +172,12 @@ async function saveSettings() {
   });
   if (!response.ok) {
     $("settings-note").textContent = await readError(response);
-    return;
+    return false;
   }
   $("cfg-password").value = "";
   await loadSettings();
-  $("status").textContent = "Settings saved. Run acquisition when ready.";
+  if (!quiet) $("status").textContent = "Settings saved. Run acquisition when ready.";
+  return true;
 }
 
 function currentSummary() {
@@ -449,10 +452,11 @@ function table(headers, rows, sourceRows = []) {
       const source = sourceRows[index] || {};
       const type = source.record_type || (state.view === "wifi" ? "wifi" : state.view === "log" ? "log" : state.view === "hosts" ? "hosts" : "");
       const id = source.record_id || source.id || "";
-      return `<tr data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">${row.map((cell) => {
+      return `<tr data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">${row.map((cell, cellIndex) => {
         const raw = text(cell);
         const html = raw.startsWith("<span") || raw.startsWith("<button");
-        return `<td>${html ? raw : escapeHtml(display(cell))}</td>`;
+        const label = headers[cellIndex]?.[0] || "";
+        return `<td data-label="${escapeHtml(label)}">${html ? raw : escapeHtml(display(cell))}</td>`;
       }).join("")}</tr>`;
     }).join("")
   }</tbody></table>`;
