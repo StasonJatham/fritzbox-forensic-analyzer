@@ -661,6 +661,8 @@ def query_records(
     evidence_level: str = "all",
     time_type: str = "all",
     run_id: str | int = "latest",
+    start: str = "",
+    end: str = "",
 ) -> dict[str, Any]:
     conn = init_db(path)
     scoped_run_id = resolve_run_id(conn, run_id)
@@ -730,6 +732,36 @@ def query_records(
         if table == "event_log" and category != "all":
             where.append("t.category = ?")
             params.append(category)
+        time_column = ""
+        if table == "event_log":
+            time_column = "timestamp"
+        elif table == "wifi_connections":
+            time_column = "derived_connected_at"
+        elif table == "hosts":
+            active_run_filter = f" AND run_id = {scoped_run_id}" if scoped_run_id is not None else ""
+            time_column = """
+                last_activity,
+                t.last_seen,
+                t.last_connected,
+                CASE WHEN t.active_now = 1 THEN (
+                    SELECT MAX(observed_at)
+                    FROM record_observations
+                    WHERE record_type = 'host' AND record_table_id = t.id
+                    {active_run_filter}
+                ) END
+            """.format(active_run_filter=active_run_filter)
+        if start:
+            if table == "hosts":
+                where.append(f"COALESCE({time_column}, '') >= ?")
+            else:
+                where.append(f"COALESCE(t.{time_column}, '') >= ?")
+            params.append(start)
+        if end:
+            if table == "hosts":
+                where.append(f"COALESCE({time_column}, '') <= ?")
+            else:
+                where.append(f"COALESCE(t.{time_column}, '') <= ?")
+            params.append(end)
         if evidence_level != "all":
             where.append("COALESCE(t.evidence_level, '') = ?")
             params.append(evidence_level)

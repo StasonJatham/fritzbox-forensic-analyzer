@@ -70,7 +70,11 @@ function isoFromLocal(value) {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
-  return date.toISOString();
+  const offset = -date.getTimezoneOffset();
+  const sign = offset >= 0 ? "+" : "-";
+  const hours = String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0");
+  const minutes = String(Math.abs(offset) % 60).padStart(2, "0");
+  return `${value.length === 16 ? `${value}:00` : value}${sign}${hours}:${minutes}`;
 }
 
 function isExact(value) {
@@ -305,7 +309,9 @@ async function loadRows(reset = false) {
     sort_by: state.sortBy,
     sort_dir: state.sortDir,
     profile: state.profile,
-    run_id: state.runId
+    run_id: state.runId,
+    start: state.rangeStart,
+    end: state.rangeEnd
   });
   let endpoint = "/api/search";
   if (state.view === "timeline") {
@@ -320,6 +326,8 @@ async function loadRows(reset = false) {
     params.delete("time_type");
     params.delete("sort_by");
     params.delete("sort_dir");
+    params.delete("start");
+    params.delete("end");
   }
   const response = await fetch(`${endpoint}?${params.toString()}`);
   state.loading = false;

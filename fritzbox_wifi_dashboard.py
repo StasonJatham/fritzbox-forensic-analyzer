@@ -468,6 +468,8 @@ def create_app() -> FastAPI:
         time_type: str = Query(default="all"),
         profile: str = PROFILE_LOCAL,
         run_id: str = "latest",
+        start: str = "",
+        end: str = "",
     ) -> JSONResponse:
         return JSONResponse(
             json_safe(
@@ -483,6 +485,8 @@ def create_app() -> FastAPI:
                     evidence_level,
                     time_type,
                     run_id,
+                    start,
+                    end,
                 )
             )
         )
