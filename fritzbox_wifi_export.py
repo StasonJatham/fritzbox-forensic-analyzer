@@ -113,6 +113,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
         use_cache=True,
     )
 
+    generated_at = datetime.now().astimezone().isoformat()
     hosts = get_hosts(fc)
     hosts_by_mac = index_hosts_by_mac(hosts)
     device_info = get_device_info(fc)
@@ -132,13 +133,13 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     event_log = [entry_to_dict(entry) for entry in sorted(entries, key=lambda item: item.timestamp.isoformat() if item.timestamp else "", reverse=True)]
     wifi_events = sorted(events, key=lambda item: item["timestamp"] or "", reverse=True)
     mesh_wifi_devices = parse_mesh_wifi_devices(avm_exports.get("mesh_list"))
-    seen_by_host = build_host_seen_index(hosts, event_log, wifi_events)
+    seen_by_host = build_host_seen_index(hosts, event_log, wifi_events, mesh_wifi_devices, generated_at=generated_at)
     known_hosts = [host_to_dict(host, seen_by_host.get(host_identity(host), {})) for host in hosts]
     active_hosts = [host for host in known_hosts if host["active_now"]]
     last_wifi_connection = next((event["timestamp"] for event in wifi_events if event["event"] == "connected"), None)
 
     return {
-        "generated_at": datetime.now().astimezone().isoformat(),
+        "generated_at": generated_at,
         "window_hours": args.hours,
         "router": {
             "address": args.address,
@@ -455,8 +456,11 @@ def build_host_seen_index(
     hosts: list[dict[str, Any]],
     event_log: list[dict[str, Any]],
     wifi_events: list[dict[str, Any]],
+    mesh_wifi_devices: list[dict[str, Any]] | None = None,
+    generated_at: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {host_identity(host): {} for host in hosts}
+    mesh_wifi_devices = mesh_wifi_devices or []
 
     for host in hosts:
         identity = host_identity(host)
@@ -465,20 +469,45 @@ def build_host_seen_index(
         host_name = str(host.get("NewHostName") or "").casefold()
         timestamps: list[str] = []
         connected_timestamps: list[str] = []
+        activity_candidates: list[tuple[str, str, str, str]] = []
 
         for entry in event_log:
             if not entry.get("timestamp"):
                 continue
             if log_matches_host(entry, host_mac, host_ip, host_name):
-                timestamps.append(str(entry["timestamp"]))
+                timestamp = str(entry["timestamp"])
+                timestamps.append(timestamp)
+                activity_candidates.append((timestamp, "retained_log_match", "medium", "Retained router log mentions this host/IP/MAC/name."))
 
         for event in wifi_events:
             if not event.get("timestamp"):
                 continue
             if event_matches_host(event, host_mac, host_ip, host_name):
-                timestamps.append(str(event["timestamp"]))
+                timestamp = str(event["timestamp"])
+                timestamps.append(timestamp)
                 if event.get("event") == "connected":
-                    connected_timestamps.append(str(event["timestamp"]))
+                    connected_timestamps.append(timestamp)
+                    activity_candidates.append((timestamp, "exact_wifi_connection", "high", "Retained WLAN connection log entry matched this host."))
+                else:
+                    activity_candidates.append((timestamp, "wifi_event", "medium", "Retained WLAN-related log entry matched this host."))
+
+        for device in mesh_wifi_devices:
+            if not device.get("last_observed"):
+                continue
+            if event_matches_host(device, host_mac, host_ip, host_name):
+                timestamp = str(device["last_observed"])
+                timestamps.append(timestamp)
+                activity_candidates.append((timestamp, "mesh_last_observed", "low", "Mesh data observed this WLAN device; this is not an exact association time."))
+
+        if truthy(host.get("NewActive")) and generated_at:
+            activity_candidates.append(
+                (
+                    generated_at,
+                    "active_host_snapshot",
+                    "medium",
+                    "Host table reported this client active at acquisition time; this is an observation, not a session start time.",
+                )
+            )
 
         if timestamps:
             sorted_timestamps = sorted(set(timestamps))
@@ -489,6 +518,17 @@ def build_host_seen_index(
             index[identity]["last_seen"] = None
 
         index[identity]["last_connected"] = max(connected_timestamps) if connected_timestamps else None
+        if activity_candidates:
+            last_activity = max(activity_candidates, key=lambda item: item[0])
+            index[identity]["last_activity"] = last_activity[0]
+            index[identity]["last_activity_source"] = last_activity[1]
+            index[identity]["last_activity_confidence"] = last_activity[2]
+            index[identity]["last_activity_note"] = last_activity[3]
+        else:
+            index[identity]["last_activity"] = None
+            index[identity]["last_activity_source"] = None
+            index[identity]["last_activity_confidence"] = None
+            index[identity]["last_activity_note"] = None
 
     return index
 
@@ -513,9 +553,10 @@ def log_matches_host(entry: dict[str, Any], mac: str, ip: str, hostname: str) ->
 
 
 def event_matches_host(event: dict[str, Any], mac: str, ip: str, hostname: str) -> bool:
+    event_ips = [part.strip() for part in str(event.get("ip") or "").split(",")]
     return bool(
         (mac and str(event.get("mac") or "").lower() == mac)
-        or (ip and str(event.get("ip") or "") == ip)
+        or (ip and (str(event.get("ip") or "") == ip or ip in event_ips))
         or (hostname and str(event.get("hostname") or "").casefold() == hostname)
     )
 
@@ -532,6 +573,10 @@ def host_to_dict(host: dict[str, Any], seen: dict[str, Any] | None = None) -> di
         "first_seen": seen.get("first_seen"),
         "last_seen": seen.get("last_seen"),
         "last_connected": seen.get("last_connected"),
+        "last_activity": seen.get("last_activity"),
+        "last_activity_source": seen.get("last_activity_source"),
+        "last_activity_confidence": seen.get("last_activity_confidence"),
+        "last_activity_note": seen.get("last_activity_note"),
     }
 
 

@@ -403,10 +403,12 @@ function renderTable() {
   } else if (state.view === "hosts") {
     $("table").innerHTML = table([
       ["Action", ""], ["Host", "hostname"], ["MAC", "mac"], ["IP", "ip"], ["Interface", "interface"], ["Active", "active_now"],
-      ["First Seen", "first_seen"], ["Last Seen", "last_seen"], ["Last Connected", "last_connected"]
+      ["Last Activity", "last_activity"], ["Activity Evidence", "last_activity_confidence"],
+      ["Last Connected", "last_connected"], ["First Seen", "first_seen"], ["Last Seen", "last_seen"]
     ], rows.map((row) => [
       rowAction(row), row.hostname, row.mac, row.ip, row.interface, row.active_now ? "yes" : "no",
-      formatTime(row.first_seen), formatTime(row.last_seen), formatTime(row.last_connected)
+      formatTime(row.last_activity), activityBadge(row), formatTime(row.last_connected),
+      formatTime(row.first_seen), formatTime(row.last_seen)
     ]), rows);
   } else if (state.view === "timeline") {
     $("table").innerHTML = table([
@@ -464,6 +466,13 @@ function confidenceBadge(row) {
   const timeType = row.time_type || row.derived_time_type || (exact ? "exact" : "derived");
   const evidenceLevel = row.evidence_level || (exact ? "parsed_from_raw" : "inferred");
   return `${pill(timeType, timeType)} ${pill(confidence, confidence)} ${pill(evidenceLevel, evidenceLevel)}`;
+}
+
+function activityBadge(row) {
+  const confidence = row.last_activity_confidence || (row.last_connected ? "high" : row.last_activity ? "medium" : "");
+  const source = row.last_activity_source || (row.last_connected ? "exact_wifi_connection" : row.last_activity ? "inferred_activity" : "");
+  if (!confidence && !source) return "";
+  return `${pill(confidence || "unknown", confidence || "unknown")} ${pill(source || "activity", source || "activity")}`;
 }
 
 function table(headers, rows, sourceRows = []) {

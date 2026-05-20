@@ -165,7 +165,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_columns(
         conn,
         "hosts",
-        {"evidence_level": "TEXT NOT NULL DEFAULT 'enriched_from_current_host_table'", "evidence_note": "TEXT"},
+        {
+            "evidence_level": "TEXT NOT NULL DEFAULT 'enriched_from_current_host_table'",
+            "evidence_note": "TEXT",
+            "last_activity": "TEXT",
+            "last_activity_source": "TEXT",
+            "last_activity_confidence": "TEXT",
+            "last_activity_note": "TEXT",
+        },
     )
     conn.execute(
         """
@@ -380,9 +387,10 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                 """
                 INSERT OR IGNORE INTO hosts(
                     run_id, hostname, mac, ip, interface, active_now, first_seen, last_seen,
-                    last_connected, evidence_level, evidence_note, raw_json, searchable
+                    last_connected, last_activity, last_activity_source, last_activity_confidence,
+                    last_activity_note, evidence_level, evidence_note, raw_json, searchable
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -394,6 +402,10 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     host.get("first_seen"),
                     host.get("last_seen"),
                     host.get("last_connected"),
+                    host.get("last_activity"),
+                    host.get("last_activity_source"),
+                    host.get("last_activity_confidence"),
+                    host.get("last_activity_note"),
                     evidence_level,
                     evidence_note,
                     json.dumps(host, sort_keys=True),
@@ -680,8 +692,9 @@ def query_records(
             "first_seen": "COALESCE(t.first_seen, '')",
             "last_seen": "COALESCE(t.last_seen, '')",
             "last_connected": "COALESCE(t.last_connected, '')",
+            "last_activity": "COALESCE(t.last_activity, t.last_seen, t.last_connected, '')",
         }
-        order = f"{sort_map.get(sort_by, sort_map['last_seen'])} {direction}"
+        order = f"{sort_map.get(sort_by, sort_map['last_activity'])} {direction}"
         fts_type = "hosts"
         dedupe = "1=1"
     elif record_type == "log":
@@ -737,6 +750,8 @@ def query_records(
         sql = f"SELECT t.* FROM {table} t{join}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = [dict(row) for row in conn.execute(sql, params)]
+        if table == "hosts":
+            enrich_host_activity(conn, rows, scoped_run_id)
     else:
         if fts_query:
             where = " WHERE content MATCH ?"
@@ -1044,6 +1059,7 @@ def query_entities(path: Path = DEFAULT_DB, query: str = "", limit: int = 100, r
             [*params, limit],
         )
     ]
+    enrich_host_activity(conn, hosts, scoped_run_id)
     entities: dict[str, dict[str, Any]] = {}
     for host in hosts:
         key = host.get("mac") or host.get("ip") or host.get("hostname") or f"host-{host['id']}"
@@ -1397,6 +1413,50 @@ def _run_record_count(
     if extra_where:
         where = f"({where}) AND ({extra_where})"
     return int(conn.execute(f"SELECT COUNT(*) FROM {table} t WHERE {where}", [run_id, record_type]).fetchone()[0])
+
+
+def enrich_host_activity(conn: sqlite3.Connection, hosts: list[dict[str, Any]], run_id: int | None = None) -> None:
+    for host in hosts:
+        if host.get("last_activity"):
+            continue
+        candidates = [
+            (host.get("last_connected"), "exact_wifi_connection", "high", "Retained WLAN connection log entry matched this host."),
+            (host.get("last_seen"), "retained_or_mesh_evidence", "medium", "Last retained evidence matched this host."),
+        ]
+        if host.get("active_now"):
+            candidates.append(
+                (
+                    _host_observed_at(conn, int(host["id"]), run_id),
+                    "active_host_snapshot",
+                    "medium",
+                    "Host table reported this client active at acquisition time; this is an observation, not a session start time.",
+                )
+            )
+        candidates = [candidate for candidate in candidates if candidate[0]]
+        if not candidates:
+            continue
+        timestamp, source, confidence, note = max(candidates, key=lambda item: str(item[0]))
+        host["last_activity"] = timestamp
+        host["last_activity_source"] = source
+        host["last_activity_confidence"] = confidence
+        host["last_activity_note"] = note
+
+
+def _host_observed_at(conn: sqlite3.Connection, host_id: int, run_id: int | None = None) -> str | None:
+    params: list[Any] = [host_id]
+    run_sql = ""
+    if run_id is not None:
+        run_sql = " AND run_id = ?"
+        params.append(run_id)
+    row = conn.execute(
+        f"""
+        SELECT MAX(observed_at) AS observed_at
+        FROM record_observations
+        WHERE record_type = 'host' AND record_table_id = ?{run_sql}
+        """,
+        params,
+    ).fetchone()
+    return row["observed_at"] if row else None
 
 
 def get_settings(path: Path = DEFAULT_DB, include_secret: bool = False) -> dict[str, Any]:

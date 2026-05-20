@@ -188,6 +188,42 @@ def test_queries_can_scope_to_latest_or_specific_acquisition_run(tmp_path: Path)
     assert query_timeline(db, run_id=run_two)["total"] == 2
 
 
+def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [
+                {
+                    "hostname": "active-phone",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.21",
+                    "interface": "WLAN",
+                    "active_now": True,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "last_connected": None,
+                }
+            ],
+        },
+        db,
+    )
+
+    hosts = query_records(db, "active-phone", "hosts")
+
+    assert hosts["total"] == 1
+    assert hosts["rows"][0]["last_connected"] is None
+    assert hosts["rows"][0]["last_activity"]
+    assert hosts["rows"][0]["last_activity_source"] == "active_host_snapshot"
+    assert hosts["rows"][0]["last_activity_confidence"] == "medium"
+
+
 def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:
     db = tmp_path / "analysis.sqlite3"
     ingest_dataset(
