@@ -65,6 +65,62 @@ def test_query_records_uses_backend_fts_and_pagination(tmp_path: Path) -> None:
     assert log["rows"][0]["ip"] == "192.0.2.23"
 
 
+def test_all_evidence_search_returns_ranked_parsed_rows_and_filters(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.23",
+                    "mac": "AA:BB:CC:DD:EE:01",
+                    "message": "needle-login needle-login password failure",
+                }
+            ],
+            "available_wifi_connections": [
+                {
+                    "derived_connected_at": "2026-05-20T11:00:00+02:00",
+                    "derived_time_type": "mesh_last_observed",
+                    "derived_time_confidence": "low",
+                    "exact_connection_time_available": False,
+                    "event": "known_wifi_device",
+                    "hostname": "needle-login-phone",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.21",
+                    "source": "mesh_list",
+                    "confidence": "known_wifi_device_no_connection_timestamp",
+                    "message": "Known WLAN device",
+                }
+            ],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    results = query_records(db, "needle-login", "all", limit=10, offset=0)
+    ranks = [row["match_rank"] for row in results["rows"]]
+
+    assert results["total"] >= 2
+    assert ranks == sorted(ranks)
+    assert results["rows"][0]["record_type"] == "event_log"
+    assert results["rows"][0]["record_title"] == "needle-login needle-login password failure"
+    assert results["rows"][0]["record_time"] == "2026-05-20T12:00:00+02:00"
+    assert results["rows"][0]["evidence_level"] == "parsed_from_raw"
+    assert results["rows"][0]["rank_position"] == 1
+
+    inferred = query_records(db, "needle-login", "all", limit=10, offset=0, evidence_level="inferred")
+
+    assert inferred["total"] == 1
+    assert inferred["rows"][0]["record_type"] == "wifi_connections"
+    assert inferred["rows"][0]["record_entity"].startswith("needle-login-phone")
+
+
 def test_settings_store_preserves_password_when_blank(tmp_path: Path) -> None:
     db = tmp_path / "analysis.sqlite3"
     saved = save_settings(

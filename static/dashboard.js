@@ -65,6 +65,10 @@ function display(value, fallback = "-") {
     : rendered;
 }
 
+function escapeRegExp(value) {
+  return text(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function evidenceLabel(value) {
   const labels = {
     parsed_from_raw: "parsed raw",
@@ -678,9 +682,12 @@ function renderTable() {
   }
   if (state.view === "all") {
     $("table").innerHTML = table([
-      ["Action", ""], ["Type", "record_type"], ["Record", "record_id"], ["Parsed / Raw Text", ""]
+      ["Action", ""], ["Rank", "rank"], ["Type", "record_type"], ["When", "record_time"],
+      ["Entity", ""], ["Evidence", "evidence_level"], ["Parsed Match", ""]
     ], rows.map((row) => [
-      rowAction(row), evidenceLabel(row.record_type), row.record_id, row.content
+      rowAction(row), allEvidenceRank(row), allEvidenceType(row), formatTime(row.record_time),
+      allEvidenceEntity(row), pill(row.evidence_level || "unknown", row.evidence_level || "unknown"),
+      allEvidenceMatch(row)
     ]), rows);
   } else if (state.view === "wifi") {
     $("table").innerHTML = table([
@@ -835,6 +842,62 @@ function entityAction(row) {
   return `<button class="row-action" data-action="entity" data-entity="${escapeHtml(value)}">Open</button>`;
 }
 
+function allEvidenceRank(row) {
+  return state.query.trim() ? `<span class="rank-chip">#${escapeHtml(row.rank_position || "-")}</span>` : "";
+}
+
+function allEvidenceType(row) {
+  const label = row.record_label || evidenceLabel(row.record_type);
+  const cls = row.record_type || label;
+  return `${pill(label, cls)}<span class="muted-id">${escapeHtml(display(row.record_id))}</span>`;
+}
+
+function allEvidenceEntity(row) {
+  const entity = display(row.record_entity, "");
+  if (!entity) return "";
+  const normalized = entity.replace(/\s+/g, " ").trim();
+  return `<button class="entity-inline" data-action="entity" data-entity="${escapeHtml(normalized)}">${escapeHtml(normalized)}</button>`;
+}
+
+function allEvidenceMatch(row) {
+  const title = display(row.record_title, evidenceLabel(row.record_type));
+  const detail = snippetAroundQuery(row.match_text || row.content || "", state.query, 240);
+  const klass = display(row.record_class, "");
+  return `
+    <div class="result-cell">
+      <div class="result-title">${escapeHtml(title)}</div>
+      <div class="result-meta">
+        ${klass ? pill(klass, klass) : ""}
+        ${row.evidence_note ? `<span>${escapeHtml(row.evidence_note)}</span>` : ""}
+      </div>
+      <div class="result-snippet">${highlightQuery(detail, state.query)}</div>
+    </div>
+  `;
+}
+
+function snippetAroundQuery(value, query, width = 220) {
+  const content = text(value).replace(/\s+/g, " ").trim();
+  if (!content || content.length <= width) return content;
+  const tokens = (query.match(/[\w]+/g) || []).filter(Boolean);
+  const lowered = content.toLowerCase();
+  const index = tokens.reduce((best, token) => {
+    const found = lowered.indexOf(token.toLowerCase());
+    return found >= 0 && (best < 0 || found < best) ? found : best;
+  }, -1);
+  const start = index >= 0 ? Math.max(0, index - Math.floor(width / 3)) : 0;
+  const end = Math.min(content.length, start + width);
+  return `${start > 0 ? "... " : ""}${content.slice(start, end)}${end < content.length ? " ..." : ""}`;
+}
+
+function highlightQuery(value, query) {
+  const tokens = Array.from(new Set((query.match(/[\w]+/g) || []).filter((token) => token.length > 1)));
+  let escaped = escapeHtml(value);
+  tokens.sort((a, b) => b.length - a.length).forEach((token) => {
+    escaped = escaped.replace(new RegExp(`(${escapeRegExp(escapeHtml(token))})`, "ig"), "<mark>$1</mark>");
+  });
+  return escaped;
+}
+
 function ensureScrollable() {
   window.setTimeout(() => {
     const el = $("table");
@@ -883,7 +946,7 @@ function table(headers, rows, sourceRows = []) {
       const id = source.record_id || source.id || "";
       return `<tr data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">${row.map((cell, cellIndex) => {
         const raw = text(cell);
-        const html = raw.startsWith("<span") || raw.startsWith("<button");
+        const html = raw.startsWith("<span") || raw.startsWith("<button") || raw.trim().startsWith("<div");
         const label = headers[cellIndex]?.[0] || "";
         return `<td data-label="${escapeHtml(label)}">${html ? raw : escapeHtml(display(cell))}</td>`;
       }).join("")}</tr>`;
@@ -893,7 +956,7 @@ function table(headers, rows, sourceRows = []) {
 
 function defaultSortForView(view) {
   if (view === "hosts") return "last_activity";
-  if (view === "all") return "record_type";
+  if (view === "all") return "";
   if (view === "presence") return "last_activity";
   if (view === "log") return "timestamp";
   if (view === "timeline") return "timestamp";
@@ -1018,7 +1081,13 @@ function moveSharedTable(section) {
 
 function updateViewChrome() {
   document.querySelectorAll(".section-tab").forEach((tab) => {
-    tab.classList.toggle("active", tab.dataset.section === state.section);
+    let active = tab.dataset.section === state.section;
+    if (tab.dataset.section === "search" && tab.dataset.view === "all") {
+      active = state.section === "search" && state.view !== "timeline";
+    } else if (tab.dataset.view) {
+      active = state.section === tab.dataset.section && state.view === tab.dataset.view;
+    }
+    tab.classList.toggle("active", active);
   });
   document.querySelectorAll("[data-section-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.sectionPanel === state.section);
@@ -1028,7 +1097,7 @@ function updateViewChrome() {
     const activeSection = panel?.dataset.sectionPanel === state.section;
     tab.classList.toggle("active", activeSection && tab.dataset.view === state.view);
   });
-  if ($("category")) $("category").disabled = !["log", "timeline"].includes(state.view);
+  if ($("category")) $("category").disabled = !["all", "log", "timeline"].includes(state.view);
   if ($("table-title")) $("table-title").textContent = VIEW_LABELS[state.view] || evidenceLabel(state.view);
 }
 
@@ -1082,7 +1151,15 @@ document.querySelectorAll(".tab").forEach((tab) => {
 });
 
 document.querySelectorAll(".section-tab").forEach((tab) => {
-  tab.addEventListener("click", () => setSection(tab.dataset.section));
+  tab.addEventListener("click", () => {
+    const view = tab.dataset.view;
+    if (!view) {
+      setSection(tab.dataset.section);
+      return;
+    }
+    setSection(tab.dataset.section, { load: false, preserveView: true });
+    setView(view);
+  });
 });
 
 $("table").addEventListener("click", (event) => {

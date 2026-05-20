@@ -1940,6 +1940,267 @@ def searchable_text(row: dict[str, Any]) -> str:
     return " ".join(values)
 
 
+def _all_evidence_sources() -> list[dict[str, str]]:
+    sources = [
+        {
+            "table": "event_log",
+            "fts_type": "event_log",
+            "record_label": "Router Log",
+            "observation_type": "event_log",
+            "time_expr": "COALESCE(t.timestamp, '')",
+            "title_expr": "COALESCE(t.message, '')",
+            "entity_expr": "TRIM(COALESCE(t.mac, '') || ' ' || COALESCE(t.ip, ''))",
+            "class_expr": "COALESCE(t.category, '')",
+            "evidence_expr": "COALESCE(t.evidence_level, '')",
+            "evidence_note_expr": "COALESCE(t.evidence_note, '')",
+            "match_expr": "COALESCE(t.searchable, records_fts.content, '')",
+            "extra_filter": "1=1",
+        },
+        {
+            "table": "wifi_connections",
+            "fts_type": "wifi_connections",
+            "record_label": "WiFi Connection",
+            "observation_type": "wifi_connection",
+            "time_expr": "COALESCE(t.derived_connected_at, '')",
+            "title_expr": "COALESCE(NULLIF(t.message, ''), t.event, '')",
+            "entity_expr": "TRIM(COALESCE(t.hostname, '') || ' ' || COALESCE(t.mac, '') || ' ' || COALESCE(t.ip, ''))",
+            "class_expr": "COALESCE(t.derived_time_type, '')",
+            "evidence_expr": "COALESCE(t.evidence_level, '')",
+            "evidence_note_expr": "COALESCE(t.evidence_note, '')",
+            "match_expr": "COALESCE(t.searchable, records_fts.content, '')",
+            "extra_filter": "1=1",
+        },
+        {
+            "table": "hosts",
+            "fts_type": "hosts",
+            "record_label": "Host",
+            "observation_type": "host",
+            "time_expr": "COALESCE(t.last_activity, t.last_seen, t.last_connected, t.first_seen, '')",
+            "title_expr": "COALESCE(NULLIF(t.hostname, ''), t.friendly_name, t.mac, t.ip, '')",
+            "entity_expr": "TRIM(COALESCE(t.hostname, '') || ' ' || COALESCE(t.mac, '') || ' ' || COALESCE(t.ip, ''))",
+            "class_expr": "COALESCE(t.interface, '')",
+            "evidence_expr": "COALESCE(t.evidence_level, '')",
+            "evidence_note_expr": "COALESCE(t.evidence_note, '')",
+            "match_expr": "COALESCE(t.searchable, records_fts.content, '')",
+            "extra_filter": "1=1",
+        },
+        {
+            "table": "support_findings",
+            "fts_type": "support_findings",
+            "record_label": "Support Finding",
+            "observation_type": "support_finding",
+            "time_expr": "COALESCE(t.observed_at, '')",
+            "title_expr": "COALESCE(NULLIF(t.key, ''), t.finding_type, t.section, '')",
+            "entity_expr": "COALESCE(t.section, '')",
+            "class_expr": "COALESCE(t.finding_type, '')",
+            "evidence_expr": "COALESCE(t.evidence_level, '')",
+            "evidence_note_expr": "COALESCE(t.evidence_note, '')",
+            "match_expr": "COALESCE(NULLIF(t.raw_text, ''), t.searchable, records_fts.content, '')",
+            "extra_filter": "1=1",
+        },
+        {
+            "table": "raw_artifacts",
+            "fts_type": "raw_artifacts",
+            "record_label": "Raw Artifact",
+            "observation_type": "raw_artifact",
+            "time_expr": "COALESCE(t.created_at, '')",
+            "title_expr": "COALESCE(t.name, '')",
+            "entity_expr": "COALESCE(t.sha256, '')",
+            "class_expr": "'raw'",
+            "evidence_expr": "'raw'",
+            "evidence_note_expr": "'Raw artifact exposed by FRITZ!Box during this acquisition run.'",
+            "match_expr": "COALESCE(t.content, records_fts.content, '')",
+            "extra_filter": "1=1",
+        },
+    ]
+    for table, spec in ADDITIONAL_EVIDENCE_TABLES.items():
+        columns = [str(column) for column in spec["columns"]]
+        title_column = next(
+            (
+                column
+                for column in (
+                    "summary",
+                    "description",
+                    "hostname",
+                    "name",
+                    "ssid",
+                    "metric",
+                    "protocol",
+                    "node",
+                    "external_port",
+                )
+                if column in columns
+            ),
+            "record_key",
+        )
+        entity_columns = [
+            column for column in ("hostname", "mac", "ip", "internal_client", "node", "peer") if column in columns
+        ]
+        entity_expr = (
+            "TRIM(" + " || ' ' || ".join(f"COALESCE(t.{column}, '')" for column in entity_columns) + ")"
+            if entity_columns
+            else "COALESCE(t.record_key, '')"
+        )
+        time_column = str(spec["time_column"])
+        sources.append(
+            {
+                "table": table,
+                "fts_type": str(spec["fts_type"]),
+                "record_label": str(spec["record_type"]).replace("_", " ").title(),
+                "observation_type": str(spec["record_type"]),
+                "time_expr": f"COALESCE(t.{time_column}, '')" if time_column else "''",
+                "title_expr": f"COALESCE(t.{title_column}, t.record_key, '')",
+                "entity_expr": entity_expr,
+                "class_expr": f"'{table}'",
+                "evidence_expr": "COALESCE(t.evidence_level, '')",
+                "evidence_note_expr": "COALESCE(t.evidence_note, '')",
+                "match_expr": "COALESCE(t.searchable, records_fts.content, '')",
+                "extra_filter": "1=1",
+            }
+        )
+    return sources
+
+
+def _all_evidence_records(
+    conn: sqlite3.Connection,
+    fts_query: str,
+    limit: int,
+    offset: int,
+    sort_by: str,
+    sort_dir: str,
+    category: str,
+    evidence_level: str,
+    time_type: str,
+    scoped_run_id: int | None,
+    start: str,
+    end: str,
+) -> tuple[list[dict[str, Any]], int]:
+    select_parts: list[str] = []
+    params: list[Any] = []
+    for source in _all_evidence_sources():
+        rank_expr = "bm25(records_fts)" if fts_query else "0.0"
+        evidence_expr = source["evidence_expr"]
+        time_expr = source["time_expr"]
+        where = [
+            "records_fts.record_type = ?",
+            "records_fts.record_id = t.id",
+            source["extra_filter"],
+        ]
+        source_params: list[Any] = [source["fts_type"]]
+        if fts_query:
+            where.append("records_fts.content MATCH ?")
+            source_params.append(fts_query)
+        run_sql, run_params = _run_observation_sql(source["observation_type"], scoped_run_id)
+        if run_sql:
+            where.append(run_sql)
+            source_params.extend(run_params)
+        if category != "all":
+            if source["table"] == "event_log":
+                where.append("t.category = ?")
+                source_params.append(category)
+            elif source["table"] == "wifi_connections":
+                where.append("1=1" if category == "wifi" else "1=0")
+            elif category == "network" and source["table"] in {
+                "hosts",
+                "mesh_topology_links",
+                "wlan_associations",
+                "wlan_radios",
+                "advertisement_hints",
+                "network_status_snapshots",
+            }:
+                where.append("1=1")
+            elif category == "internet" and source["table"] in {"wan_port_mappings", "network_status_snapshots"}:
+                where.append("1=1")
+            else:
+                where.append("1=0")
+        if evidence_level != "all":
+            where.append(f"COALESCE({evidence_expr}, '') = ?")
+            source_params.append(evidence_level)
+        if time_type != "all":
+            if source["table"] == "event_log":
+                where.append("1=1" if time_type == "exact" else "1=0")
+            elif source["table"] == "wifi_connections":
+                if time_type == "exact":
+                    where.append("t.exact_connection_time_available = 1")
+                elif time_type == "derived":
+                    where.append("t.exact_connection_time_available = 0")
+                else:
+                    where.append("COALESCE(t.derived_time_type, '') = ?")
+                    source_params.append(time_type)
+            elif source["table"] == "hosts":
+                if time_type == "exact":
+                    where.append("COALESCE(t.last_activity_source, '') = 'exact_wifi_connection'")
+                elif time_type == "derived":
+                    where.append("COALESCE(t.last_activity_source, '') != 'exact_wifi_connection'")
+                else:
+                    where.append("COALESCE(t.last_activity_source, '') = ?")
+                    source_params.append(time_type)
+            else:
+                where.append("1=0")
+        if start and time_expr != "''":
+            where.append(f"COALESCE({time_expr}, '') >= ?")
+            source_params.append(start)
+        if end and time_expr != "''":
+            where.append(f"COALESCE({time_expr}, '') <= ?")
+            source_params.append(end)
+        select_parts.append(
+            f"""
+            SELECT
+                ? AS record_type,
+                ? AS record_label,
+                t.id AS record_id,
+                {time_expr} AS record_time,
+                {source["title_expr"]} AS record_title,
+                {source["entity_expr"]} AS record_entity,
+                {source["class_expr"]} AS record_class,
+                {evidence_expr} AS evidence_level,
+                {source["evidence_note_expr"]} AS evidence_note,
+                records_fts.content AS content,
+                {source["match_expr"]} AS match_text,
+                {rank_expr} AS match_rank,
+                CASE
+                    WHEN {evidence_expr} IN ('raw', 'parsed_from_raw') THEN 0
+                    WHEN {evidence_expr} = 'enriched_from_current_host_table' THEN 1
+                    WHEN {evidence_expr} = 'inferred' THEN 2
+                    ELSE 3
+                END AS evidence_weight
+            FROM {source["table"]} t
+            JOIN records_fts
+            WHERE {" AND ".join(where)}
+            """
+        )
+        params.extend([source["fts_type"], source["record_label"], *source_params])
+    union_sql = " UNION ALL ".join(select_parts)
+    total = int(conn.execute(f"SELECT COUNT(*) FROM ({union_sql}) all_evidence", params).fetchone()[0])
+    direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
+    order_map = {
+        "record_type": "record_type COLLATE NOCASE",
+        "record_id": "record_id",
+        "record_time": "record_time",
+        "evidence_level": "evidence_level COLLATE NOCASE",
+        "rank": "match_rank",
+    }
+    if fts_query and sort_by not in order_map:
+        order = "match_rank ASC, evidence_weight ASC, record_time DESC, record_id DESC"
+    elif sort_by in order_map:
+        if sort_by == "rank":
+            order = f"match_rank {'ASC' if fts_query else direction}, record_time DESC, record_id DESC"
+        else:
+            order = f"{order_map[sort_by]} {direction}, record_time DESC, record_id DESC"
+    else:
+        order = "record_time DESC, evidence_weight ASC, record_id DESC"
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            f"SELECT * FROM ({union_sql}) all_evidence ORDER BY {order} LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        )
+    ]
+    for index, row in enumerate(rows, start=offset + 1):
+        row["rank_position"] = index
+    return rows, total
+
+
 def query_records(
     path: Path = DEFAULT_DB,
     query: str = "",
@@ -2134,20 +2395,20 @@ def query_records(
         if table == "hosts":
             enrich_host_activity(conn, rows, scoped_run_id)
     else:
-        if fts_query:
-            where = " WHERE content MATCH ?"
-            params = [fts_query]
-        else:
-            where = ""
-            params = []
-        total = int(conn.execute(f"SELECT COUNT(*) FROM records_fts{where}", params).fetchone()[0])
-        rows = [
-            dict(row)
-            for row in conn.execute(
-                f"SELECT record_type, record_id, content FROM records_fts{where} LIMIT ? OFFSET ?",
-                [*params, limit, offset],
-            )
-        ]
+        rows, total = _all_evidence_records(
+            conn,
+            fts_query,
+            limit,
+            offset,
+            sort_by,
+            sort_dir,
+            category,
+            evidence_level,
+            time_type,
+            scoped_run_id,
+            start,
+            end,
+        )
     conn.close()
     return {"rows": rows, "total": total, "limit": limit, "offset": offset}
 
