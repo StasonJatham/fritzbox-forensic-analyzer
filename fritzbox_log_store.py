@@ -12,6 +12,19 @@ from typing import Any
 
 
 DEFAULT_DB = Path(os.getenv("FRITZBOX_ANALYSIS_DB", "fritzbox-analysis.sqlite3"))
+MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+ADVERTISEMENT_PROTOCOL_PATTERNS = {
+    "UPnP": re.compile(r"\b(upnp|igd_fw_cnt_upnp|allow_pcp_and_upnp|igd|internetgatewaydevice)\b", re.I),
+    "PCP": re.compile(r"\b(pcp|igd_fw_cnt_pcp)\b", re.I),
+    "SSDP": re.compile(r"\b(ssdp|239\.255\.255\.250|1900/udp|udp.?1900)\b", re.I),
+    "mDNS/Bonjour": re.compile(r"\b(mdns|bonjour|224\.0\.0\.251|5353/udp|udp.?5353)\b", re.I),
+    "IGMP/Multicast": re.compile(r"\b(igmp|multicast|224\.0\.0\.|239\.)\b", re.I),
+    "LLMNR": re.compile(r"\b(llmnr|224\.0\.0\.252|5355/udp|udp.?5355)\b", re.I),
+    "NetBIOS": re.compile(r"\b(netbios|nbns|nbtns|137/udp|138/udp|udp.?137|udp.?138)\b", re.I),
+    "ARP/Neighbor": re.compile(r"\b(arp|neighbou?r|ndp|neighbor solicitation|neighbor advertisement)\b", re.I),
+    "DHCP": re.compile(r"\b(dhcp|bootp|67/udp|68/udp|udp.?67|udp.?68)\b", re.I),
+}
 EXPECTED_RAW_ARTIFACTS = [
     "device_log_xml",
     "mesh_list",
@@ -285,6 +298,28 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             FOREIGN KEY(run_id) REFERENCES export_runs(id)
         );
 
+        CREATE TABLE IF NOT EXISTS advertisement_hints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            observed_at TEXT,
+            hint_type TEXT,
+            protocol TEXT,
+            hostname TEXT,
+            mac TEXT,
+            ip TEXT,
+            direction TEXT,
+            confidence TEXT,
+            summary TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'inferred',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
         CREATE TABLE IF NOT EXISTS device_risk_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -449,6 +484,7 @@ def repair_observation_table_ids(conn: sqlite3.Connection) -> None:
         "wan_port_mapping": lambda conn, row: lookup_keyed_record_id(conn, "wan_port_mappings", row),
         "wlan_radio": lambda conn, row: lookup_keyed_record_id(conn, "wlan_radios", row),
         "wlan_association": lambda conn, row: lookup_keyed_record_id(conn, "wlan_associations", row),
+        "advertisement_hint": lambda conn, row: lookup_keyed_record_id(conn, "advertisement_hints", row),
         "device_risk_summary": lambda conn, row: lookup_keyed_record_id(conn, "device_risk_summaries", row),
     }
     rows = conn.execute(
@@ -988,6 +1024,30 @@ ADDITIONAL_EVIDENCE_TABLES: dict[str, dict[str, Any]] = {
         "time_column": "observed_at",
         "note": "Current WLAN association detail parsed from FRITZ!Box WLAN evidence; this is an observation, not a session start time.",
     },
+    "advertisement_hints": {
+        "dataset_keys": ("advertisement_hints", "broadcast_hints", "advertising_hints"),
+        "record_type": "advertisement_hint",
+        "fts_type": "advertisement_hints",
+        "columns": (
+            "observed_at",
+            "hint_type",
+            "protocol",
+            "hostname",
+            "mac",
+            "ip",
+            "direction",
+            "confidence",
+            "summary",
+            "source",
+        ),
+        "record_key_fields": ("observed_at", "hint_type", "protocol", "mac", "ip", "source", "summary"),
+        "sort": "COALESCE(t.observed_at, '')",
+        "time_column": "observed_at",
+        "note": (
+            "Best-effort advertisement/broadcast hint from retained FRITZ!Box artifacts or router state; "
+            "not packet-level proof of every broadcast."
+        ),
+    },
     "device_risk_summaries": {
         "dataset_keys": ("device_risk_summaries", "device_risks"),
         "record_type": "device_risk_summary",
@@ -1024,6 +1084,12 @@ ADDITIONAL_RECORD_TYPE_ALIASES: dict[str, str] = {
     "wlan_radio": "wlan_radios",
     "wlan_associations": "wlan_associations",
     "wlan_association": "wlan_associations",
+    "advertisements": "advertisement_hints",
+    "advertisement": "advertisement_hints",
+    "advertisement_hints": "advertisement_hints",
+    "advertising": "advertisement_hints",
+    "broadcasts": "advertisement_hints",
+    "broadcast_hints": "advertisement_hints",
     "device_risks": "device_risk_summaries",
     "device_risk": "device_risk_summaries",
     "device_risk_summaries": "device_risk_summaries",
@@ -1119,6 +1185,9 @@ def extract_additional_evidence(dataset: dict[str, Any], generated_at: str) -> d
 
     mesh_raw = raw_exports.get("mesh_list")
     rows["mesh_topology_links"].extend(extract_mesh_links(mesh_raw))
+    rows["advertisement_hints"].extend(
+        build_advertisement_hints(dataset, raw_exports, rows["wan_port_mappings"], generated_at)
+    )
 
     if not rows["device_risk_summaries"]:
         rows["device_risk_summaries"].extend(build_device_risk_summaries(dataset))
@@ -1166,6 +1235,17 @@ def normalize_additional_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("hostname", first_value(row, "hostname", "NewAssociatedDeviceName"))
         normalized.setdefault("auth_state", first_value(row, "auth_state", "NewAssociatedDeviceAuthState"))
         normalized.setdefault("source", "WLANConfiguration:GetGenericAssociatedDeviceInfo")
+    elif table == "advertisement_hints":
+        normalized.setdefault("observed_at", first_value(row, "observed_at", "timestamp"))
+        normalized.setdefault("hint_type", first_value(row, "hint_type", "type"))
+        normalized.setdefault("protocol", first_value(row, "protocol", "service", "keyword"))
+        normalized.setdefault("hostname", first_value(row, "hostname", "host", "device"))
+        normalized.setdefault("mac", first_value(row, "mac", "client_mac"))
+        normalized.setdefault("ip", first_value(row, "ip", "client_ip", "internal_client"))
+        normalized.setdefault("direction", first_value(row, "direction"))
+        normalized.setdefault("confidence", first_value(row, "confidence", "derived_time_confidence"))
+        normalized.setdefault("summary", first_value(row, "summary", "message", "raw_text"))
+        normalized.setdefault("source", first_value(row, "source", "artifact"))
     elif table == "device_risk_summaries":
         device_key = first_value(row, "device_key", "mac", "ip", "hostname")
         normalized.setdefault("device_key", device_key)
@@ -1282,6 +1362,181 @@ def extract_mesh_links(content: Any) -> list[dict[str, Any]]:
                     }
                 )
     return rows
+
+
+def build_advertisement_hints(
+    dataset: dict[str, Any],
+    raw_exports: dict[str, Any],
+    wan_port_mappings: list[dict[str, Any]],
+    observed_at: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    host_index = host_lookup_index(dataset.get("known_hosts") or [])
+    for host in dataset.get("known_hosts") or []:
+        if not isinstance(host, dict):
+            continue
+        hostname = first_value(host, "hostname", "friendly_name", "name")
+        mac = first_value(host, "mac", "mac_address")
+        ip = first_value(host, "ip", "ipv4")
+        if truthy_value(host.get("allow_pcp_and_upnp")):
+            rows.append(
+                advertisement_hint_row(
+                    observed_at=observed_at,
+                    hint_type="router_upnp_pcp_policy",
+                    protocol="UPnP/PCP",
+                    hostname=hostname,
+                    mac=mac,
+                    ip=ip,
+                    direction="client_to_router_permission",
+                    confidence="medium",
+                    summary="FRITZ!Box host state allows PCP/UPnP for this device.",
+                    source="host_table",
+                )
+            )
+        for key, protocol in (("upnp_count", "UPnP"), ("pcp_count", "PCP")):
+            count = int_string(host.get(key))
+            if not count:
+                continue
+            rows.append(
+                advertisement_hint_row(
+                    observed_at=observed_at,
+                    hint_type="router_mapping_counter",
+                    protocol=protocol,
+                    hostname=hostname,
+                    mac=mac,
+                    ip=ip,
+                    direction="client_to_router_counter",
+                    confidence="medium",
+                    summary=f"FRITZ!Box host state reports {count} {protocol} mapping counter(s).",
+                    source="host_table",
+                )
+            )
+
+    for mapping in wan_port_mappings:
+        if not isinstance(mapping, dict):
+            continue
+        ip = first_value(mapping, "internal_client", "NewInternalClient")
+        host = host_index.get(str(ip or "").casefold(), {})
+        external = first_value(mapping, "external_port", "NewExternalPort")
+        proto = first_value(mapping, "protocol", "NewProtocol")
+        description = first_value(mapping, "description", "NewPortMappingDescription")
+        rows.append(
+            advertisement_hint_row(
+                observed_at=observed_at,
+                hint_type="wan_port_mapping_state",
+                protocol="UPnP/PCP candidate",
+                hostname=first_value(host, "hostname", "friendly_name"),
+                mac=first_value(host, "mac", "mac_address"),
+                ip=ip,
+                direction="router_to_wan_exposure",
+                confidence="medium",
+                summary=(
+                    f"Router has {proto or 'unknown'} WAN mapping {external or '?'}"
+                    f" to {ip or 'unknown'}"
+                    f"{f' ({description})' if description else ''}."
+                ),
+                source=first_value(mapping, "source") or "wan_port_mappings",
+            )
+        )
+
+    rows.extend(raw_advertisement_hints(raw_exports, host_index, observed_at))
+    return rows
+
+
+def advertisement_hint_row(**values: Any) -> dict[str, Any]:
+    return {
+        **values,
+        "evidence_level": "inferred",
+        "evidence_note": (
+            "Best-effort advertisement/broadcast hint from retained FRITZ!Box artifacts or router state; "
+            "not packet-level proof of every broadcast or service advertisement."
+        ),
+    }
+
+
+def raw_advertisement_hints(
+    raw_exports: dict[str, Any], host_index: dict[str, dict[str, Any]], observed_at: str
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for source, content in raw_exports.items():
+        text_content = artifact_text(content)
+        if not text_content:
+            continue
+        per_source_protocol_counts: dict[str, int] = {}
+        for protocol, pattern in ADVERTISEMENT_PROTOCOL_PATTERNS.items():
+            for match in pattern.finditer(text_content):
+                if per_source_protocol_counts.get(protocol, 0) >= 12 or len(rows) >= 250:
+                    break
+                snippet = artifact_snippet(text_content, match.start())
+                key = (str(source), protocol, snippet)
+                if key in seen:
+                    continue
+                seen.add(key)
+                per_source_protocol_counts[protocol] = per_source_protocol_counts.get(protocol, 0) + 1
+                mac = first_regex(MAC_RE, snippet)
+                ip = first_regex(IPV4_RE, snippet)
+                host = host_index.get(str(mac or "").casefold()) or host_index.get(str(ip or "").casefold()) or {}
+                rows.append(
+                    advertisement_hint_row(
+                        observed_at=observed_at,
+                        hint_type="raw_artifact_keyword",
+                        protocol=protocol,
+                        hostname=first_value(host, "hostname", "friendly_name"),
+                        mac=mac or first_value(host, "mac", "mac_address"),
+                        ip=ip or first_value(host, "ip", "ipv4"),
+                        direction="unknown_retained_artifact",
+                        confidence="low",
+                        summary=f"{protocol} keyword hit in {source}: {snippet}",
+                        source=source,
+                    )
+                )
+            if len(rows) >= 250:
+                break
+    return rows
+
+
+def host_lookup_index(hosts: list[Any]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        for key in ("mac", "mac_address", "ip", "ipv4", "hostname", "friendly_name"):
+            value = host.get(key)
+            if value not in (None, ""):
+                index[str(value).casefold()] = host
+    return index
+
+
+def artifact_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, sort_keys=True, default=str)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def artifact_snippet(content: str, offset: int, size: int = 360) -> str:
+    start = max(0, offset - size // 2)
+    end = min(len(content), offset + size // 2)
+    snippet = re.sub(r"\s+", " ", content[start:end]).strip()
+    return snippet[:size]
+
+
+def first_regex(pattern: re.Pattern[str], content: str) -> str | None:
+    match = pattern.search(content)
+    return match.group(0) if match else None
+
+
+def int_string(value: Any) -> int:
+    try:
+        return int(str(value or "0").strip())
+    except (TypeError, ValueError):
+        return 0
 
 
 def build_device_risk_summaries(dataset: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2254,6 +2509,7 @@ def analysis_snapshot(
     tr064 = tr064_summary(raw.get("tr064_snapshot_json"))
     host_risk = host_risk_summary(conn, host_filter, host_params, tr064.get("wan", {}).get("port_mappings") or [])
     last_used = last_used_histogram(conn, host_filter, host_params)
+    advertisement_hints = advertisement_hint_summary(conn, scoped_run_id, start, end)
     conn.close()
     return {
         "category_counts": category_counts,
@@ -2268,6 +2524,7 @@ def analysis_snapshot(
         "tr064_summary": tr064,
         "host_risk_summary": host_risk,
         "last_used_histogram": last_used,
+        "advertisement_hints": advertisement_hints,
         "retained": retained,
         "latest_run": dict(run) if run else None,
         "gaps": gaps,
@@ -2423,6 +2680,72 @@ def last_used_histogram(conn: sqlite3.Connection, host_filter: str, host_params:
         host_params,
     ).fetchall()
     return [dict(row) for row in reversed(rows)]
+
+
+def advertisement_hint_summary(
+    conn: sqlite3.Connection, run_id: int | None, start: str = "", end: str = ""
+) -> dict[str, Any]:
+    run_sql, run_params = _run_observation_sql("advertisement_hint", run_id)
+    where: list[str] = []
+    params: list[Any] = []
+    if run_sql:
+        where.append(run_sql)
+        params.extend(run_params)
+    if start:
+        where.append("COALESCE(t.observed_at, '') >= ?")
+        params.append(start)
+    if end:
+        where.append("COALESCE(t.observed_at, '') <= ?")
+        params.append(end)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    total = int(conn.execute(f"SELECT COUNT(*) FROM advertisement_hints t {where_sql}", params).fetchone()[0])
+    by_protocol = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(t.protocol, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM advertisement_hints t
+            {where_sql}
+            GROUP BY label
+            ORDER BY count DESC
+            LIMIT 8
+            """,
+            params,
+        )
+    ]
+    by_confidence = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(t.confidence, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM advertisement_hints t
+            {where_sql}
+            GROUP BY label
+            ORDER BY count DESC
+            """,
+            params,
+        )
+    ]
+    recent = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT observed_at, hint_type, protocol, hostname, mac, ip, direction, confidence, summary, source
+            FROM advertisement_hints t
+            {where_sql}
+            ORDER BY COALESCE(t.observed_at, '') DESC, t.id DESC
+            LIMIT 8
+            """,
+            params,
+        )
+    ]
+    return {
+        "available": total > 0,
+        "total": total,
+        "by_protocol": by_protocol,
+        "by_confidence": by_confidence,
+        "recent": recent,
+    }
 
 
 def tr064_summary(content: str | None) -> dict[str, Any]:

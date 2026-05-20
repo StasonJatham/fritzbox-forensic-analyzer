@@ -69,7 +69,17 @@ function evidenceLabel(value) {
     wan_port_mappings: "WAN exposure",
     wlan_radios: "WLAN radios",
     wlan_associations: "WLAN associations",
+    advertisement_hints: "ad/broadcast hints",
     device_risk_summaries: "device risk",
+    UPnP: "UPnP",
+    PCP: "PCP",
+    SSDP: "SSDP",
+    "mDNS/Bonjour": "mDNS/Bonjour",
+    "IGMP/Multicast": "IGMP/Multicast",
+    LLMNR: "LLMNR",
+    NetBIOS: "NetBIOS",
+    "ARP/Neighbor": "ARP/Neighbor",
+    DHCP: "DHCP",
     high: "high",
     medium: "medium",
     low: "low"
@@ -415,6 +425,7 @@ function renderCharts() {
   renderDeviceRisk(analysis.host_risk_summary || {});
   renderLastUsedHistogram(analysis.last_used_histogram || []);
   renderPresenceSummary(state.latest?.presence_summary || {});
+  renderAdvertisementHints(analysis.advertisement_hints || {});
 }
 
 function renderMiniChart(id, rows) {
@@ -572,6 +583,30 @@ function renderPresenceSummary(summary) {
   `).join("") : `<div class="empty">No device presence timestamps yet.</div>`;
 }
 
+function renderAdvertisementHints(summary) {
+  const recent = summary.recent || [];
+  const protocols = summary.by_protocol || [];
+  if (!summary.available) {
+    $("advertisement-hints").innerHTML = `<div class="empty">No retained advertisement or broadcast hints.</div>`;
+    return;
+  }
+  $("advertisement-hints").innerHTML = `
+    <div class="mini-row"><span>Total hints</span><strong>${escapeHtml(summary.total || 0)}</strong></div>
+    ${protocols.slice(0, 5).map((row) => `
+      <div class="mini-row"><span>${escapeHtml(evidenceLabel(row.label))}</span><strong>${escapeHtml(row.count || 0)}</strong></div>
+    `).join("")}
+    ${recent.slice(0, 5).map((row) => `
+      <div class="topology-row">
+        <div class="mini-row">
+          <span>${escapeHtml(display(row.hostname || row.ip || row.mac || row.protocol, "Hint"))}</span>
+          <strong>${escapeHtml(evidenceLabel(row.confidence))}</strong>
+        </div>
+        <div class="subtitle">${escapeHtml([row.protocol, row.direction, row.source].filter(Boolean).join(" / "))}</div>
+      </div>
+    `).join("")}
+  `;
+}
+
 function renderTimeline(rows) {
   $("timeline").innerHTML = rows.map((row) => `
     <button class="timeline-row ${escapeHtml(cssToken(row.event_class || row.category))}" data-record-type="${escapeHtml(row.record_type || "")}" data-record-id="${escapeHtml(row.record_id || "")}">
@@ -685,6 +720,15 @@ function renderTable() {
     ], rows.map((row) => [
       rowAction(row), formatTime(row.observed_at), row.radio_index, row.mac, row.ip,
       row.hostname, row.auth_state, row.speed, row.signal_strength, row.guest
+    ]), rows);
+  } else if (state.view === "advertisement_hints") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Observed", "observed_at"], ["Protocol", "protocol"], ["Host", "hostname"],
+      ["MAC", "mac"], ["IP", "ip"], ["Direction", "direction"], ["Confidence", "confidence"],
+      ["Source", "source"], ["Summary", "summary"]
+    ], rows.map((row) => [
+      rowAction(row), formatTime(row.observed_at), pill(row.protocol, row.protocol), row.hostname,
+      row.mac, row.ip, row.direction, confidenceBadge(row), row.source, row.summary
     ]), rows);
   } else if (state.view === "host_filter_profiles") {
     $("table").innerHTML = table([
@@ -808,6 +852,7 @@ function defaultSortForView(view) {
   if (view === "mesh_topology_links") return "last_connected";
   if (view === "wlan_radios") return "radio_index";
   if (view === "wlan_associations") return "observed_at";
+  if (view === "advertisement_hints") return "observed_at";
   if (view === "host_filter_profiles") return "name";
   if (view === "device_risk_summaries") return "risk_score";
   return "derived_connected_at";
@@ -839,6 +884,7 @@ function additionalEvidenceView(view) {
     "mesh_topology_links",
     "wlan_radios",
     "wlan_associations",
+    "advertisement_hints",
     "host_filter_profiles",
     "device_risk_summaries"
   ].includes(view);

@@ -664,3 +664,52 @@ def test_additional_evidence_extracts_from_raw_artifacts(tmp_path: Path) -> None
     risk = query_records(db, "UPnP", "device_risk")
     assert risk["total"] == 1
     assert risk["rows"][0]["risk_level"] == "medium"
+
+
+def test_advertisement_hints_are_extracted_and_searchable(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {
+                "support_data_txt": ("wlan debug: SSDP multicast 239.255.255.250 from 192.0.2.44 aa:bb:cc:dd:ee:ff\n")
+            },
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [
+                {
+                    "hostname": "camera",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.44",
+                    "interface": "WLAN",
+                    "allow_pcp_and_upnp": "1",
+                    "upnp_count": "2",
+                }
+            ],
+            "wan_port_mappings": [
+                {
+                    "protocol": "TCP",
+                    "external_port": "8443",
+                    "internal_client": "192.0.2.44",
+                    "internal_port": "443",
+                    "description": "camera",
+                    "enabled": "1",
+                }
+            ],
+        },
+        db,
+    )
+
+    ssdp = query_records(db, "SSDP", "advertisement_hints")
+    upnp = query_records(db, "UPnP", "advertisements")
+    snapshot = analysis_snapshot(db)
+
+    assert ssdp["total"] >= 1
+    assert ssdp["rows"][0]["protocol"] == "SSDP"
+    assert ssdp["rows"][0]["confidence"] == "low"
+    assert upnp["total"] >= 2
+    assert snapshot["advertisement_hints"]["total"] >= 3
+    assert any(row["label"] == "SSDP" for row in snapshot["advertisement_hints"]["by_protocol"])

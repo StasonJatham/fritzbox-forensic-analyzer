@@ -519,6 +519,7 @@ def create_app() -> FastAPI:
                 "^(all|wifi|hosts|presence|log|support|raw|host_filter|host_filters|host_filter_profiles|"
                 "mesh|mesh_links|mesh_topology_links|wan|wan_exposure|port_mappings|wan_port_mappings|"
                 "wlan_radios|wlan_radio|wlan_associations|wlan_association|"
+                "advertisements|advertisement|advertisement_hints|advertising|broadcasts|broadcast_hints|"
                 "device_risks|device_risk|device_risk_summaries)$"
             ),
         ),
