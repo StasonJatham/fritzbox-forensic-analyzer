@@ -2,6 +2,8 @@ const state = {
   latest: null,
   profiles: [],
   profile: "local",
+  runs: [],
+  runId: "latest",
   data: null,
   analysis: null,
   view: "timeline",
@@ -77,7 +79,7 @@ function isExact(value) {
 
 async function loadStored({ quiet = false } = {}) {
   if (!quiet) $("status").textContent = "Loading stored evidence...";
-  const response = await fetch(`/api/latest?profile=${encodeURIComponent(state.profile)}`);
+  const response = await fetch(`/api/latest?profile=${encodeURIComponent(state.profile)}&run_id=${encodeURIComponent(state.runId)}`);
   if (!response.ok) {
     $("status").textContent = await readError(response);
     return;
@@ -107,6 +109,7 @@ async function runAcquisition() {
   $("subtitle").textContent = `${display(state.data.router?.address, "FRITZ!Box")} - acquired ${formatTime(state.data.generated_at)}`;
   await loadStored({ quiet: true });
   await loadProfiles();
+  await loadRuns();
   $("status").textContent = "Acquisition complete. Stored evidence reloaded.";
 }
 
@@ -126,6 +129,23 @@ async function loadProfiles(selected = state.profile) {
   $("profile").value = state.profile;
 }
 
+async function loadRuns(selected = state.runId) {
+  const response = await fetch(`/api/runs?profile=${encodeURIComponent(state.profile)}`);
+  if (!response.ok) return;
+  const payload = await response.json();
+  state.runs = payload.runs || [];
+  $("run").innerHTML = [
+    `<option value="latest">Latest acquisition</option>`,
+    `<option value="all">All acquisitions</option>`,
+    ...state.runs.map((run) => `
+      <option value="${escapeHtml(run.id)}">${escapeHtml(run.label || `Run ${run.id}`)}</option>
+    `)
+  ].join("");
+  const valid = selected === "latest" || selected === "all" || state.runs.some((run) => String(run.id) === String(selected));
+  state.runId = valid ? String(selected) : "latest";
+  $("run").value = state.runId;
+}
+
 async function importPackage(file) {
   if (!file) return;
   $("status").textContent = `Importing ${file.name}...`;
@@ -142,6 +162,8 @@ async function importPackage(file) {
   const payload = await response.json();
   const imported = payload.profile || {};
   await loadProfiles(imported.id || "local");
+  state.runId = "latest";
+  await loadRuns();
   await loadStored({ quiet: true });
   $("status").textContent = `Imported ${imported.label || imported.id || "package"}.`;
 }
@@ -226,7 +248,7 @@ function renderAcquisitionStatus() {
 }
 
 async function loadAnalysis() {
-  const params = new URLSearchParams({ start: state.rangeStart, end: state.rangeEnd, profile: state.profile });
+  const params = new URLSearchParams({ start: state.rangeStart, end: state.rangeEnd, profile: state.profile, run_id: state.runId });
   const response = await fetch(`/api/analysis?${params.toString()}`);
   if (!response.ok) return;
   state.analysis = await response.json();
@@ -234,7 +256,7 @@ async function loadAnalysis() {
 }
 
 async function loadEntities() {
-  const params = new URLSearchParams({ q: state.query, limit: "40", profile: state.profile });
+  const params = new URLSearchParams({ q: state.query, limit: "40", profile: state.profile, run_id: state.runId });
   const response = await fetch(`/api/entities?${params.toString()}`);
   if (!response.ok) return;
   const payload = await response.json();
@@ -250,6 +272,7 @@ async function loadSideTimeline() {
     evidence_level: state.evidenceLevel,
     time_type: state.timeType,
     profile: state.profile,
+    run_id: state.runId,
     limit: "8",
     offset: "0"
   });
@@ -281,7 +304,8 @@ async function loadRows(reset = false) {
     offset: String(state.offset),
     sort_by: state.sortBy,
     sort_dir: state.sortDir,
-    profile: state.profile
+    profile: state.profile,
+    run_id: state.runId
   });
   let endpoint = "/api/search";
   if (state.view === "timeline") {
@@ -491,7 +515,9 @@ async function openEvidence(type, id) {
 
 async function openEntity(value) {
   if (!value) return;
-  const response = await fetch(`/api/entity?value=${encodeURIComponent(value)}&profile=${encodeURIComponent(state.profile)}`);
+  const response = await fetch(
+    `/api/entity?value=${encodeURIComponent(value)}&profile=${encodeURIComponent(state.profile)}&run_id=${encodeURIComponent(state.runId)}`
+  );
   if (!response.ok) return;
   const payload = await response.json();
   $("drawer-body").innerHTML = `
@@ -613,6 +639,12 @@ $("refresh").addEventListener("click", () => loadStored());
 $("run-acquisition").addEventListener("click", runAcquisition);
 $("profile").addEventListener("change", async (event) => {
   state.profile = event.target.value || "local";
+  state.runId = "latest";
+  await loadRuns();
+  await loadStored();
+});
+$("run").addEventListener("change", async (event) => {
+  state.runId = event.target.value || "latest";
   await loadStored();
 });
 $("import-package").addEventListener("click", () => $("import-file").click());
@@ -658,5 +690,6 @@ $("drawer-close-backdrop").addEventListener("click", () => $("drawer").classList
 $("category").disabled = false;
 loadSettings().then(async () => {
   await loadProfiles();
+  await loadRuns();
   await loadStored();
 });

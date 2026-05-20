@@ -31,6 +31,7 @@ from fritzbox_log_store import (
     ingest_dataset,
     init_db,
     latest_snapshot,
+    list_runs,
     query_entities,
     query_records,
     query_timeline,
@@ -404,12 +405,16 @@ def create_app() -> FastAPI:
         return load_app_html()
 
     @app.get("/api/latest")
-    def api_latest(profile: str = PROFILE_LOCAL) -> JSONResponse:
-        return JSONResponse(json_safe(latest_snapshot(db_for_profile(profile))))
+    def api_latest(profile: str = PROFILE_LOCAL, run_id: str = "latest") -> JSONResponse:
+        return JSONResponse(json_safe(latest_snapshot(db_for_profile(profile), run_id)))
 
     @app.get("/api/profiles")
     def api_profiles() -> JSONResponse:
         return JSONResponse(json_safe({"profiles": list_profiles()}))
+
+    @app.get("/api/runs")
+    def api_runs(profile: str = PROFILE_LOCAL) -> JSONResponse:
+        return JSONResponse(json_safe({"runs": list_runs(db_for_profile(profile))}))
 
     @app.post("/api/import/package")
     async def api_import_package(request: Request, filename: str = "import.zip") -> JSONResponse:
@@ -462,6 +467,7 @@ def create_app() -> FastAPI:
         evidence_level: str = Query(default="all"),
         time_type: str = Query(default="all"),
         profile: str = PROFILE_LOCAL,
+        run_id: str = "latest",
     ) -> JSONResponse:
         return JSONResponse(
             json_safe(
@@ -476,6 +482,7 @@ def create_app() -> FastAPI:
                     sort_dir,
                     evidence_level,
                     time_type,
+                    run_id,
                 )
             )
         )
@@ -491,28 +498,32 @@ def create_app() -> FastAPI:
         evidence_level: str = Query(default="all"),
         time_type: str = Query(default="all"),
         profile: str = PROFILE_LOCAL,
+        run_id: str = "latest",
     ) -> JSONResponse:
         return JSONResponse(
             json_safe(
-                query_timeline(db_for_profile(profile), q, category, start, end, limit, offset, evidence_level, time_type)
+                query_timeline(
+                    db_for_profile(profile), q, category, start, end, limit, offset, evidence_level, time_type, run_id
+                )
             )
         )
 
     @app.get("/api/analysis")
-    def api_analysis(start: str = "", end: str = "", profile: str = PROFILE_LOCAL) -> JSONResponse:
-        return JSONResponse(json_safe(analysis_snapshot(db_for_profile(profile), start, end)))
+    def api_analysis(start: str = "", end: str = "", profile: str = PROFILE_LOCAL, run_id: str = "latest") -> JSONResponse:
+        return JSONResponse(json_safe(analysis_snapshot(db_for_profile(profile), start, end, run_id)))
 
     @app.get("/api/entities")
     def api_entities(
         q: str = "",
         limit: int = Query(default=100, ge=1, le=500),
         profile: str = PROFILE_LOCAL,
+        run_id: str = "latest",
     ) -> JSONResponse:
-        return JSONResponse(json_safe(query_entities(db_for_profile(profile), q, limit)))
+        return JSONResponse(json_safe(query_entities(db_for_profile(profile), q, limit, run_id)))
 
     @app.get("/api/entity")
-    def api_entity(value: str = "", profile: str = PROFILE_LOCAL) -> JSONResponse:
-        return JSONResponse(json_safe(entity_pivot(db_for_profile(profile), value)))
+    def api_entity(value: str = "", profile: str = PROFILE_LOCAL, run_id: str = "latest") -> JSONResponse:
+        return JSONResponse(json_safe(entity_pivot(db_for_profile(profile), value, run_id=run_id)))
 
     @app.get("/api/evidence")
     def api_evidence(

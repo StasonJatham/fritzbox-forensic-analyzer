@@ -657,7 +657,8 @@
       }
 
       .search,
-      #profile {
+      #profile,
+      #run {
         grid-column: 1 / -1;
       }
 

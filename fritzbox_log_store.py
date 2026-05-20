@@ -192,6 +192,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         WHERE evidence_note IS NULL
         """
     )
+    repair_observation_table_ids(conn)
     conn.commit()
 
 
@@ -200,6 +201,26 @@ def ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]
     for name, definition in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def repair_observation_table_ids(conn: sqlite3.Connection) -> None:
+    lookup_map = {"event_log": lookup_event_id, "wifi_connection": lookup_wifi_id, "host": lookup_host_id}
+    rows = conn.execute(
+        """
+        SELECT id, record_type, record_table_id, content_json
+        FROM record_observations
+        WHERE record_type IN ('event_log', 'wifi_connection', 'host')
+        """
+    ).fetchall()
+    for row in rows:
+        record_id = row["record_table_id"]
+        try:
+            content = json.loads(row["content_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        replacement = lookup_map[str(row["record_type"])](conn, content)
+        if replacement and replacement != record_id:
+            conn.execute("UPDATE record_observations SET record_table_id = ? WHERE id = ?", [replacement, row["id"]])
 
 
 def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
@@ -284,7 +305,7 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     searchable,
                 ),
             )
-            row_id = cursor.lastrowid
+            row_id = cursor.lastrowid if cursor.rowcount else None
             if row_id:
                 add_fts(conn, "event_log", int(row_id), searchable)
             else:
@@ -333,7 +354,7 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     searchable,
                 ),
             )
-            row_id = cursor.lastrowid
+            row_id = cursor.lastrowid if cursor.rowcount else None
             if row_id:
                 add_fts(conn, "wifi_connections", int(row_id), searchable)
             else:
@@ -379,7 +400,7 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     searchable,
                 ),
             )
-            row_id = cursor.lastrowid
+            row_id = cursor.lastrowid if cursor.rowcount else None
             if row_id:
                 add_fts(conn, "hosts", int(row_id), searchable)
             else:
@@ -627,8 +648,10 @@ def query_records(
     sort_dir: str = "desc",
     evidence_level: str = "all",
     time_type: str = "all",
+    run_id: str | int = "latest",
 ) -> dict[str, Any]:
     conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
     fts_query = make_fts_query(query)
     direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
     if record_type == "wifi":
@@ -645,7 +668,7 @@ def query_records(
         }
         order = f"{sort_map.get(sort_by, sort_map['derived_connected_at'])} {direction}"
         fts_type = "wifi_connections"
-        dedupe = "t." + WIFI_DEDUPE_SQL.strip()
+        dedupe = "1=1" if scoped_run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()
     elif record_type == "hosts":
         table = "hosts"
         sort_map = {
@@ -681,11 +704,16 @@ def query_records(
         params: list[Any] = []
         where: list[str] = [dedupe]
         join = ""
+        observation_type = {"event_log": "event_log", "wifi_connections": "wifi_connection", "hosts": "host"}[table]
         if fts_query:
             join = " JOIN records_fts f ON f.record_id = t.id AND f.record_type = ?"
             params.append(fts_type)
             where.append("f.content MATCH ?")
             params.append(fts_query)
+        run_sql, run_params = _run_observation_sql(observation_type, scoped_run_id)
+        if run_sql:
+            where.append(run_sql)
+            params.extend(run_params)
         if table == "event_log" and category != "all":
             where.append("t.category = ?")
             params.append(category)
@@ -738,13 +766,17 @@ def query_timeline(
     offset: int = 0,
     evidence_level: str = "all",
     time_type: str = "all",
+    run_id: str | int = "latest",
 ) -> dict[str, Any]:
     conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
     fts_query = make_fts_query(query)
     rows: list[dict[str, Any]] = []
-    event_where, event_params = _timeline_filters("event_log", fts_query, category, start, end, evidence_level, time_type)
+    event_where, event_params = _timeline_filters(
+        "event_log", fts_query, category, start, end, evidence_level, time_type, scoped_run_id
+    )
     wifi_where, wifi_params = _timeline_filters(
-        "wifi_connections", fts_query, category, start, end, evidence_level, time_type
+        "wifi_connections", fts_query, category, start, end, evidence_level, time_type, scoped_run_id
     )
 
     event_total = int(conn.execute(f"SELECT COUNT(*) FROM event_log t{event_where}", event_params).fetchone()[0])
@@ -782,10 +814,16 @@ def _timeline_filters(
     end: str,
     evidence_level: str = "all",
     time_type: str = "all",
+    run_id: int | None = None,
 ) -> tuple[str, list[Any]]:
     params: list[Any] = []
     where: list[str] = []
     time_column = "timestamp" if table == "event_log" else "derived_connected_at"
+    observation_type = "event_log" if table == "event_log" else "wifi_connection"
+    run_sql, run_params = _run_observation_sql(observation_type, run_id)
+    if run_sql:
+        where.append(run_sql)
+        params.extend(run_params)
     if fts_query:
         where.append(
             "t.id IN (SELECT record_id FROM records_fts WHERE record_type = ? AND content MATCH ?)"
@@ -810,7 +848,7 @@ def _timeline_filters(
             else:
                 where.append("COALESCE(t.derived_time_type, '') = ?")
                 params.append(time_type)
-    if table == "wifi_connections":
+    if table == "wifi_connections" and run_id is None:
         where.append("t." + WIFI_DEDUPE_SQL.strip())
     if start:
         where.append(f"COALESCE(t.{time_column}, '') >= ?")
@@ -830,29 +868,64 @@ def _decode_json(value: Any) -> Any:
         return value
 
 
-def latest_snapshot(path: Path = DEFAULT_DB) -> dict[str, Any]:
+def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> dict[str, Any]:
     conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
     latest_run = conn.execute("SELECT * FROM export_runs ORDER BY id DESC LIMIT 1").fetchone()
-    retained = dict(
-        conn.execute(
-            "SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event, COUNT(*) AS event_count FROM event_log"
-        ).fetchone()
-    )
-    counts = {
-        "runs": int(conn.execute("SELECT COUNT(*) FROM export_runs").fetchone()[0]),
-        "raw_artifacts": int(conn.execute("SELECT COUNT(*) FROM raw_artifacts").fetchone()[0]),
-        "event_log": int(conn.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]),
-        "wifi_connections": int(
-            conn.execute("SELECT COUNT(*) FROM wifi_connections WHERE " + WIFI_DEDUPE_SQL).fetchone()[0]
-        ),
-        "hosts": int(conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]),
-        "active_hosts": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE active_now = 1").fetchone()[0]),
-    }
-    last_exact_wifi = conn.execute(
-        "SELECT MAX(derived_connected_at) FROM wifi_connections WHERE exact_connection_time_available = 1 AND "
-        + WIFI_DEDUPE_SQL
-    ).fetchone()[0]
-    latest = dict(latest_run) if latest_run else None
+    if scoped_run_id is None:
+        selected_run = latest_run
+        retained = dict(
+            conn.execute(
+                "SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event, COUNT(*) AS event_count FROM event_log"
+            ).fetchone()
+        )
+        counts = {
+            "runs": int(conn.execute("SELECT COUNT(*) FROM export_runs").fetchone()[0]),
+            "raw_artifacts": int(conn.execute("SELECT COUNT(*) FROM raw_artifacts").fetchone()[0]),
+            "event_log": int(conn.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]),
+            "wifi_connections": int(
+                conn.execute("SELECT COUNT(*) FROM wifi_connections WHERE " + WIFI_DEDUPE_SQL).fetchone()[0]
+            ),
+            "hosts": int(conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]),
+            "active_hosts": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE active_now = 1").fetchone()[0]),
+        }
+        last_exact_wifi = conn.execute(
+            "SELECT MAX(derived_connected_at) FROM wifi_connections WHERE exact_connection_time_available = 1 AND "
+            + WIFI_DEDUPE_SQL
+        ).fetchone()[0]
+    else:
+        selected_run = conn.execute("SELECT * FROM export_runs WHERE id = ?", [scoped_run_id]).fetchone()
+        retained = dict(
+            conn.execute(
+                """
+                SELECT MIN(event_time) AS oldest_event, MAX(event_time) AS newest_event, COUNT(*) AS event_count
+                FROM record_observations
+                WHERE run_id = ? AND record_type = 'event_log' AND event_time IS NOT NULL
+                """,
+                [scoped_run_id],
+            ).fetchone()
+        )
+        counts = {
+            "runs": int(conn.execute("SELECT COUNT(*) FROM export_runs").fetchone()[0]),
+            "raw_artifacts": _run_observation_count(conn, scoped_run_id, "raw_artifact"),
+            "event_log": _run_observation_count(conn, scoped_run_id, "event_log"),
+            "wifi_connections": _run_record_count(conn, scoped_run_id, "wifi_connection", "wifi_connections"),
+            "hosts": _run_record_count(conn, scoped_run_id, "host", "hosts"),
+            "active_hosts": _run_record_count(conn, scoped_run_id, "host", "hosts", "t.active_now = 1"),
+        }
+        last_exact_wifi = conn.execute(
+            """
+            SELECT MAX(t.derived_connected_at)
+            FROM wifi_connections t
+            WHERE t.exact_connection_time_available = 1
+              AND t.id IN (
+                SELECT record_table_id FROM record_observations
+                WHERE run_id = ? AND record_type = 'wifi_connection' AND record_table_id IS NOT NULL
+              )
+            """,
+            [scoped_run_id],
+        ).fetchone()[0]
+    latest = dict(selected_run) if selected_run else None
     if latest:
         for key in (
             "summary_json",
@@ -866,49 +939,78 @@ def latest_snapshot(path: Path = DEFAULT_DB) -> dict[str, Any]:
     return {
         "has_data": counts["runs"] > 0 or counts["event_log"] > 0 or counts["wifi_connections"] > 0 or counts["hosts"] > 0,
         "latest_run": latest,
+        "selected_run_id": scoped_run_id,
+        "run_scope": "all" if scoped_run_id is None else str(scoped_run_id),
         "retained": retained,
         "counts": counts,
         "last_exact_wifi": last_exact_wifi,
     }
 
 
-def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "") -> dict[str, Any]:
+def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "", run_id: str | int = "latest") -> dict[str, Any]:
     conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
     range_filter, params = _time_range_sql("timestamp", start, end)
+    event_run_sql, event_run_params = _run_observation_sql("event_log", scoped_run_id)
+    event_filter, event_params = _combine_filter(range_filter, params, event_run_sql, event_run_params)
     category_counts = [
         dict(row)
         for row in conn.execute(
-            f"SELECT COALESCE(category, 'unknown') AS label, COUNT(*) AS count FROM event_log{range_filter} GROUP BY label ORDER BY count DESC",
-            params,
+            f"SELECT COALESCE(category, 'unknown') AS label, COUNT(*) AS count FROM event_log t{event_filter} GROUP BY label ORDER BY count DESC",
+            event_params,
         )
     ]
     auth_counts = {
-        "failed": _count_like(conn, "event_log", "message", ["falsches", "fehlgeschlagen", "failed"], start, end, "timestamp"),
-        "successful": _count_like(conn, "event_log", "message", ["erfolgreich", "success"], start, end, "timestamp"),
-        "app": _count_like(conn, "event_log", "message", ["app"], start, end, "timestamp"),
+        "failed": _count_like(conn, "event_log", "message", ["falsches", "fehlgeschlagen", "failed"], start, end, "timestamp", scoped_run_id),
+        "successful": _count_like(conn, "event_log", "message", ["erfolgreich", "success"], start, end, "timestamp", scoped_run_id),
+        "app": _count_like(conn, "event_log", "message", ["app"], start, end, "timestamp", scoped_run_id),
     }
-    hourly = _hourly_counts(conn, start, end)
+    hourly = _hourly_counts(conn, start, end, scoped_run_id)
+    wifi_run_sql, wifi_run_params = _run_observation_sql("wifi_connection", scoped_run_id)
+    confidence_filter, confidence_params = _combine_filter(
+        " WHERE " + ("1=1" if scoped_run_id is not None else WIFI_DEDUPE_SQL),
+        [],
+        wifi_run_sql,
+        wifi_run_params,
+    )
     confidence = [
         dict(row)
         for row in conn.execute(
-            """
+            f"""
             SELECT COALESCE(derived_time_confidence, evidence, 'unknown') AS label, COUNT(*) AS count
-            FROM wifi_connections
-            WHERE """ + WIFI_DEDUPE_SQL + """
+            FROM wifi_connections t
+            {confidence_filter}
             GROUP BY label
             ORDER BY count DESC
-            """
+            """,
+            confidence_params,
         )
     ]
-    retained = dict(
-        conn.execute(
-            "SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event, COUNT(*) AS event_count FROM event_log"
+    if scoped_run_id is None:
+        retained = dict(
+            conn.execute(
+                "SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event, COUNT(*) AS event_count FROM event_log"
+            ).fetchone()
+        )
+        run = conn.execute(
+            "SELECT generated_at, router_address, summary_json FROM export_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
-    )
-    run = conn.execute(
-        "SELECT generated_at, router_address, summary_json FROM export_runs ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    gaps = _event_gaps(conn)
+    else:
+        retained = dict(
+            conn.execute(
+                """
+                SELECT MIN(event_time) AS oldest_event, MAX(event_time) AS newest_event, COUNT(*) AS event_count
+                FROM record_observations
+                WHERE run_id = ? AND record_type = 'event_log' AND event_time IS NOT NULL
+                """,
+                [scoped_run_id],
+            ).fetchone()
+        )
+        run = conn.execute(
+            "SELECT generated_at, router_address, summary_json FROM export_runs WHERE id = ?",
+            [scoped_run_id],
+        ).fetchone()
+    gaps = _event_gaps(conn, scoped_run_id)
     conn.close()
     return {
         "category_counts": category_counts,
@@ -921,15 +1023,27 @@ def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "") -
     }
 
 
-def query_entities(path: Path = DEFAULT_DB, query: str = "", limit: int = 100) -> dict[str, Any]:
+def query_entities(path: Path = DEFAULT_DB, query: str = "", limit: int = 100, run_id: str | int = "latest") -> dict[str, Any]:
     conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
     q = f"%{query.casefold()}%" if query else ""
-    where = ""
+    where_parts: list[str] = []
     params: list[Any] = []
     if q:
-        where = "WHERE lower(searchable) LIKE ?"
+        where_parts.append("lower(t.searchable) LIKE ?")
         params.append(q)
-    hosts = [dict(row) for row in conn.execute(f"SELECT * FROM hosts {where} ORDER BY COALESCE(last_seen, '') DESC LIMIT ?", [*params, limit])]
+    run_sql, run_params = _run_observation_sql("host", scoped_run_id)
+    if run_sql:
+        where_parts.append(run_sql)
+        params.extend(run_params)
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    hosts = [
+        dict(row)
+        for row in conn.execute(
+            f"SELECT t.* FROM hosts t {where} ORDER BY COALESCE(t.last_seen, '') DESC LIMIT ?",
+            [*params, limit],
+        )
+    ]
     entities: dict[str, dict[str, Any]] = {}
     for host in hosts:
         key = host.get("mac") or host.get("ip") or host.get("hostname") or f"host-{host['id']}"
@@ -944,29 +1058,54 @@ def query_entities(path: Path = DEFAULT_DB, query: str = "", limit: int = 100) -
             "last_seen": host.get("last_seen"),
             "last_connected": host.get("last_connected"),
             "host_record": host,
-            "event_count": _entity_event_count(conn, host),
-            "wifi_count": _entity_wifi_count(conn, host),
+            "event_count": _entity_event_count(conn, host, scoped_run_id),
+            "wifi_count": _entity_wifi_count(conn, host, scoped_run_id),
         }
     conn.close()
     return {"rows": list(entities.values()), "total": len(entities)}
 
 
-def entity_pivot(path: Path = DEFAULT_DB, value: str = "", limit: int = 200) -> dict[str, Any]:
+def entity_pivot(path: Path = DEFAULT_DB, value: str = "", limit: int = 200, run_id: str | int = "latest") -> dict[str, Any]:
     conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
     needle = value.strip()
     if not needle:
         conn.close()
         return {"entity": {}, "timeline": [], "hosts": [], "wifi": [], "logs": []}
     like = f"%{needle}%"
-    hosts = [dict(row) for row in conn.execute("SELECT * FROM hosts WHERE searchable LIKE ? ORDER BY COALESCE(last_seen, '') DESC LIMIT 10", [like])]
+    host_run_sql, host_run_params = _run_observation_sql("host", scoped_run_id)
+    host_where, host_params = _combine_filter(" WHERE t.searchable LIKE ?", [like], host_run_sql, host_run_params)
+    hosts = [
+        dict(row)
+        for row in conn.execute(
+            f"SELECT t.* FROM hosts t{host_where} ORDER BY COALESCE(t.last_seen, '') DESC LIMIT 10",
+            host_params,
+        )
+    ]
+    wifi_run_sql, wifi_run_params = _run_observation_sql("wifi_connection", scoped_run_id)
+    wifi_where, wifi_params = _combine_filter(
+        " WHERE t.searchable LIKE ? AND "
+        + ("1=1" if scoped_run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()),
+        [like],
+        wifi_run_sql,
+        wifi_run_params,
+    )
     wifi = [
         dict(row)
         for row in conn.execute(
-            "SELECT * FROM wifi_connections WHERE searchable LIKE ? AND " + WIFI_DEDUPE_SQL + " ORDER BY COALESCE(derived_connected_at, '') DESC LIMIT ?",
-            [like, limit],
+            f"SELECT t.* FROM wifi_connections t{wifi_where} ORDER BY COALESCE(t.derived_connected_at, '') DESC LIMIT ?",
+            [*wifi_params, limit],
         )
     ]
-    logs = [dict(row) for row in conn.execute("SELECT * FROM event_log WHERE searchable LIKE ? ORDER BY COALESCE(timestamp, '') DESC LIMIT ?", [like, limit])]
+    event_run_sql, event_run_params = _run_observation_sql("event_log", scoped_run_id)
+    event_where, event_params = _combine_filter(" WHERE t.searchable LIKE ?", [like], event_run_sql, event_run_params)
+    logs = [
+        dict(row)
+        for row in conn.execute(
+            f"SELECT t.* FROM event_log t{event_where} ORDER BY COALESCE(t.timestamp, '') DESC LIMIT ?",
+            [*event_params, limit],
+        )
+    ]
     timeline = [
         {
             "record_type": "event_log",
@@ -1051,24 +1190,40 @@ def _time_range_sql(column: str, start: str, end: str) -> tuple[str, list[Any]]:
     return (f" WHERE {' AND '.join(where)}" if where else "", params)
 
 
-def _count_like(conn: sqlite3.Connection, table: str, column: str, needles: list[str], start: str, end: str, time_column: str) -> int:
+def _count_like(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    needles: list[str],
+    start: str,
+    end: str,
+    time_column: str,
+    run_id: int | None = None,
+) -> int:
     range_sql, params = _time_range_sql(time_column, start, end)
+    record_type = "event_log" if table == "event_log" else table
+    run_sql, run_params = _run_observation_sql(record_type, run_id)
+    range_sql, params = _combine_filter(range_sql, params, run_sql, run_params)
     clause = " OR ".join([f"lower({column}) LIKE ?" for _ in needles])
     if range_sql:
-        sql = f"SELECT COUNT(*) FROM {table}{range_sql} AND ({clause})"
+        sql = f"SELECT COUNT(*) FROM {table} t{range_sql} AND ({clause})"
     else:
-        sql = f"SELECT COUNT(*) FROM {table} WHERE {clause}"
+        sql = f"SELECT COUNT(*) FROM {table} t WHERE {clause}"
     return int(conn.execute(sql, [*params, *[f"%{needle}%" for needle in needles]]).fetchone()[0])
 
 
-def _hourly_counts(conn: sqlite3.Connection, start: str, end: str) -> list[dict[str, Any]]:
+def _hourly_counts(conn: sqlite3.Connection, start: str, end: str, run_id: int | None = None) -> list[dict[str, Any]]:
     event_filter, event_params = _time_range_sql("timestamp", start, end)
+    event_run_sql, event_run_params = _run_observation_sql("event_log", run_id)
+    event_filter, event_params = _combine_filter(event_filter, event_params, event_run_sql, event_run_params)
     wifi_filter, wifi_params = _time_range_sql("derived_connected_at", start, end)
+    wifi_run_sql, wifi_run_params = _run_observation_sql("wifi_connection", run_id)
+    wifi_filter, wifi_params = _combine_filter(wifi_filter, wifi_params, wifi_run_sql, wifi_run_params)
     sql = f"""
         SELECT hour, SUM(count) AS count FROM (
-            SELECT substr(timestamp, 12, 2) AS hour, COUNT(*) AS count FROM event_log{event_filter} GROUP BY hour
+            SELECT substr(timestamp, 12, 2) AS hour, COUNT(*) AS count FROM event_log t{event_filter} GROUP BY hour
             UNION ALL
-            SELECT substr(derived_connected_at, 12, 2) AS hour, COUNT(*) AS count FROM wifi_connections{wifi_filter}{' AND ' if wifi_filter else ' WHERE '}""" + WIFI_DEDUPE_SQL + """ GROUP BY hour
+            SELECT substr(derived_connected_at, 12, 2) AS hour, COUNT(*) AS count FROM wifi_connections t{wifi_filter}{' AND ' if wifi_filter else ' WHERE '}""" + ("1=1" if run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()) + """ GROUP BY hour
         )
         WHERE hour IS NOT NULL AND hour != ''
         GROUP BY hour
@@ -1077,8 +1232,13 @@ def _hourly_counts(conn: sqlite3.Connection, start: str, end: str) -> list[dict[
     return [dict(row) for row in conn.execute(sql, [*event_params, *wifi_params])]
 
 
-def _event_gaps(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = [row["timestamp"] for row in conn.execute("SELECT timestamp FROM event_log WHERE timestamp IS NOT NULL ORDER BY timestamp")]
+def _event_gaps(conn: sqlite3.Connection, run_id: int | None = None) -> list[dict[str, Any]]:
+    run_sql, run_params = _run_observation_sql("event_log", run_id)
+    where, params = _combine_filter(" WHERE t.timestamp IS NOT NULL", [], run_sql, run_params)
+    rows = [
+        row["timestamp"]
+        for row in conn.execute(f"SELECT t.timestamp FROM event_log t{where} ORDER BY t.timestamp", params)
+    ]
     gaps: list[dict[str, Any]] = []
     previous_dt: datetime | None = None
     previous_raw = ""
@@ -1096,25 +1256,34 @@ def _event_gaps(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return sorted(gaps, key=lambda row: row["hours"], reverse=True)[:5]
 
 
-def _entity_event_count(conn: sqlite3.Connection, host: dict[str, Any]) -> int:
+def _entity_event_count(conn: sqlite3.Connection, host: dict[str, Any], run_id: int | None = None) -> int:
     terms = [host.get("hostname"), host.get("mac"), host.get("ip")]
     terms = [term for term in terms if term]
     if not terms:
         return 0
     where = " OR ".join("searchable LIKE ?" for _ in terms)
-    return int(conn.execute(f"SELECT COUNT(*) FROM event_log WHERE {where}", [f"%{term}%" for term in terms]).fetchone()[0])
+    run_sql, run_params = _run_observation_sql("event_log", run_id)
+    filter_sql, params = _combine_filter(f" WHERE ({where})", [f"%{term}%" for term in terms], run_sql, run_params)
+    return int(conn.execute(f"SELECT COUNT(*) FROM event_log t{filter_sql}", params).fetchone()[0])
 
 
-def _entity_wifi_count(conn: sqlite3.Connection, host: dict[str, Any]) -> int:
+def _entity_wifi_count(conn: sqlite3.Connection, host: dict[str, Any], run_id: int | None = None) -> int:
     terms = [host.get("hostname"), host.get("mac"), host.get("ip")]
     terms = [term for term in terms if term]
     if not terms:
         return 0
     where = " OR ".join("searchable LIKE ?" for _ in terms)
+    run_sql, run_params = _run_observation_sql("wifi_connection", run_id)
+    filter_sql, params = _combine_filter(
+        f" WHERE ({where}) AND " + ("1=1" if run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()),
+        [f"%{term}%" for term in terms],
+        run_sql,
+        run_params,
+    )
     return int(
         conn.execute(
-            f"SELECT COUNT(*) FROM wifi_connections WHERE ({where}) AND {WIFI_DEDUPE_SQL}",
-            [f"%{term}%" for term in terms],
+            f"SELECT COUNT(*) FROM wifi_connections t{filter_sql}",
+            params,
         ).fetchone()[0]
     )
 
@@ -1131,6 +1300,103 @@ def _snippet(content: str, needle: str, width: int = 360) -> str:
 def make_fts_query(query: str) -> str:
     tokens = re.findall(r"[\w]+", query.casefold())
     return " AND ".join(f"{token}*" for token in tokens)
+
+
+def resolve_run_id(conn: sqlite3.Connection, run_id: str | int | None = "latest") -> int | None:
+    value = str(run_id or "latest").strip().lower()
+    if value == "all":
+        return None
+    if value == "latest":
+        row = conn.execute("SELECT id FROM export_runs ORDER BY id DESC LIMIT 1").fetchone()
+        return int(row["id"]) if row else None
+    try:
+        return int(value)
+    except ValueError:
+        row = conn.execute("SELECT id FROM export_runs ORDER BY id DESC LIMIT 1").fetchone()
+        return int(row["id"]) if row else None
+
+
+def list_runs(path: Path = DEFAULT_DB) -> list[dict[str, Any]]:
+    conn = init_db(path)
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT r.id, r.generated_at, r.acquired_at, r.router_address, r.window_hours,
+                   COUNT(DISTINCT CASE WHEN o.record_type = 'event_log' THEN o.record_table_id END) AS event_log,
+                   COUNT(DISTINCT CASE WHEN o.record_type = 'wifi_connection' THEN o.record_table_id END) AS wifi_connections,
+                   COUNT(DISTINCT CASE WHEN o.record_type = 'host' THEN o.record_table_id END) AS hosts
+            FROM export_runs r
+            LEFT JOIN record_observations o ON o.run_id = r.id
+            GROUP BY r.id
+            ORDER BY r.id DESC
+            """
+        )
+    ]
+    conn.close()
+    for row in rows:
+        timestamp = row.get("generated_at") or row.get("acquired_at") or f"run {row['id']}"
+        router = row.get("router_address") or "unknown router"
+        row["label"] = (
+            f"Run {row['id']} - {router} - {timestamp} "
+            f"({row.get('event_log') or 0} logs / {row.get('wifi_connections') or 0} wifi / {row.get('hosts') or 0} hosts)"
+        )
+    return rows
+
+
+def _run_observation_sql(record_type: str, run_id: int | None) -> tuple[str, list[Any]]:
+    if run_id is None:
+        return "", []
+    return (
+        """
+        t.id IN (
+            SELECT record_table_id FROM record_observations
+            WHERE run_id = ? AND record_type = ? AND record_table_id IS NOT NULL
+        )
+        """,
+        [run_id, record_type],
+    )
+
+
+def _combine_filter(
+    base_sql: str,
+    base_params: list[Any],
+    extra_sql: str,
+    extra_params: list[Any],
+) -> tuple[str, list[Any]]:
+    if not extra_sql:
+        return base_sql, base_params
+    if base_sql:
+        return f"{base_sql} AND {extra_sql}", [*base_params, *extra_params]
+    return f" WHERE {extra_sql}", extra_params
+
+
+def _run_observation_count(conn: sqlite3.Connection, run_id: int, record_type: str) -> int:
+    column = "record_table_id" if record_type != "raw_artifact" else "content_sha256"
+    return int(
+        conn.execute(
+            f"SELECT COUNT(DISTINCT {column}) FROM record_observations WHERE run_id = ? AND record_type = ?",
+            [run_id, record_type],
+        ).fetchone()[0]
+    )
+
+
+def _run_record_count(
+    conn: sqlite3.Connection,
+    run_id: int,
+    record_type: str,
+    table: str,
+    extra_where: str = "",
+) -> int:
+    where = """
+        t.id IN (
+            SELECT record_table_id FROM record_observations
+            WHERE run_id = ? AND record_type = ? AND record_table_id IS NOT NULL
+        )
+    """
+    if extra_where:
+        where = f"({where}) AND ({extra_where})"
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table} t WHERE {where}", [run_id, record_type]).fetchone()[0])
 
 
 def get_settings(path: Path = DEFAULT_DB, include_secret: bool = False) -> dict[str, Any]:

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fritzbox_log_store import get_settings, ingest_dataset, init_db, latest_snapshot, query_records, query_timeline, save_settings
+from fritzbox_log_store import get_settings, ingest_dataset, init_db, latest_snapshot, list_runs, query_records, query_timeline, save_settings
 
 
 def test_query_records_uses_backend_fts_and_pagination(tmp_path: Path) -> None:
@@ -137,6 +137,55 @@ def test_ingest_preserves_repeated_observations_per_run(tmp_path: Path) -> None:
     assert canonical_events == 1
     assert observations == 2
     assert evidence == "parsed_from_raw"
+
+
+def test_queries_can_scope_to_latest_or_specific_acquisition_run(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    base = {
+        "window_hours": 100,
+        "router": {"address": "192.0.2.1"},
+        "summary": {},
+        "raw_exports": {},
+        "available_wifi_connections": [
+            {
+                "derived_connected_at": "2026-05-20T11:00:00+02:00",
+                "derived_time_type": "mesh_last_observed",
+                "derived_time_confidence": "low",
+                "exact_connection_time_available": False,
+                "event": "known_wifi_device",
+                "hostname": "shared-phone",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "ip": "192.0.2.21",
+                "source": "mesh_list",
+                "confidence": "known_wifi_device_no_connection_timestamp",
+                "message": "Known WLAN device",
+            }
+        ],
+        "known_hosts": [],
+    }
+    run_one = ingest_dataset(
+        {
+            **base,
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "event_log": [{"timestamp": "2026-05-20T12:00:00+02:00", "category": "system", "message": "old run"}],
+        },
+        db,
+    )
+    run_two = ingest_dataset(
+        {
+            **base,
+            "generated_at": "2026-05-20T13:00:00+02:00",
+            "event_log": [{"timestamp": "2026-05-20T13:00:00+02:00", "category": "system", "message": "new run"}],
+        },
+        db,
+    )
+
+    assert [run["id"] for run in list_runs(db)] == [run_two, run_one]
+    assert query_records(db, "", "log")["rows"][0]["message"] == "new run"
+    assert query_records(db, "", "log", run_id=run_one)["rows"][0]["message"] == "old run"
+    assert query_records(db, "shared-phone", "wifi", run_id=run_two)["total"] == 1
+    assert latest_snapshot(db, run_id=run_one)["latest_run"]["id"] == run_one
+    assert query_timeline(db, run_id=run_two)["total"] == 2
 
 
 def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:
