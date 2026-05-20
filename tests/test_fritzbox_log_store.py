@@ -209,6 +209,16 @@ def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
                     "first_seen": None,
                     "last_seen": None,
                     "last_connected": None,
+                },
+                {
+                    "hostname": "returned-phone",
+                    "mac": "AA:BB:CC:DD:EE:00",
+                    "ip": "192.0.2.22",
+                    "interface": "WLAN",
+                    "active_now": True,
+                    "first_seen": "2026-05-01T12:00:00+02:00",
+                    "last_seen": "2026-05-15T12:00:00+02:00",
+                    "last_connected": "2026-05-15T12:00:00+02:00",
                 }
             ],
         },
@@ -222,8 +232,10 @@ def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
     assert hosts["rows"][0]["last_activity"]
     assert hosts["rows"][0]["last_activity_source"] == "active_host_snapshot"
     assert hosts["rows"][0]["last_activity_confidence"] == "medium"
-    assert query_records(db, "", "hosts", start="2026-05-20T00:00:00+02:00", end="2026-05-21T00:00:00+02:00")["total"] == 1
-    assert query_records(db, "", "hosts", start="2026-05-15T00:00:00+02:00", end="2026-05-16T00:00:00+02:00")["total"] == 0
+    assert query_records(db, "", "hosts", start="2026-05-20T00:00:00+02:00", end="2026-05-21T00:00:00+02:00")["total"] == 2
+    friday_hosts = query_records(db, "", "hosts", start="2026-05-15T00:00:00+02:00", end="2026-05-16T00:00:00+02:00")
+    assert friday_hosts["total"] == 1
+    assert friday_hosts["rows"][0]["hostname"] == "returned-phone"
 
 
 def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:

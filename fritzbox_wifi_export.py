@@ -133,7 +133,15 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     event_log = [entry_to_dict(entry) for entry in sorted(entries, key=lambda item: item.timestamp.isoformat() if item.timestamp else "", reverse=True)]
     wifi_events = sorted(events, key=lambda item: item["timestamp"] or "", reverse=True)
     mesh_wifi_devices = parse_mesh_wifi_devices(avm_exports.get("mesh_list"))
-    seen_by_host = build_host_seen_index(hosts, event_log, wifi_events, mesh_wifi_devices, generated_at=generated_at)
+    landevice_records = parse_landevice_query(avm_exports.get("landevice_query_json"))
+    seen_by_host = build_host_seen_index(
+        hosts,
+        event_log,
+        wifi_events,
+        mesh_wifi_devices,
+        landevice_records,
+        generated_at=generated_at,
+    )
     known_hosts = [host_to_dict(host, seen_by_host.get(host_identity(host), {})) for host in hosts]
     active_hosts = [host for host in known_hosts if host["active_now"]]
     last_wifi_connection = next((event["timestamp"] for event in wifi_events if event["event"] == "connected"), None)
@@ -166,11 +174,12 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "raw_exports": {key: value for key, value in avm_exports.items() if key != "device_log_text"},
         "source_endpoints": {
             "tr064": ["DeviceInfo:GetDeviceLog", "Hosts:GetGenericHostEntry", "DeviceInfo:GetInfo", "Time:GetInfo"],
-            "avm_exports": ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml"],
+            "avm_exports": ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml", "landevice_query_json"],
         },
         "notes": [
-            "This export uses FRITZ!Box TR-064 DeviceInfo:GetDeviceLog and Hosts:GetGenericHostEntry only.",
+            "This export uses FRITZ!Box TR-064 DeviceInfo:GetDeviceLog and Hosts:GetGenericHostEntry plus the FRITZ!Box web UI LAN-device query when available.",
             "It can only show event-log entries still retained by the router.",
+            "LAN-device firstused/lastused values are router-retained device state, not a complete session log.",
             "Mesh WLAN device rows are current/known-device records, not guaranteed historical association records.",
             "If a separate access point handles WiFi, the FRITZ!Box may only show that access point as an Ethernet host.",
         ],
@@ -257,7 +266,24 @@ def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
         parsed_log = parse_device_log_xml(exports["device_log_xml"])
         if parsed_log:
             exports["device_log_text"] = parsed_log
+    landevice_query = fetch_landevice_query(fc)
+    if landevice_query:
+        exports["landevice_query_json"] = landevice_query
     return exports
+
+
+def fetch_landevice_query(fc: Any) -> str | None:
+    query = (
+        "landevice:settings/landevice/list("
+        "UID,ip,mac,name,friendly_name,active,flags,interface,online,firstused,lastused"
+        ")"
+    )
+    try:
+        response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/query.lua", {"mq_landevices": query})
+    except Exception:
+        return None
+    text = getattr(response, "text", "")
+    return text if text and "landevice" in text else None
 
 
 def fetch_avm_path(address: str, port: int, path: str) -> str | None:
@@ -333,6 +359,54 @@ def mesh_timestamp_to_iso(value: Any) -> str | None:
         return datetime.fromtimestamp(value / 1000).astimezone().isoformat()
     except (OSError, OverflowError, ValueError):
         return None
+
+
+def unix_timestamp_to_iso(value: Any) -> str | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric < 946684800:
+        return None
+    try:
+        return datetime.fromtimestamp(numeric).astimezone().isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def parse_landevice_query(content: str | None) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    rows = data.get("mq_landevices") or data.get("landevice") or data.get("devices") or []
+    if isinstance(rows, dict):
+        rows = rows.get("list") or rows.get("devices") or []
+    if not isinstance(rows, list):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        records.append(
+            {
+                "uid": row.get("UID") or row.get("uid"),
+                "hostname": row.get("name") or row.get("friendly_name"),
+                "friendly_name": row.get("friendly_name"),
+                "mac": parse_mac(str(row.get("mac") or "")),
+                "ip": row.get("ip") or None,
+                "interface": row.get("interface") or None,
+                "active_now": truthy(row.get("active")) or truthy(row.get("online")),
+                "first_seen": unix_timestamp_to_iso(row.get("firstused")),
+                "last_connected": unix_timestamp_to_iso(row.get("lastused")),
+                "last_seen": unix_timestamp_to_iso(row.get("lastused")),
+                "source": "webui_landevice_query",
+            }
+        )
+    return records
 
 
 def build_available_wifi_connections(
@@ -457,10 +531,12 @@ def build_host_seen_index(
     event_log: list[dict[str, Any]],
     wifi_events: list[dict[str, Any]],
     mesh_wifi_devices: list[dict[str, Any]] | None = None,
+    landevice_records: list[dict[str, Any]] | None = None,
     generated_at: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {host_identity(host): {} for host in hosts}
     mesh_wifi_devices = mesh_wifi_devices or []
+    landevice_records = landevice_records or []
 
     for host in hosts:
         identity = host_identity(host)
@@ -498,6 +574,24 @@ def build_host_seen_index(
                 timestamp = str(device["last_observed"])
                 timestamps.append(timestamp)
                 activity_candidates.append((timestamp, "mesh_last_observed", "low", "Mesh data observed this WLAN device; this is not an exact association time."))
+
+        for device in landevice_records:
+            if not event_matches_host(device, host_mac, host_ip, host_name):
+                continue
+            if device.get("first_seen"):
+                timestamps.append(str(device["first_seen"]))
+            if device.get("last_connected"):
+                timestamp = str(device["last_connected"])
+                timestamps.append(timestamp)
+                connected_timestamps.append(timestamp)
+                activity_candidates.append(
+                    (
+                        timestamp,
+                        "fritzbox_landevice_lastused",
+                        "medium",
+                        "FRITZ!Box web UI LAN-device state reported this client last connected/used at this time.",
+                    )
+                )
 
         if truthy(host.get("NewActive")) and generated_at:
             activity_candidates.append(

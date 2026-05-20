@@ -82,3 +82,27 @@ def test_host_seen_index_derives_first_last_and_connection_time() -> None:
     assert host["first_seen"] == "2026-05-20T13:00:00+02:00"
     assert host["last_seen"] == "2026-05-20T14:00:00+02:00"
     assert host["last_connected"] == "2026-05-20T14:00:00+02:00"
+
+
+def test_landevice_query_derives_ui_last_connected_time() -> None:
+    hosts = [
+        {
+            "NewHostName": "tablet",
+            "NewMACAddress": "AA:BB:CC:DD:EE:FF",
+            "NewIPAddress": "192.0.2.44",
+            "NewInterfaceType": "802.11",
+            "NewActive": "0",
+        }
+    ]
+    records = fritzbox_wifi_export.parse_landevice_query(
+        '{"mq_landevices":[{"UID":"landevice1","ip":"192.0.2.44","mac":"AA:BB:CC:DD:EE:FF",'
+        '"name":"tablet","active":"0","firstused":1777272000,"lastused":1777725960}]}'
+    )
+
+    seen = fritzbox_wifi_export.build_host_seen_index(hosts, [], [], landevice_records=records)
+    host = fritzbox_wifi_export.host_to_dict(hosts[0], seen[fritzbox_wifi_export.host_identity(hosts[0])])
+
+    assert host["first_seen"].startswith("2026-04-27T")
+    assert host["last_seen"].startswith("2026-05-02T")
+    assert host["last_connected"].startswith("2026-05-02T")
+    assert host["last_activity_source"] == "fritzbox_landevice_lastused"

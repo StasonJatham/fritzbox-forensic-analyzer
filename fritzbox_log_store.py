@@ -739,29 +739,37 @@ def query_records(
             time_column = "derived_connected_at"
         elif table == "hosts":
             active_run_filter = f" AND run_id = {scoped_run_id}" if scoped_run_id is not None else ""
-            time_column = """
-                last_activity,
-                t.last_seen,
-                t.last_connected,
-                CASE WHEN t.active_now = 1 THEN (
+            host_time_columns = [
+                "t.last_activity",
+                "t.last_seen",
+                "t.last_connected",
+                "t.first_seen",
+                """CASE WHEN t.active_now = 1 THEN (
                     SELECT MAX(observed_at)
                     FROM record_observations
                     WHERE record_type = 'host' AND record_table_id = t.id
                     {active_run_filter}
-                ) END
-            """.format(active_run_filter=active_run_filter)
-        if start:
-            if table == "hosts":
-                where.append(f"COALESCE({time_column}, '') >= ?")
-            else:
+                ) END""".format(active_run_filter=active_run_filter),
+            ]
+        if table == "hosts" and (start or end):
+            range_clauses = []
+            for column in host_time_columns:
+                column_checks = []
+                if start:
+                    column_checks.append(f"COALESCE({column}, '') >= ?")
+                    params.append(start)
+                if end:
+                    column_checks.append(f"COALESCE({column}, '') <= ?")
+                    params.append(end)
+                range_clauses.append("(" + " AND ".join(column_checks) + ")")
+            where.append("(" + " OR ".join(range_clauses) + ")")
+        else:
+            if start:
                 where.append(f"COALESCE(t.{time_column}, '') >= ?")
-            params.append(start)
-        if end:
-            if table == "hosts":
-                where.append(f"COALESCE({time_column}, '') <= ?")
-            else:
+                params.append(start)
+            if end:
                 where.append(f"COALESCE(t.{time_column}, '') <= ?")
-            params.append(end)
+                params.append(end)
         if evidence_level != "all":
             where.append("COALESCE(t.evidence_level, '') = ?")
             params.append(evidence_level)
