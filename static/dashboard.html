@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/static/favicon.ico" sizes="any">
+  <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/logo-192.png">
+  <title>FRITZ!Box Forensic Analyzer</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header>
+    <div class="wrap topbar">
+      <div class="brand">
+        <img class="brand-mark" src="/static/logo.svg" alt="" width="42" height="42">
+        <div class="brand-copy">
+          <h1>FRITZ!Box Forensic Analyzer</h1>
+          <div class="subtitle" id="subtitle">Local evidence workbench</div>
+        </div>
+      </div>
+      <div class="controls">
+        <input class="search" id="search" placeholder="Search evidence, host, MAC, IP">
+        <select id="category">
+          <option value="all">All categories</option>
+          <option value="wifi">WiFi</option>
+          <option value="internet">Internet</option>
+          <option value="network">Network</option>
+          <option value="auth">Auth</option>
+          <option value="system">System</option>
+        </select>
+        <select id="evidence-level">
+          <option value="all">All evidence</option>
+          <option value="parsed_from_raw">Parsed raw</option>
+          <option value="inferred">Inferred</option>
+          <option value="enriched_from_current_host_table">Host context</option>
+        </select>
+        <select id="time-type">
+          <option value="all">All times</option>
+          <option value="exact">Exact</option>
+          <option value="derived">Derived</option>
+          <option value="mesh_last_observed">Mesh observed</option>
+        </select>
+        <button id="refresh">Load Stored</button>
+        <button id="download-raw">Download Raw</button>
+        <button id="download-package">Forensic Package</button>
+      </div>
+    </div>
+    <div class="settings">
+      <form class="wrap settings-inner" id="settings-form" autocomplete="off">
+        <label>FRITZ!Box IP<input id="cfg-address" autocomplete="username" placeholder="192.168.178.1"></label>
+        <label>Admin Password<input id="cfg-password" type="password" autocomplete="current-password" placeholder="Leave blank to keep saved"></label>
+        <label>Acquisition Window<select id="hours"><option value="24">24h</option><option value="168">7d</option><option value="720">30d</option><option value="3000" selected>All retained</option></select></label>
+        <button id="save-settings" type="button">Save Settings</button>
+        <button id="run-acquisition" type="button">Run Acquisition</button>
+      </form>
+      <div class="wrap settings-note" id="settings-note">Settings are stored locally in fritzbox-analysis.sqlite3.</div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="forensic-notice" id="forensic-notice">
+      <strong>Evidence model:</strong> this tool shows what the FRITZ!Box retained and exposed at acquisition time.
+      Absence of a row is not proof an event did not happen. Mesh observations are inferred context, not exact WiFi join times.
+    </section>
+    <section class="acquisition-panel">
+      <div>
+        <p class="section-title">Acquisition Status</p>
+        <div class="status-grid" id="acquisition-status">
+          <span>No stored acquisition loaded.</span>
+        </div>
+      </div>
+      <div class="limit-strip">
+        <span class="pill parsed_from_raw">Exact retained log</span>
+        <span class="pill inferred">Inferred context</span>
+        <span class="pill enriched_from_current_host_table">Host table context</span>
+      </div>
+    </section>
+    <section class="forensic-bar">
+      <label>Start Time<input id="range-start" type="datetime-local"></label>
+      <label>End Time<input id="range-end" type="datetime-local"></label>
+      <label>Poll Interval<select id="poll-interval"><option value="5">5 min</option><option value="10">10 min</option><option value="15" selected>15 min</option></select></label>
+      <label>Polling State<div class="check-row" id="poll-status">Stopped</div></label>
+      <button id="apply-range">Apply Range</button>
+      <button id="toggle-poll">Start Polling</button>
+    </section>
+    <section class="metrics">
+      <div class="metric"><div class="label">WiFi Observed</div><div class="value" id="m-wifi">0</div><div class="accent"></div></div>
+      <div class="metric"><div class="label">Retained Logs</div><div class="value" id="m-log">0</div><div class="accent"></div></div>
+      <div class="metric"><div class="label">Known Hosts</div><div class="value" id="m-hosts">0</div><div class="accent"></div></div>
+      <div class="metric"><div class="label">Active Hosts</div><div class="value" id="m-active">0</div><div class="accent"></div></div>
+      <div class="metric"><div class="label">Last Exact WiFi</div><div class="value small" id="m-last">None retained</div><div class="accent"></div></div>
+    </section>
+    <section class="charts">
+      <div class="chart-panel">
+        <p class="section-title">Connection / Event High Times</p>
+        <div class="bar-chart" id="hour-chart"></div>
+      </div>
+      <div class="chart-panel">
+        <p class="section-title">Event Classes</p>
+        <div class="mini-list" id="category-chart"></div>
+      </div>
+      <div class="chart-panel">
+        <p class="section-title">Evidence Confidence</p>
+        <div class="mini-list" id="confidence-chart"></div>
+      </div>
+    </section>
+    <div class="tabs">
+      <button class="tab active" data-view="timeline">Timeline</button>
+      <button class="tab" data-view="wifi">WiFi Connections</button>
+      <button class="tab" data-view="log">Router Log</button>
+      <button class="tab" data-view="hosts">Host Table</button>
+      <button class="tab" data-view="entities">Entity Pivot</button>
+    </div>
+    <p class="status" id="status"></p>
+    <section class="workspace">
+      <aside>
+        <p class="section-title">Recent Signal</p>
+        <div class="timeline" id="timeline"></div>
+        <div class="entity-panel">
+          <p class="section-title">Entities</p>
+          <div class="entity-list" id="entities"></div>
+        </div>
+      </aside>
+      <div class="table-shell" id="table"></div>
+    </section>
+  </main>
+  <div class="drawer" id="drawer">
+    <div class="drawer-backdrop" id="drawer-close-backdrop"></div>
+    <div class="drawer-panel">
+      <div class="drawer-head">
+        <div>
+          <h2 style="margin:0;font-size:18px;">Evidence</h2>
+          <div class="subtitle">Parsed row and matching retained raw artifact snippet</div>
+        </div>
+        <button id="drawer-close">Close</button>
+      </div>
+      <div id="drawer-body"></div>
+    </div>
+  </div>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

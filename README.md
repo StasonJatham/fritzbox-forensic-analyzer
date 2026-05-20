@@ -9,7 +9,7 @@ This project is built for local incident response and home-network forensics. It
 - Pulls retained FRITZ!Box logs and current router state through FRITZ!Box APIs.
 - Stores raw artifacts, parsed events, host records, WiFi observations, and run metadata in SQLite.
 - Provides backend full-text search across logs, hosts, WiFi records, entities, and timeline rows.
-- Shows an analyst dashboard with sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, and raw evidence drawers.
+- Shows an analyst dashboard with stored-evidence review, explicit acquisition runs, sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, and raw evidence drawers.
 - Exports raw artifacts and a forensic acquisition package for offline review.
 - Preserves evidence confidence labels so exact log entries are not confused with inferred observations.
 

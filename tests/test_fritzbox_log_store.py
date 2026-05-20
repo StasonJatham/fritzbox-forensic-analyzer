@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fritzbox_log_store import get_settings, ingest_dataset, init_db, query_records, save_settings
+from fritzbox_log_store import get_settings, ingest_dataset, init_db, latest_snapshot, query_records, query_timeline, save_settings
 
 
 def test_query_records_uses_backend_fts_and_pagination(tmp_path: Path) -> None:
@@ -137,3 +137,54 @@ def test_ingest_preserves_repeated_observations_per_run(tmp_path: Path) -> None:
     assert canonical_events == 1
     assert observations == 2
     assert evidence == "parsed_from_raw"
+
+
+def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.23",
+                    "mac": None,
+                    "message": "Successful login",
+                }
+            ],
+            "available_wifi_connections": [
+                {
+                    "derived_connected_at": "2026-05-20T11:00:00+02:00",
+                    "derived_time_type": "mesh_last_observed",
+                    "derived_time_confidence": "low",
+                    "exact_connection_time_available": False,
+                    "event": "known_wifi_device",
+                    "hostname": "phone",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.21",
+                    "source": "mesh_list",
+                    "confidence": "known_wifi_device_no_connection_timestamp",
+                    "message": "Known WLAN device",
+                }
+            ],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    snapshot = latest_snapshot(db)
+    inferred = query_records(db, "", "wifi", evidence_level="inferred")
+    exact_timeline = query_timeline(db, time_type="exact")
+
+    assert snapshot["has_data"] is True
+    assert snapshot["counts"]["event_log"] == 1
+    assert snapshot["counts"]["wifi_connections"] == 1
+    assert snapshot["latest_run"]["router_address"] == "192.0.2.1"
+    assert inferred["total"] == 1
+    assert exact_timeline["total"] == 1
+    assert exact_timeline["rows"][0]["record_type"] == "event_log"

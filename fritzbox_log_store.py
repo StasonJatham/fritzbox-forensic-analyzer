@@ -625,6 +625,8 @@ def query_records(
     category: str = "all",
     sort_by: str = "",
     sort_dir: str = "desc",
+    evidence_level: str = "all",
+    time_type: str = "all",
 ) -> dict[str, Any]:
     conn = init_db(path)
     fts_query = make_fts_query(query)
@@ -687,6 +689,20 @@ def query_records(
         if table == "event_log" and category != "all":
             where.append("t.category = ?")
             params.append(category)
+        if evidence_level != "all":
+            where.append("COALESCE(t.evidence_level, '') = ?")
+            params.append(evidence_level)
+        if time_type != "all":
+            if table == "event_log":
+                where.append("1=1" if time_type == "exact" else "1=0")
+            elif table == "wifi_connections":
+                if time_type == "exact":
+                    where.append("t.exact_connection_time_available = 1")
+                elif time_type == "derived":
+                    where.append("t.exact_connection_time_available = 0")
+                else:
+                    where.append("COALESCE(t.derived_time_type, '') = ?")
+                    params.append(time_type)
         where_sql = f" WHERE {' AND '.join(where)}" if where else ""
         count_sql = f"SELECT COUNT(*) FROM {table} t{join}{where_sql}"
         total = int(conn.execute(count_sql, params).fetchone()[0])
@@ -720,12 +736,16 @@ def query_timeline(
     end: str = "",
     limit: int = 200,
     offset: int = 0,
+    evidence_level: str = "all",
+    time_type: str = "all",
 ) -> dict[str, Any]:
     conn = init_db(path)
     fts_query = make_fts_query(query)
     rows: list[dict[str, Any]] = []
-    event_where, event_params = _timeline_filters("event_log", fts_query, category, start, end)
-    wifi_where, wifi_params = _timeline_filters("wifi_connections", fts_query, category, start, end)
+    event_where, event_params = _timeline_filters("event_log", fts_query, category, start, end, evidence_level, time_type)
+    wifi_where, wifi_params = _timeline_filters(
+        "wifi_connections", fts_query, category, start, end, evidence_level, time_type
+    )
 
     event_total = int(conn.execute(f"SELECT COUNT(*) FROM event_log t{event_where}", event_params).fetchone()[0])
     wifi_total = int(conn.execute(f"SELECT COUNT(*) FROM wifi_connections t{wifi_where}", wifi_params).fetchone()[0])
@@ -754,7 +774,15 @@ def query_timeline(
     return {"rows": rows, "total": event_total + wifi_total, "limit": limit, "offset": offset}
 
 
-def _timeline_filters(table: str, fts_query: str, category: str, start: str, end: str) -> tuple[str, list[Any]]:
+def _timeline_filters(
+    table: str,
+    fts_query: str,
+    category: str,
+    start: str,
+    end: str,
+    evidence_level: str = "all",
+    time_type: str = "all",
+) -> tuple[str, list[Any]]:
     params: list[Any] = []
     where: list[str] = []
     time_column = "timestamp" if table == "event_log" else "derived_connected_at"
@@ -768,6 +796,20 @@ def _timeline_filters(table: str, fts_query: str, category: str, start: str, end
         params.append(category)
     elif table == "wifi_connections" and category not in ("all", "wifi"):
         where.append("1=0")
+    if evidence_level != "all":
+        where.append("COALESCE(t.evidence_level, '') = ?")
+        params.append(evidence_level)
+    if time_type != "all":
+        if table == "event_log":
+            where.append("1=1" if time_type == "exact" else "1=0")
+        elif table == "wifi_connections":
+            if time_type == "exact":
+                where.append("t.exact_connection_time_available = 1")
+            elif time_type == "derived":
+                where.append("t.exact_connection_time_available = 0")
+            else:
+                where.append("COALESCE(t.derived_time_type, '') = ?")
+                params.append(time_type)
     if table == "wifi_connections":
         where.append("t." + WIFI_DEDUPE_SQL.strip())
     if start:
@@ -777,6 +819,57 @@ def _timeline_filters(table: str, fts_query: str, category: str, start: str, end
         where.append(f"COALESCE(t.{time_column}, '') <= ?")
         params.append(end)
     return (f" WHERE {' AND '.join(where)}" if where else "", params)
+
+
+def _decode_json(value: Any) -> Any:
+    if value in (None, ""):
+        return None
+    try:
+        return json.loads(str(value))
+    except json.JSONDecodeError:
+        return value
+
+
+def latest_snapshot(path: Path = DEFAULT_DB) -> dict[str, Any]:
+    conn = init_db(path)
+    latest_run = conn.execute("SELECT * FROM export_runs ORDER BY id DESC LIMIT 1").fetchone()
+    retained = dict(
+        conn.execute(
+            "SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event, COUNT(*) AS event_count FROM event_log"
+        ).fetchone()
+    )
+    counts = {
+        "runs": int(conn.execute("SELECT COUNT(*) FROM export_runs").fetchone()[0]),
+        "raw_artifacts": int(conn.execute("SELECT COUNT(*) FROM raw_artifacts").fetchone()[0]),
+        "event_log": int(conn.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]),
+        "wifi_connections": int(
+            conn.execute("SELECT COUNT(*) FROM wifi_connections WHERE " + WIFI_DEDUPE_SQL).fetchone()[0]
+        ),
+        "hosts": int(conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]),
+        "active_hosts": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE active_now = 1").fetchone()[0]),
+    }
+    last_exact_wifi = conn.execute(
+        "SELECT MAX(derived_connected_at) FROM wifi_connections WHERE exact_connection_time_available = 1 AND "
+        + WIFI_DEDUPE_SQL
+    ).fetchone()[0]
+    latest = dict(latest_run) if latest_run else None
+    if latest:
+        for key in (
+            "summary_json",
+            "router_metadata_json",
+            "timestamp_assumptions_json",
+            "contamination_json",
+            "source_endpoints_json",
+        ):
+            latest[key.removesuffix("_json")] = _decode_json(latest.pop(key, None))
+    conn.close()
+    return {
+        "has_data": counts["runs"] > 0 or counts["event_log"] > 0 or counts["wifi_connections"] > 0 or counts["hosts"] > 0,
+        "latest_run": latest,
+        "retained": retained,
+        "counts": counts,
+        "last_exact_wifi": last_exact_wifi,
+    }
 
 
 def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "") -> dict[str, Any]:
