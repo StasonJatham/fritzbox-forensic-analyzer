@@ -150,6 +150,22 @@ def test_data_lua_log_json_can_be_used_as_log_fallback() -> None:
     assert entries[0].timestamp is not None
 
 
+def test_support_data_parser_extracts_sections_key_values_and_signals() -> None:
+    findings = fritzbox_wifi_export.parse_support_data(
+        """
+##### WLAN diagnostics
+SSID: Restaurant WiFi
+FirmwareVersion=8.20
+client aa:bb:cc:dd:ee:ff has ip 192.0.2.44 via wlan
+""",
+        "2026-05-20T12:00:00+02:00",
+    )
+
+    assert any(row["finding_type"] == "section" and row["section"] == "WLAN diagnostics" for row in findings)
+    assert any(row["finding_type"] == "key_value" and row["key"] == "SSID" for row in findings)
+    assert any(row["finding_type"] == "signal_line" and "192.0.2.44" in row["value"] for row in findings)
+
+
 def test_landevice_records_add_hosts_missing_from_official_host_list() -> None:
     records = fritzbox_wifi_export.parse_landevice_query(
         '{"mq_landevices":[{"UID":"landevice42","ip":"192.0.2.77","mac":"AA:BB:CC:DD:EE:77",'

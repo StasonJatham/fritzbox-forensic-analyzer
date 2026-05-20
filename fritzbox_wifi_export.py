@@ -27,6 +27,7 @@ from fritzbox_parsers import (
     parse_device_log,
     parse_landevice_query,
     parse_mesh_wifi_devices,
+    parse_support_data,
     parse_wlan_device_lists,
     parse_wifi_event,
 )
@@ -105,7 +106,8 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
         or parse_data_lua_log(avm_exports.get("data_lua_pages_json"))
         or get_device_log(fc)
     )
-    entries = filter_recent(parse_device_log(raw_log), args.hours)
+    support_log = parse_device_log(avm_exports.get("support_data_txt") or "")
+    entries = filter_recent(deduplicate_log_entries([*parse_device_log(raw_log), *support_log]), args.hours)
     events = []
     for entry in entries:
         event = parse_wifi_event(entry, hosts_by_mac)
@@ -125,6 +127,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     mesh_wifi_devices = parse_mesh_wifi_devices(avm_exports.get("mesh_list"))
     wlan_associations = parse_wlan_device_lists(avm_exports, generated_at)
     landevice_records = parse_landevice_query(avm_exports.get("landevice_query_json"))
+    support_findings = parse_support_data(avm_exports.get("support_data_txt"), generated_at)
     seen_by_host = build_host_seen_index(
         hosts,
         event_log,
@@ -154,6 +157,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "wifi_events": len(wifi_events),
             "available_wifi_connections": len(available_wifi_connections),
             "current_wlan_associations": len(wlan_associations),
+            "support_findings": len(support_findings),
             "known_hosts": len(known_hosts),
             "active_hosts": len(active_hosts),
             "last_wifi_connection": last_wifi_connection,
@@ -165,6 +169,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "mesh_wifi_devices": mesh_wifi_devices,
         "wlan_associations": wlan_associations,
         "event_log": event_log,
+        "support_findings": support_findings,
         "known_hosts": sorted(
             known_hosts, key=lambda item: (not item["active_now"], item["hostname"] or "", item["ip"] or "")
         ),
@@ -179,6 +184,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 "landevice_query_json",
                 "data_lua_pages_json",
                 "tr064_snapshot_json",
+                "support_data_txt",
             ],
         },
         "notes": [
@@ -186,9 +192,22 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "It can only show event-log entries still retained by the router.",
             "LAN-device firstused/lastused values are router-retained device state, not a complete session log.",
             "Mesh WLAN device rows are current/known-device records, not guaranteed historical association records.",
+            "Support-data exports are high-sensitivity diagnostic artifacts and may contain settings, identifiers, logs, and service state.",
             "If a separate access point handles WiFi, the FRITZ!Box may only show that access point as an Ethernet host.",
         ],
     }
+
+
+def deduplicate_log_entries(entries: list[FritzLogEntry]) -> list[FritzLogEntry]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[FritzLogEntry] = []
+    for entry in entries:
+        key = (entry.timestamp.isoformat() if entry.timestamp else "", entry.message)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+    return unique
 
 
 def load_env_file(path: Path) -> None:

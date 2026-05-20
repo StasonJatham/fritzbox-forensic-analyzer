@@ -20,7 +20,10 @@ def test_query_records_uses_backend_fts_and_pagination(tmp_path: Path) -> None:
             "window_hours": 100,
             "router": {"address": "192.168.178.1"},
             "summary": {},
-            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "raw_exports": {
+                "device_log_xml": "<DeviceLog />",
+                "support_data_txt": "FRITZ!Box support data\nsupport device system wlan dsl mesh kernel\n",
+            },
             "event_log": [
                 {
                     "timestamp": "2026-05-20T12:00:00+02:00",
@@ -271,7 +274,10 @@ def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:
             "window_hours": 100,
             "router": {"address": "192.0.2.1"},
             "summary": {},
-            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "raw_exports": {
+                "device_log_xml": "<DeviceLog />",
+                "support_data_txt": "FRITZ!Box support data\nsupport device system wlan dsl mesh kernel\n",
+            },
             "event_log": [
                 {
                     "timestamp": "2026-05-20T12:00:00+02:00",
@@ -309,6 +315,54 @@ def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:
     assert snapshot["counts"]["event_log"] == 1
     assert snapshot["counts"]["wifi_connections"] == 1
     assert snapshot["latest_run"]["router_address"] == "192.0.2.1"
+    assert "support_data_txt" not in snapshot["source_coverage"]["missing_raw_artifacts"]
     assert inferred["total"] == 1
     assert exact_timeline["total"] == 1
     assert exact_timeline["rows"][0]["record_type"] == "event_log"
+
+
+def test_support_findings_are_searchable_and_observed_per_run(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    dataset = {
+        "generated_at": "2026-05-20T12:00:00+02:00",
+        "window_hours": 100,
+        "router": {"address": "192.0.2.1"},
+        "summary": {},
+        "raw_exports": {
+            "support_data_txt": "##### WLAN diagnostics\nSSID: Restaurant WiFi\nclient aa:bb:cc:dd:ee:ff\n",
+        },
+        "event_log": [],
+        "available_wifi_connections": [],
+        "known_hosts": [],
+        "support_findings": [
+            {
+                "finding_type": "key_value",
+                "section": "WLAN diagnostics",
+                "key": "SSID",
+                "value": "Restaurant WiFi",
+                "line_number": 2,
+                "observed_at": "2026-05-20T12:00:00+02:00",
+                "raw_text": "SSID: Restaurant WiFi",
+                "evidence_level": "parsed_from_raw",
+                "evidence_note": "Key/value parsed from support data.",
+            }
+        ],
+    }
+
+    ingest_dataset(dataset, db)
+    ingest_dataset(dataset, db)
+
+    support = query_records(db, "Restaurant", "support", run_id="all")
+    conn = init_db(db)
+    try:
+        canonical = conn.execute("SELECT COUNT(*) FROM support_findings").fetchone()[0]
+        observations = conn.execute(
+            "SELECT COUNT(*) FROM record_observations WHERE record_type = 'support_finding'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert support["total"] == 2
+    assert support["rows"][0]["key"] == "SSID"
+    assert canonical == 2
+    assert observations == 2

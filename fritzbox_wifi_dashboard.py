@@ -309,6 +309,7 @@ def build_forensic_acquisition_zip(path: Path = DEFAULT_DB) -> bytes:
         "event_log": "SELECT * FROM event_log ORDER BY COALESCE(timestamp, ''), id",
         "wifi_connections": "SELECT * FROM wifi_connections ORDER BY COALESCE(derived_connected_at, ''), id",
         "hosts": "SELECT * FROM hosts ORDER BY hostname, mac, ip, id",
+        "support_findings": "SELECT * FROM support_findings ORDER BY line_number, id",
         "record_observations": "SELECT * FROM record_observations ORDER BY observed_at, id",
     }
     table_rows = {name: rows_for_query(conn, sql) for name, sql in tables.items()}
@@ -423,6 +424,7 @@ This package preserves what the FRITZ!Box exposed through the local collection t
 - Absence of a log row means only that it was not observed in retained/exported data.
 - Mesh `last_observed` values are low-confidence context and are not exact WiFi join times.
 - Current host table enrichment can be stale or reassigned.
+- Parsed support-data findings are best-effort extraction from an undocumented diagnostic bundle; always validate against the raw `support_data_txt` artifact.
 - Router timestamps are not independently validated unless separately documented.
 - Tool login and polling may create router log entries and repeated observations.
 """
@@ -511,7 +513,7 @@ def create_app() -> FastAPI:
     @app.get("/api/search")
     def api_search(
         q: str = "",
-        view: str = Query(default="all", pattern="^(all|wifi|hosts|log)$"),
+        view: str = Query(default="all", pattern="^(all|wifi|hosts|log|support)$"),
         category: str = Query(default="all"),
         limit: int = Query(default=50, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),

@@ -136,6 +136,25 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             FOREIGN KEY(run_id) REFERENCES export_runs(id)
         );
 
+        CREATE TABLE IF NOT EXISTS support_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            finding_type TEXT,
+            section TEXT,
+            key TEXT,
+            value TEXT,
+            line_number INTEGER,
+            observed_at TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
+            evidence_note TEXT,
+            raw_text TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, line_number, raw_text),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
             record_type,
             record_id UNINDEXED,
@@ -265,12 +284,17 @@ def ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]
 
 
 def repair_observation_table_ids(conn: sqlite3.Connection) -> None:
-    lookup_map = {"event_log": lookup_event_id, "wifi_connection": lookup_wifi_id, "host": lookup_host_id}
+    lookup_map = {
+        "event_log": lookup_event_id,
+        "wifi_connection": lookup_wifi_id,
+        "host": lookup_host_id,
+        "support_finding": lookup_support_finding_id,
+    }
     rows = conn.execute(
         """
         SELECT id, record_type, record_table_id, content_json
         FROM record_observations
-        WHERE record_type IN ('event_log', 'wifi_connection', 'host')
+        WHERE record_type IN ('event_log', 'wifi_connection', 'host', 'support_finding')
         """
     ).fetchall()
     for row in rows:
@@ -342,6 +366,51 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                 evidence_note="Raw artifact exposed by FRITZ!Box during this acquisition run.",
                 source=name,
                 content={"name": name, "sha256": digest, "content": content},
+            )
+
+        for finding in dataset.get("support_findings") or []:
+            searchable = searchable_text(finding)
+            evidence_level = finding.get("evidence_level") or "parsed_from_raw"
+            evidence_note = finding.get("evidence_note") or "Parsed from FRITZ!Box support-data raw artifact."
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO support_findings(
+                    run_id, finding_type, section, key, value, line_number, observed_at, source,
+                    evidence_level, evidence_note, raw_text, raw_json, searchable
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    finding.get("finding_type"),
+                    finding.get("section"),
+                    finding.get("key"),
+                    finding.get("value"),
+                    finding.get("line_number"),
+                    finding.get("observed_at"),
+                    finding.get("source") or "support_data_txt",
+                    evidence_level,
+                    evidence_note,
+                    finding.get("raw_text"),
+                    json.dumps(finding, sort_keys=True),
+                    searchable,
+                ),
+            )
+            row_id = cursor.lastrowid if cursor.rowcount else lookup_support_finding_id(conn, finding)
+            if row_id and cursor.rowcount:
+                add_fts(conn, "support_findings", int(row_id), searchable)
+            add_observation(
+                conn,
+                run_id=run_id,
+                record_type="support_finding",
+                record_key=support_finding_key(finding),
+                record_table_id=int(row_id) if row_id else None,
+                observed_at=acquired_at,
+                event_time=finding.get("observed_at") or generated_at,
+                evidence_level=evidence_level,
+                evidence_note=evidence_note,
+                source=finding.get("source") or "support_data_txt",
+                content=finding,
             )
 
         for event in dataset.get("event_log") or []:
@@ -595,6 +664,7 @@ def acquisition_metadata(dataset: dict[str, Any], acquired_at: str) -> dict[str,
                 "landevice_query_json",
                 "data_lua_pages_json",
                 "tr064_snapshot_json",
+                "support_data_txt",
             ],
         },
     }
@@ -722,6 +792,22 @@ def host_key(host: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def support_finding_key(finding: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "finding_type": finding.get("finding_type"),
+                "section": finding.get("section"),
+                "key": finding.get("key"),
+                "line_number": finding.get("line_number"),
+                "raw_text": finding.get("raw_text"),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def lookup_event_id(conn: sqlite3.Connection, event: dict[str, Any]) -> int | None:
     row = conn.execute(
         "SELECT id FROM event_log WHERE timestamp IS ? AND message = ?",
@@ -760,6 +846,20 @@ def lookup_host_id(conn: sqlite3.Connection, host: dict[str, Any]) -> int | None
           AND COALESCE(ip, '') = COALESCE(?, '')
         """,
         (host.get("hostname"), host.get("mac"), host.get("ip")),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def lookup_support_finding_id(conn: sqlite3.Connection, finding: dict[str, Any]) -> int | None:
+    row = conn.execute(
+        """
+        SELECT id FROM support_findings
+        WHERE COALESCE(line_number, -1) = COALESCE(?, -1)
+          AND COALESCE(raw_text, '') = COALESCE(?, '')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (finding.get("line_number"), finding.get("raw_text")),
     ).fetchone()
     return int(row["id"]) if row else None
 
@@ -845,6 +945,19 @@ def query_records(
         order = f"{sort_map.get(sort_by, sort_map['timestamp'])} {direction}"
         fts_type = "event_log"
         dedupe = "1=1"
+    elif record_type == "support":
+        table = "support_findings"
+        sort_map = {
+            "line_number": "COALESCE(t.line_number, 0)",
+            "finding_type": "COALESCE(t.finding_type, '')",
+            "section": "COALESCE(t.section, '')",
+            "key": "COALESCE(t.key, '')",
+            "value": "COALESCE(t.value, '')",
+            "observed_at": "COALESCE(t.observed_at, '')",
+        }
+        order = f"{sort_map.get(sort_by, sort_map['line_number'])} {direction}"
+        fts_type = "support_findings"
+        dedupe = "1=1"
     else:
         table = None
         fts_type = None
@@ -853,7 +966,12 @@ def query_records(
         params: list[Any] = []
         where: list[str] = [dedupe]
         join = ""
-        observation_type = {"event_log": "event_log", "wifi_connections": "wifi_connection", "hosts": "host"}[table]
+        observation_type = {
+            "event_log": "event_log",
+            "wifi_connections": "wifi_connection",
+            "hosts": "host",
+            "support_findings": "support_finding",
+        }[table]
         if fts_query:
             join = " JOIN records_fts f ON f.record_id = t.id AND f.record_type = ?"
             params.append(fts_type)
@@ -871,6 +989,8 @@ def query_records(
             time_column = "timestamp"
         elif table == "wifi_connections":
             time_column = "derived_connected_at"
+        elif table == "support_findings":
+            time_column = "observed_at"
         elif table == "hosts":
             active_run_filter = f" AND run_id = {scoped_run_id}" if scoped_run_id is not None else ""
             host_time_columns = [
@@ -1074,6 +1194,7 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
                 conn.execute("SELECT COUNT(*) FROM wifi_connections WHERE " + WIFI_DEDUPE_SQL).fetchone()[0]
             ),
             "hosts": int(conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]),
+            "support_findings": int(conn.execute("SELECT COUNT(*) FROM support_findings").fetchone()[0]),
             "active_hosts": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE active_now = 1").fetchone()[0]),
             "hosts_with_last_connected": int(
                 conn.execute(
@@ -1109,6 +1230,7 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             "event_log": _run_observation_count(conn, scoped_run_id, "event_log"),
             "wifi_connections": _run_record_count(conn, scoped_run_id, "wifi_connection", "wifi_connections"),
             "hosts": _run_record_count(conn, scoped_run_id, "host", "hosts"),
+            "support_findings": _run_record_count(conn, scoped_run_id, "support_finding", "support_findings"),
             "active_hosts": _run_record_count(conn, scoped_run_id, "host", "hosts", "t.active_now = 1"),
             "hosts_with_last_connected": _run_record_count(
                 conn, scoped_run_id, "host", "hosts", "t.last_connected IS NOT NULL AND t.last_connected != ''"
@@ -1153,10 +1275,13 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
     source_coverage = acquisition_source_coverage(conn, scoped_run_id)
     conn.close()
     return {
-        "has_data": counts["runs"] > 0
-        or counts["event_log"] > 0
-        or counts["wifi_connections"] > 0
-        or counts["hosts"] > 0,
+        "has_data": (
+            counts["runs"] > 0
+            or counts["event_log"] > 0
+            or counts["wifi_connections"] > 0
+            or counts["hosts"] > 0
+            or counts["support_findings"] > 0
+        ),
         "latest_run": latest,
         "selected_run_id": scoped_run_id,
         "run_scope": "all" if scoped_run_id is None else str(scoped_run_id),
@@ -1177,6 +1302,7 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
         "landevice_query_json",
         "data_lua_pages_json",
         "tr064_snapshot_json",
+        "support_data_txt",
     ]
     params: list[Any] = []
     if run_id is None:
@@ -1215,6 +1341,10 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
     if "data_lua_pages_json" not in present:
         warnings.append(
             "Unofficial FRITZ!Box data.lua pages were not collected; UI-only topology/log/counter evidence is reduced."
+        )
+    if "support_data_txt" not in present:
+        warnings.append(
+            "FRITZ!Box support data was not collected; deep diagnostic settings/service-state evidence is unavailable."
         )
     return {
         "expected_raw_artifacts": expected,
@@ -1622,6 +1752,8 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         "wifi": "wifi_connections",
         "wifi_connections": "wifi_connections",
         "hosts": "hosts",
+        "support": "support_findings",
+        "support_findings": "support_findings",
     }
     table = table_map.get(record_type)
     if not table:
@@ -1632,7 +1764,16 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         conn.close()
         return {"record": None, "artifacts": []}
     row = dict(record)
-    needles = [row.get("message"), row.get("mac"), row.get("ip"), row.get("hostname")]
+    needles = [
+        row.get("message"),
+        row.get("mac"),
+        row.get("ip"),
+        row.get("hostname"),
+        row.get("raw_text"),
+        row.get("value"),
+        row.get("key"),
+        row.get("section"),
+    ]
     artifacts: list[dict[str, Any]] = []
     for needle in [item for item in needles if item]:
         found = conn.execute(

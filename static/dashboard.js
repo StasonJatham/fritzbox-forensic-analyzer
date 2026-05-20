@@ -54,6 +54,7 @@ function evidenceLabel(value) {
     device_log_xml: "device log",
     host_list_xml: "host list",
     mesh_list: "mesh list",
+    support_data_txt: "support data",
     wlan_device_list_xml: "WLAN device list",
     high: "high",
     medium: "medium",
@@ -499,6 +500,14 @@ function renderTable() {
       rowAction(row), formatTime(row.event_time), pill(row.event_class, row.event_class), row.hostname, row.mac, row.ip,
       confidenceBadge(row), row.message
     ]), rows);
+  } else if (state.view === "support") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Line", "line_number"], ["Type", "finding_type"], ["Section", "section"], ["Key", "key"],
+      ["Value", "value"], ["Evidence", "evidence_level"]
+    ], rows.map((row) => [
+      rowAction(row), row.line_number, pill(row.finding_type, row.finding_type), row.section, row.key,
+      row.value || row.raw_text, confidenceBadge(row)
+    ]), rows);
   } else if (state.view === "entities") {
     $("table").innerHTML = table([
       ["Action", ""], ["Host", "hostname"], ["MAC", "mac"], ["IP", "ip"], ["Interface", "interface"], ["Active", "active_now"],
@@ -519,7 +528,12 @@ function renderTable() {
 }
 
 function rowAction(row) {
-  const type = row.record_type || (state.view === "wifi" ? "wifi" : state.view === "log" ? "log" : state.view === "hosts" ? "hosts" : "");
+  const type = row.record_type || (
+    state.view === "wifi" ? "wifi" :
+    state.view === "log" ? "log" :
+    state.view === "hosts" ? "hosts" :
+    state.view === "support" ? "support" : ""
+  );
   const id = row.record_id || row.id || "";
   return `<button class="row-action" data-action="evidence" data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">Open</button>`;
 }
@@ -565,7 +579,12 @@ function table(headers, rows, sourceRows = []) {
   }).join("")}</tr></thead><tbody>${
     rows.map((row, index) => {
       const source = sourceRows[index] || {};
-      const type = source.record_type || (state.view === "wifi" ? "wifi" : state.view === "log" ? "log" : state.view === "hosts" ? "hosts" : "");
+      const type = source.record_type || (
+        state.view === "wifi" ? "wifi" :
+        state.view === "log" ? "log" :
+        state.view === "hosts" ? "hosts" :
+        state.view === "support" ? "support" : ""
+      );
       const id = source.record_id || source.id || "";
       return `<tr data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">${row.map((cell, cellIndex) => {
         const raw = text(cell);
@@ -582,6 +601,7 @@ function defaultSortForView(view) {
   if (view === "log") return "timestamp";
   if (view === "timeline") return "timestamp";
   if (view === "entities") return "last_seen";
+  if (view === "support") return "line_number";
   return "derived_connected_at";
 }
 

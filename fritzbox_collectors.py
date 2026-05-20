@@ -114,7 +114,58 @@ def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
     tr064_snapshot = collect_tr064_snapshot(fc)
     if tr064_snapshot:
         exports["tr064_snapshot_json"] = json.dumps(tr064_snapshot, sort_keys=True, default=str)
+    support_data = fetch_support_data(fc)
+    if support_data:
+        exports["support_data_txt"] = support_data
     return exports
+
+
+def fetch_support_data(fc: Any) -> str | None:
+    """Download the FRITZ!Box support-data text dump via the hidden support workflow."""
+    http = getattr(fc, "http_interface", None)
+    if http is None:
+        return None
+    session = getattr(getattr(http, "fc", None), "session", None)
+    if session is None:
+        return None
+    try:
+        sid = next(http._get_sid())
+    except Exception:
+        return None
+    if not sid or sid == "0000000000000000":
+        return None
+
+    url = f"{http.router_url}/cgi-bin/firmwarecfg"
+    for field in ("SupportDataEnhanced", "SupportData"):
+        try:
+            response = session.post(url, files={"sid": (None, sid), field: (None, "")}, timeout=90)
+        except TypeError:
+            try:
+                response = session.post(url, files={"sid": (None, sid), field: (None, "")})
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if getattr(response, "status_code", None) != 200:
+            continue
+        content = getattr(response, "content", b"")
+        if not content:
+            text = getattr(response, "text", "")
+        else:
+            text = content.decode("utf-8", errors="replace")
+        if is_support_data_response(text):
+            return text
+    return None
+
+
+def is_support_data_response(text: str) -> bool:
+    sample = text[:500].casefold()
+    if len(text) < 1000:
+        return False
+    if "<html" in sample or "<!doctype html" in sample:
+        return False
+    support_markers = ("support", "fritz", "box", "kernel", "device", "system", "wlan", "dsl", "mesh")
+    return sum(1 for marker in support_markers if marker in text.casefold()) >= 3
 
 
 def fetch_data_lua_pages(fc: Any) -> dict[str, Any]:

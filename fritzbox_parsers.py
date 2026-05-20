@@ -13,6 +13,7 @@ LOG_TS_RE = re.compile(
 )
 MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+SUPPORT_KEY_VALUE_RE = re.compile(r"^\s*(?P<key>[A-Za-z0-9_. /()[\]#:+-]{2,90})\s*(?:=|:)\s*(?P<value>.+?)\s*$")
 WIFI_EVENT_KEYWORDS = (
     "wlan-gerät",
     "wlan device",
@@ -34,6 +35,29 @@ DISCONNECTED_KEYWORDS = (
     "disconnected",
     "unregistered",
     "abmeldung",
+)
+SUPPORT_KEYWORDS = (
+    "auth",
+    "channel",
+    "config",
+    "device",
+    "dhcp",
+    "dns",
+    "firmware",
+    "gateway",
+    "host",
+    "internet",
+    "ipv4",
+    "ipv6",
+    "login",
+    "mac",
+    "mesh",
+    "network",
+    "ssid",
+    "uptime",
+    "user",
+    "wan",
+    "wlan",
 )
 
 
@@ -83,6 +107,94 @@ def parse_data_lua_log(content: str | None) -> str:
         if date and time and message:
             lines.append(f"{date} {time} {message}")
     return "\n".join(lines)
+
+
+def parse_support_data(
+    content: str | None, observed_at: str | None = None, max_findings: int = 3000
+) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    findings: list[dict[str, Any]] = []
+    section = "support_data"
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        section_candidate = support_section_title(line)
+        if section_candidate:
+            section = section_candidate
+            findings.append(
+                {
+                    "finding_type": "section",
+                    "section": section,
+                    "key": None,
+                    "value": section,
+                    "line_number": line_number,
+                    "observed_at": observed_at,
+                    "raw_text": raw_line,
+                    "evidence_level": "parsed_from_raw",
+                    "evidence_note": "Section marker parsed from FRITZ!Box support-data raw artifact.",
+                }
+            )
+            if len(findings) >= max_findings:
+                break
+            continue
+        key_value = SUPPORT_KEY_VALUE_RE.match(line)
+        parsed_key_value = False
+        if key_value:
+            key = key_value.group("key").strip()
+            value = key_value.group("value").strip()
+            if key.count(":") < 2 and len(value) <= 800:
+                parsed_key_value = True
+                findings.append(
+                    {
+                        "finding_type": "key_value",
+                        "section": section,
+                        "key": key,
+                        "value": value,
+                        "line_number": line_number,
+                        "observed_at": observed_at,
+                        "raw_text": raw_line,
+                        "evidence_level": "parsed_from_raw",
+                        "evidence_note": "Key/value parsed from FRITZ!Box support-data raw artifact.",
+                    }
+                )
+        if not parsed_key_value and support_line_is_forensic_signal(line):
+            findings.append(
+                {
+                    "finding_type": "signal_line",
+                    "section": section,
+                    "key": None,
+                    "value": line[:1000],
+                    "line_number": line_number,
+                    "observed_at": observed_at,
+                    "raw_text": raw_line,
+                    "evidence_level": "parsed_from_raw",
+                    "evidence_note": "Forensic keyword line parsed from FRITZ!Box support-data raw artifact.",
+                }
+            )
+        if len(findings) >= max_findings:
+            break
+    return findings
+
+
+def support_section_title(line: str) -> str | None:
+    stripped = line.strip(" #*=-\t")
+    if not stripped or len(stripped) > 120:
+        return None
+    marker_count = sum(line.startswith(marker) for marker in ("#", "*", "=", "-"))
+    if marker_count:
+        return stripped
+    if line.startswith(("#####", "====", "----", "***")):
+        return stripped
+    return None
+
+
+def support_line_is_forensic_signal(line: str) -> bool:
+    lower = line.casefold()
+    return any(keyword in lower for keyword in SUPPORT_KEYWORDS) and (
+        parse_mac(line) is not None or parse_ip(line) is not None
+    )
 
 
 def parse_wlan_device_lists(exports: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:

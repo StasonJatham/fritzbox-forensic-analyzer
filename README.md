@@ -10,7 +10,7 @@ This project is built for local incident response and home-network forensics. It
 
 ## What It Does
 
-- Pulls retained FRITZ!Box logs, host tables, mesh state, WLAN association snapshots, TR-064 router/WAN/WLAN status, and FRITZ!Box web UI LAN-device state when available.
+- Pulls retained FRITZ!Box logs, host tables, mesh state, WLAN association snapshots, TR-064 router/WAN/WLAN status, FRITZ!Box web UI LAN-device state, and support-data diagnostics when available.
 - Stores raw artifacts, parsed events, host records, WiFi observations, and run metadata in SQLite.
 - Provides backend full-text search across logs, hosts, WiFi records, entities, and timeline rows.
 - Shows an analyst dashboard with stored-evidence review, explicit acquisition runs, sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, and raw evidence drawers.
@@ -36,7 +36,7 @@ Low-confidence rows such as `mesh_last_observed` are contextual observations, no
 
 FRITZ!Box web UI device-state values such as `firstused` and `lastused` can provide valuable "first seen" and "last connected/used" timestamps. These values are retained router state, not a complete per-session connection log. The dashboard shows source coverage so analysts can see whether that internal LAN-device artifact was collected for a run.
 
-The collector also attempts selected unofficial FRITZ!Box Lua endpoints such as `query.lua` and `data.lua`. These are valuable because they mirror parts of the router UI, but they are not stable public APIs. The raw responses are preserved and labeled separately from official TR-064 evidence.
+The collector also attempts selected unofficial FRITZ!Box Lua endpoints such as `query.lua`, `data.lua`, and the hidden support-data workflow behind `support.lua`. These are valuable because they mirror parts of the router UI and diagnostic bundle, but they are not stable public APIs. The raw responses are preserved and labeled separately from official TR-064 evidence.
 
 ## Quick Start
 
@@ -112,6 +112,7 @@ Real router data can reveal personal devices, locations, account names, public I
 - `fritzbox-analysis.sqlite3`
 - raw artifact archives
 - acquisition packages
+- `support_data_txt` raw artifacts
 - JSON, CSV, or screenshot exports from a real network
 
 This repository intentionally does not include real screenshots, sample exports, or captured router data.
