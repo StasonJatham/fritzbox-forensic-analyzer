@@ -1,6 +1,9 @@
+import json
 from pathlib import Path
 
 from fritzbox_log_store import (
+    analysis_snapshot,
+    evidence_for_record,
     get_settings,
     ingest_dataset,
     init_db,
@@ -266,6 +269,86 @@ def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
     assert friday_hosts["rows"][0]["hostname"] == "returned-phone"
 
 
+def test_analysis_snapshot_exposes_forensic_visualization_data(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    tr064 = {
+        "actions": {
+            "wan_ip_external": {"ok": True, "response": {"NewExternalIPAddress": "198.51.100.10"}},
+            "wan_ip_status": {"ok": True, "response": {"NewConnectionStatus": "Connected"}},
+        },
+        "indexed_results": {
+            "wan_ip_port_mappings": {
+                "items": [
+                    {
+                        "ok": True,
+                        "response": {
+                            "NewEnabled": "1",
+                            "NewExternalPort": "8443",
+                            "NewProtocol": "TCP",
+                            "NewInternalPort": "443",
+                            "NewInternalClient": "192.0.2.21",
+                            "NewPortMappingDescription": "camera",
+                        },
+                    }
+                ]
+            }
+        },
+        "wlan": [],
+    }
+    mesh = {
+        "nodes": [
+            {
+                "device_name": "Repeater",
+                "node_interfaces": [
+                    {
+                        "name": "5 GHz",
+                        "type": "wifi",
+                        "node_links": [{"type": "wifi", "state": "connected", "cur_data_rate_rx": 866}],
+                    }
+                ],
+            }
+        ]
+    }
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {
+                "tr064_snapshot_json": json.dumps(tr064),
+                "mesh_list": json.dumps(mesh),
+                "landevice_query_json": "{}",
+            },
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [
+                {
+                    "hostname": "camera",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.21",
+                    "interface": "LAN",
+                    "active_now": True,
+                    "last_connected": "2026-05-20T10:00:00+02:00",
+                    "allow_pcp_and_upnp": "1",
+                    "upnp_count": "1",
+                }
+            ],
+        },
+        db,
+    )
+
+    snapshot = analysis_snapshot(db)
+
+    assert snapshot["mesh_summary"]["nodes"] == 1
+    assert snapshot["mesh_summary"]["links"][0]["device"] == "Repeater"
+    assert snapshot["tr064_summary"]["wan"]["port_mapping_count"] == 1
+    assert snapshot["tr064_summary"]["wan"]["port_mappings"][0]["internal_client"] == "192.0.2.21"
+    assert snapshot["host_risk_summary"]["devices"][0]["level"] == "high"
+    assert snapshot["last_used_histogram"] == [{"label": "2026-05-20", "count": 1}]
+    assert any(row["area"] == "Network exposure" for row in snapshot["source_coverage"]["matrix"])
+
+
 def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:
     db = tmp_path / "analysis.sqlite3"
     ingest_dataset(
@@ -366,3 +449,212 @@ def test_support_findings_are_searchable_and_observed_per_run(tmp_path: Path) ->
     assert support["rows"][0]["key"] == "SSID"
     assert canonical == 2
     assert observations == 2
+
+
+def test_ingest_additional_forensic_evidence_tables_and_queries(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+            "host_filter_profiles": [
+                {"profile_id": "standard", "name": "Standard", "access_mode": "unlimited", "devices": ["phone"]}
+            ],
+            "mesh_topology_links": [
+                {
+                    "node": "FRITZ!Box",
+                    "node_mac": "AA:BB:CC:00:00:01",
+                    "interface": "wifi0",
+                    "peer": "Repeater",
+                    "peer_mac": "AA:BB:CC:00:00:02",
+                    "link_type": "wifi",
+                    "state": "active",
+                    "last_connected": "2026-05-20T11:59:00+02:00",
+                }
+            ],
+            "wan_port_mappings": [
+                {
+                    "protocol": "TCP",
+                    "external_port": "8443",
+                    "internal_client": "192.0.2.44",
+                    "internal_port": "443",
+                    "description": "camera https",
+                    "enabled": "1",
+                }
+            ],
+            "wlan_radios": [
+                {
+                    "radio_index": "1",
+                    "ssid": "ForensicNet",
+                    "enabled": "1",
+                    "status": "Up",
+                    "standard": "ax",
+                    "channel": "11",
+                    "total_associations": "1",
+                }
+            ],
+            "wlan_associations": [
+                {
+                    "observed_at": "2026-05-20T12:00:00+02:00",
+                    "radio_index": "1",
+                    "association_index": "0",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.44",
+                    "hostname": "camera",
+                    "speed": "866",
+                    "signal_strength": "-45",
+                }
+            ],
+            "device_risk_summaries": [
+                {
+                    "device_key": "AA:BB:CC:DD:EE:FF",
+                    "hostname": "camera",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.44",
+                    "risk_level": "high",
+                    "risk_score": "80",
+                    "reasons": ["WAN mapping"],
+                    "summary": "WAN mapping exposes camera",
+                }
+            ],
+        },
+        db,
+    )
+
+    snapshot = latest_snapshot(db)
+    host_filter = query_records(db, "Standard", "host_filter")
+    mesh = query_records(db, "Repeater", "mesh")
+    wan = query_records(db, "camera", "wan_exposure")
+    radio = query_records(db, "ForensicNet", "wlan_radios")
+    association = query_records(db, "camera", "wlan_associations")
+    risk = query_records(db, "WAN mapping", "device_risks", evidence_level="inferred")
+    evidence = evidence_for_record(db, "wan_exposure", wan["rows"][0]["id"])
+
+    assert snapshot["counts"]["host_filter_profiles"] == 1
+    assert snapshot["counts"]["mesh_topology_links"] == 1
+    assert snapshot["counts"]["wan_port_mappings"] == 1
+    assert snapshot["counts"]["wlan_radios"] == 1
+    assert snapshot["counts"]["wlan_associations"] == 1
+    assert snapshot["counts"]["device_risk_summaries"] == 1
+    assert host_filter["rows"][0]["name"] == "Standard"
+    assert mesh["rows"][0]["peer"] == "Repeater"
+    assert wan["rows"][0]["external_port"] == "8443"
+    assert radio["rows"][0]["ssid"] == "ForensicNet"
+    assert association["rows"][0]["mac"] == "AA:BB:CC:DD:EE:FF"
+    assert risk["rows"][0]["risk_level"] == "high"
+    assert evidence["record"]["description"] == "camera https"
+
+
+def test_additional_evidence_extracts_from_raw_artifacts(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    tr064_snapshot = {
+        "actions": {
+            "host_filter_profiles": {
+                "ok": True,
+                "response": {"NewProfileList": [{"id": "guest", "name": "Guest", "access_mode": "limited"}]},
+            }
+        },
+        "wlan": [
+            {
+                "index": 1,
+                "info": {"ok": True, "response": {"NewSSID": "LabNet", "NewEnable": "1", "NewStatus": "Up"}},
+                "total_associations": {"ok": True, "response": {"NewTotalAssociations": "1"}},
+                "channel_info": {"ok": True, "response": {"NewChannel": "6"}},
+                "statistics": {"ok": True, "response": {"NewTotalBytesSent": "123", "NewTotalBytesReceived": "456"}},
+            }
+        ],
+        "indexed_results": {
+            "wan_ip_port_mappings": {
+                "items": [
+                    {
+                        "ok": True,
+                        "response": {
+                            "NewProtocol": "UDP",
+                            "NewExternalPort": "51820",
+                            "NewInternalClient": "192.0.2.99",
+                            "NewInternalPort": "51820",
+                            "NewPortMappingDescription": "wireguard",
+                            "NewEnabled": "1",
+                        },
+                    }
+                ]
+            },
+            "wlan_1_associations": {
+                "items": [
+                    {
+                        "ok": True,
+                        "response": {
+                            "NewAssociatedDeviceMACAddress": "AA:BB:CC:DD:EE:99",
+                            "NewAssociatedDeviceIPAddress": "192.0.2.99",
+                            "NewAssociatedDeviceAuthState": "1",
+                        },
+                    }
+                ]
+            },
+        },
+    }
+    mesh_list = {
+        "nodes": [
+            {
+                "device_name": "Router",
+                "device_mac_address": "AA:BB:CC:00:00:01",
+                "node_interfaces": [
+                    {
+                        "name": "lan",
+                        "type": "ethernet",
+                        "node_links": [
+                            {
+                                "type": "ethernet",
+                                "state": "active",
+                                "remote_name": "Switch",
+                                "remote_mac": "AA:BB:CC:00:00:03",
+                                "last_connected": 1779271200,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {
+                "tr064_snapshot_json": json.dumps(tr064_snapshot),
+                "mesh_list": json.dumps(mesh_list),
+            },
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [
+                {
+                    "hostname": "wireguard",
+                    "mac": "AA:BB:CC:DD:EE:99",
+                    "ip": "192.0.2.99",
+                    "interface": "WLAN",
+                    "active_now": True,
+                    "allow_pcp_and_upnp": "1",
+                    "upnp_count": "2",
+                }
+            ],
+        },
+        db,
+    )
+
+    assert query_records(db, "Guest", "host_filter_profiles")["total"] == 1
+    assert query_records(db, "Switch", "mesh_topology_links")["rows"][0]["link_type"] == "ethernet"
+    assert query_records(db, "51820", "wan_port_mappings")["rows"][0]["internal_client"] == "192.0.2.99"
+    assert query_records(db, "LabNet", "wlan_radio")["rows"][0]["total_associations"] == "1"
+    assert query_records(db, "AA:BB:CC:DD:EE:99", "wlan_association")["total"] == 1
+    risk = query_records(db, "UPnP", "device_risk")
+    assert risk["total"] == 1
+    assert risk["rows"][0]["risk_level"] == "medium"

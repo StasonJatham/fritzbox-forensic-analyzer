@@ -513,7 +513,15 @@ def create_app() -> FastAPI:
     @app.get("/api/search")
     def api_search(
         q: str = "",
-        view: str = Query(default="all", pattern="^(all|wifi|hosts|log|support|raw)$"),
+        view: str = Query(
+            default="all",
+            pattern=(
+                "^(all|wifi|hosts|log|support|raw|host_filter|host_filters|host_filter_profiles|"
+                "mesh|mesh_links|mesh_topology_links|wan|wan_exposure|port_mappings|wan_port_mappings|"
+                "wlan_radios|wlan_radio|wlan_associations|wlan_association|"
+                "device_risks|device_risk|device_risk_summaries)$"
+            ),
+        ),
         category: str = Query(default="all"),
         limit: int = Query(default=50, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),

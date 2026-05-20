@@ -16,6 +16,7 @@ from fritzbox_log_store import ingest_dataset
 from fritzbox_parsers import (
     FritzLogEntry as FritzLogEntry,
     build_available_wifi_connections,
+    build_forensic_findings,
     build_host_seen_index,
     entry_to_dict,
     filter_recent,
@@ -142,6 +143,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     active_hosts = [host for host in known_hosts if host["active_now"]]
     last_wifi_connection = next((event["timestamp"] for event in wifi_events if event["event"] == "connected"), None)
     available_wifi_connections = build_available_wifi_connections(wifi_events, mesh_wifi_devices, wlan_associations)
+    support_findings.extend(build_forensic_findings(avm_exports, known_hosts, available_wifi_connections, generated_at))
 
     return {
         "generated_at": generated_at,
@@ -183,6 +185,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 "host_list_xml",
                 "wlan_device_list_xml",
                 "landevice_query_json",
+                "query_lua_artifacts_json",
                 "data_lua_pages_json",
                 "tr064_snapshot_json",
                 "call_list_xml",

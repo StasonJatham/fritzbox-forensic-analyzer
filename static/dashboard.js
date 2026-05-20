@@ -50,6 +50,7 @@ function evidenceLabel(value) {
     active_host_snapshot: "active at fetch",
     fritzbox_landevice_lastused: "FRITZ!Box last used",
     landevice_query_json: "LAN device state",
+    query_lua_artifacts_json: "Web UI query.lua",
     data_lua_pages_json: "Web UI data.lua",
     device_log_xml: "device log",
     host_list_xml: "host list",
@@ -63,6 +64,12 @@ function evidenceLabel(value) {
     aha_switch_list_txt: "AHA switch list",
     aha_device_stats_json: "AHA device stats",
     config_export_file: "config export",
+    host_filter_profiles: "host filters",
+    mesh_topology_links: "mesh links",
+    wan_port_mappings: "WAN exposure",
+    wlan_radios: "WLAN radios",
+    wlan_associations: "WLAN associations",
+    device_risk_summaries: "device risk",
     high: "high",
     medium: "medium",
     low: "low"
@@ -400,10 +407,13 @@ function renderCharts() {
   renderMiniChart("confidence-chart", analysis.confidence_counts || []);
   renderMiniChart("interface-chart", analysis.interface_counts || []);
   renderMiniChart("timestamp-chart", Object.entries(analysis.timestamp_coverage || {}).map(([label, count]) => ({ label, count })));
-  renderMiniChart("mesh-links", analysis.mesh_summary?.link_counts || []);
+  renderMeshLinks(analysis.mesh_summary || {});
   renderSourceCoverage(analysis.source_coverage || {});
   renderWlanRadios(analysis.tr064_summary?.wlan_radios || []);
   renderWanState(analysis.tr064_summary?.wan || {});
+  renderWanExposure(analysis.tr064_summary?.wan || {});
+  renderDeviceRisk(analysis.host_risk_summary || {});
+  renderLastUsedHistogram(analysis.last_used_histogram || []);
 }
 
 function renderMiniChart(id, rows) {
@@ -419,12 +429,30 @@ function renderMiniChart(id, rows) {
 function renderSourceCoverage(coverage) {
   const present = new Set((coverage.present_raw_artifacts || []).map((row) => row.name));
   const expected = coverage.expected_raw_artifacts || [];
-  $("source-coverage").innerHTML = expected.length ? expected.map((name) => `
+  const matrix = coverage.matrix || [];
+  const summary = expected.length ? expected.map((name) => `
     <div class="mini-row">
       <span>${escapeHtml(evidenceLabel(name))}</span>
       <strong>${present.has(name) ? "present" : "missing"}</strong>
     </div>
-  `).join("") : `<div class="empty">No source coverage data.</div>`;
+  `).join("") : "";
+  const details = matrix.map((row) => `
+    <div class="coverage-row ${escapeHtml(cssToken(row.state))}">
+      <div class="mini-row">
+        <span>${escapeHtml(row.area)}</span>
+        <strong>${escapeHtml(row.present)} / ${escapeHtml(row.expected)}</strong>
+      </div>
+      <div class="subtitle">${escapeHtml(row.detail)}</div>
+      <div class="coverage-artifacts">
+        ${(row.artifacts || []).map((artifact) => `
+          <span class="${artifact.present ? "present" : "missing"}" title="${escapeHtml(formatTime(artifact.last_observed))}">
+            ${escapeHtml(evidenceLabel(artifact.name))}
+          </span>
+        `).join("")}
+      </div>
+    </div>
+  `).join("");
+  $("source-coverage").innerHTML = details || summary || `<div class="empty">No source coverage data.</div>`;
 }
 
 function renderWlanRadios(radios) {
@@ -448,6 +476,83 @@ function renderWanState(wan) {
   $("wan-state").innerHTML = rows.length ? rows.map(([label, value]) => `
     <div class="mini-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display(value))}</strong></div>
   `).join("") : `<div class="empty">No WAN snapshot.</div>`;
+}
+
+function renderMeshLinks(mesh) {
+  const links = mesh.links || [];
+  if (!mesh.available) {
+    $("mesh-links").innerHTML = `<div class="empty">No mesh topology artifact.</div>`;
+    return;
+  }
+  $("mesh-links").innerHTML = `
+    <div class="mini-row"><span>Nodes</span><strong>${escapeHtml(mesh.nodes || 0)}</strong></div>
+    ${links.length ? links.slice(0, 8).map((link) => `
+      <div class="topology-row">
+        <div class="mini-row">
+          <span>${escapeHtml(display(link.device, "Unknown device"))}</span>
+          <strong>${escapeHtml(display(link.state, "unknown"))}</strong>
+        </div>
+        <div class="subtitle">${escapeHtml([link.interface, link.type, link.rx ? `${link.rx} rx` : "", link.tx ? `${link.tx} tx` : "", link.last_connected ? formatTime(link.last_connected) : ""].filter(Boolean).join(" / "))}</div>
+      </div>
+    `).join("") : `<div class="empty compact">No mesh links reported.</div>`}
+  `;
+}
+
+function renderWanExposure(wan) {
+  const mappings = wan.port_mappings || [];
+  const enabled = mappings.filter((mapping) => mapping.enabled);
+  const rows = [
+    ["External IP", wan.external_ip],
+    ["Port mappings", mappings.length ? `${enabled.length} enabled / ${mappings.length} total` : ""]
+  ].filter(([, value]) => display(value, "") !== "");
+  $("wan-exposure").innerHTML = rows.length || mappings.length ? `
+    ${rows.map(([label, value]) => `<div class="mini-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display(value))}</strong></div>`).join("")}
+    ${mappings.slice(0, 8).map((mapping) => `
+      <div class="exposure-row ${mapping.enabled ? "enabled" : "disabled"}">
+        <div class="mini-row">
+          <span>${escapeHtml(display(mapping.description, "Port mapping"))}</span>
+          <strong>${escapeHtml([mapping.external_port, mapping.protocol].filter(Boolean).join("/"))}</strong>
+        </div>
+        <div class="subtitle">${escapeHtml([mapping.internal_client, mapping.internal_port ? `internal ${mapping.internal_port}` : "", mapping.enabled ? "enabled" : "disabled"].filter(Boolean).join(" / "))}</div>
+      </div>
+    `).join("")}
+  ` : `<div class="empty">No WAN exposure details.</div>`;
+}
+
+function renderDeviceRisk(risk) {
+  const devices = risk.devices || [];
+  const totals = risk.totals || {};
+  if (!risk.available) {
+    $("device-risk").innerHTML = `<div class="empty">No host inventory for risk scoring.</div>`;
+    return;
+  }
+  $("device-risk").innerHTML = `
+    <div class="risk-summary">
+      ${["high", "medium", "low"].map((level) => `<span class="pill ${level}">${escapeHtml(level)} ${escapeHtml(totals[level] || 0)}</span>`).join("")}
+    </div>
+    ${devices.length ? devices.slice(0, 6).map((device) => `
+      <button class="risk-device" data-entity="${escapeHtml(device.mac || device.ip || device.hostname || "")}">
+        <div class="mini-row">
+          <span>${escapeHtml(display(device.hostname || device.ip || device.mac, "Unknown device"))}</span>
+          <strong>${escapeHtml(device.score)}</strong>
+        </div>
+        <div class="subtitle">${escapeHtml((device.reasons || []).join(" / "))}</div>
+      </button>
+    `).join("") : `<div class="empty compact">No elevated device-risk signals.</div>`}
+  `;
+}
+
+function renderLastUsedHistogram(rows) {
+  const max = Math.max(1, ...rows.map((row) => row.count || 0));
+  $("last-used-histogram").innerHTML = rows.length ? rows.map((row) => {
+    const height = Math.max(8, Math.round(((row.count || 0) / max) * 100));
+    return `
+      <div class="histogram-bar" title="${escapeHtml(row.label)} - ${escapeHtml(row.count)} devices">
+        <div style="height:${height}%"></div>
+        <span>${escapeHtml(String(row.label || "").slice(5))}</span>
+      </div>
+    `;
+  }).join("") : `<div class="empty">No retained last-used timestamps.</div>`;
 }
 
 function renderTimeline(rows) {
@@ -522,6 +627,54 @@ function renderTable() {
       rowAction(row), formatTime(row.created_at), evidenceLabel(row.name), row.sha256,
       text(row.content).length, text(row.content).slice(0, 220)
     ]), rows);
+  } else if (state.view === "wan_port_mappings") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Protocol", "protocol"], ["External", "external_port"], ["Internal Host", "internal_client"],
+      ["Internal Port", "internal_port"], ["Enabled", "enabled"], ["Description", "description"], ["Source", "source"]
+    ], rows.map((row) => [
+      rowAction(row), row.protocol, row.external_port, row.internal_client, row.internal_port,
+      row.enabled, row.description, row.source
+    ]), rows);
+  } else if (state.view === "mesh_topology_links") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Last Connected", "last_connected"], ["Node", "node"], ["Interface", "interface"],
+      ["Peer", "peer"], ["Type", "link_type"], ["State", "state"], ["RX", "rx"], ["TX", "tx"]
+    ], rows.map((row) => [
+      rowAction(row), formatTime(row.last_connected), row.node || row.node_mac, row.interface,
+      row.peer || row.peer_mac, row.link_type, row.state, row.rx, row.tx
+    ]), rows);
+  } else if (state.view === "wlan_radios") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Radio", "radio_index"], ["SSID", "ssid"], ["Enabled", "enabled"], ["Status", "status"],
+      ["Standard", "standard"], ["Channel", "channel"], ["Associations", "total_associations"], ["Bytes RX", "bytes_received"], ["Bytes TX", "bytes_sent"]
+    ], rows.map((row) => [
+      rowAction(row), row.radio_index, row.ssid, row.enabled, row.status, row.standard,
+      row.channel, row.total_associations, row.bytes_received, row.bytes_sent
+    ]), rows);
+  } else if (state.view === "wlan_associations") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Observed", "observed_at"], ["Radio", "radio_index"], ["MAC", "mac"], ["IP", "ip"],
+      ["Host", "hostname"], ["Auth", "auth_state"], ["Speed", "speed"], ["Signal", "signal_strength"], ["Guest", "guest"]
+    ], rows.map((row) => [
+      rowAction(row), formatTime(row.observed_at), row.radio_index, row.mac, row.ip,
+      row.hostname, row.auth_state, row.speed, row.signal_strength, row.guest
+    ]), rows);
+  } else if (state.view === "host_filter_profiles") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Profile", "name"], ["ID", "profile_id"], ["Access", "access_mode"],
+      ["Budget", "time_budget"], ["Blocked", "blocked"], ["Devices", "devices_json"], ["Source", "source"]
+    ], rows.map((row) => [
+      rowAction(row), row.name, row.profile_id, row.access_mode, row.time_budget,
+      row.blocked, row.devices_json, row.source
+    ]), rows);
+  } else if (state.view === "device_risk_summaries") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Risk", "risk_score"], ["Level", "risk_level"], ["Host", "hostname"], ["MAC", "mac"],
+      ["IP", "ip"], ["Reasons", "reasons_json"], ["Summary", "summary"]
+    ], rows.map((row) => [
+      rowAction(row), row.risk_score, pill(row.risk_level, row.risk_level), row.hostname,
+      row.mac, row.ip, row.reasons_json, row.summary
+    ]), rows);
   } else if (state.view === "entities") {
     $("table").innerHTML = table([
       ["Action", ""], ["Host", "hostname"], ["MAC", "mac"], ["IP", "ip"], ["Interface", "interface"], ["Active", "active_now"],
@@ -547,7 +700,8 @@ function rowAction(row) {
     state.view === "log" ? "log" :
     state.view === "hosts" ? "hosts" :
     state.view === "support" ? "support" :
-    state.view === "raw" ? "raw" : ""
+    state.view === "raw" ? "raw" :
+    additionalEvidenceView(state.view) ? state.view : ""
   );
   const id = row.record_id || row.id || "";
   return `<button class="row-action" data-action="evidence" data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">Open</button>`;
@@ -599,7 +753,8 @@ function table(headers, rows, sourceRows = []) {
         state.view === "log" ? "log" :
         state.view === "hosts" ? "hosts" :
         state.view === "support" ? "support" :
-        state.view === "raw" ? "raw" : ""
+        state.view === "raw" ? "raw" :
+        additionalEvidenceView(state.view) ? state.view : ""
       );
       const id = source.record_id || source.id || "";
       return `<tr data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">${row.map((cell, cellIndex) => {
@@ -619,7 +774,24 @@ function defaultSortForView(view) {
   if (view === "entities") return "last_seen";
   if (view === "support") return "line_number";
   if (view === "raw") return "created_at";
+  if (view === "wan_port_mappings") return "external_port";
+  if (view === "mesh_topology_links") return "last_connected";
+  if (view === "wlan_radios") return "radio_index";
+  if (view === "wlan_associations") return "observed_at";
+  if (view === "host_filter_profiles") return "name";
+  if (view === "device_risk_summaries") return "risk_score";
   return "derived_connected_at";
+}
+
+function additionalEvidenceView(view) {
+  return [
+    "wan_port_mappings",
+    "mesh_topology_links",
+    "wlan_radios",
+    "wlan_associations",
+    "host_filter_profiles",
+    "device_risk_summaries"
+  ].includes(view);
 }
 
 async function openEvidence(type, id) {
@@ -804,6 +976,11 @@ $("timeline").addEventListener("click", (event) => {
   openEvidence(row.dataset.recordType, row.dataset.recordId);
 });
 $("entities").addEventListener("click", (event) => {
+  const card = event.target.closest("[data-entity]");
+  if (!card) return;
+  openEntity(card.dataset.entity);
+});
+$("device-risk").addEventListener("click", (event) => {
   const card = event.target.closest("[data-entity]");
   if (!card) return;
   openEntity(card.dataset.entity);

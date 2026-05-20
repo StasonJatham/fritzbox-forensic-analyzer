@@ -354,6 +354,7 @@ def parse_landevice_query(content: str | None) -> list[dict[str, Any]]:
                 "dhcp": row.get("dhcp") or None,
                 "static_dhcp": row.get("static_dhcp") or None,
                 "blocked": row.get("blocked") or None,
+                "guest": row.get("guest") or None,
                 "allow_pcp_and_upnp": row.get("allow_pcp_and_upnp") or None,
                 "pcp_count": row.get("igd_fw_cnt_pcp") or None,
                 "upnp_count": row.get("igd_fw_cnt_upnp") or None,
@@ -420,6 +421,7 @@ def lan_device_host_rows(
                 "dhcp": device.get("dhcp"),
                 "static_dhcp": device.get("static_dhcp"),
                 "blocked": device.get("blocked"),
+                "guest": device.get("guest"),
                 "allow_pcp_and_upnp": device.get("allow_pcp_and_upnp"),
                 "pcp_count": device.get("pcp_count"),
                 "upnp_count": device.get("upnp_count"),
@@ -770,7 +772,7 @@ def host_to_dict(host: dict[str, Any], seen: dict[str, Any] | None = None) -> di
         "online": seen.get("online"),
         "lease_time_remaining": host.get("NewLeaseTimeRemaining"),
         "uid": seen.get("uid"),
-        "friendly_name": seen.get("friendly_name"),
+        "friendly_name": seen.get("friendly_name") or host.get("NewX_AVM-DE_FriendlyName"),
         "neighbour_name": seen.get("neighbour_name"),
         "ip_list": seen.get("ip_list"),
         "mac_list": seen.get("mac_list"),
@@ -779,8 +781,8 @@ def host_to_dict(host: dict[str, Any], seen: dict[str, Any] | None = None) -> di
         "plc_uids": seen.get("plc_uids"),
         "ethernet_port": seen.get("ethernet_port"),
         "vendor": seen.get("vendor"),
-        "model": seen.get("model"),
-        "speed": seen.get("speed"),
+        "model": seen.get("model") or host.get("NewX_AVM-DE_Model"),
+        "speed": seen.get("speed") or host.get("NewX_AVM-DE_Speed"),
         "source_flags": seen.get("source_flags"),
         "parent_uid": seen.get("parent_uid"),
         "flags": seen.get("flags"),
@@ -788,6 +790,10 @@ def host_to_dict(host: dict[str, Any], seen: dict[str, Any] | None = None) -> di
         "dhcp": seen.get("dhcp"),
         "static_dhcp": seen.get("static_dhcp"),
         "blocked": seen.get("blocked"),
+        "guest": seen.get("guest") or host.get("NewX_AVM-DE_Guest"),
+        "vpn": host.get("NewX_AVM-DE_VPN"),
+        "wan_access": host.get("NewX_AVM-DE_WANAccess"),
+        "filter_profile_id": host.get("NewX_AVM-DE_FilterProfileID"),
         "allow_pcp_and_upnp": seen.get("allow_pcp_and_upnp"),
         "pcp_count": seen.get("pcp_count"),
         "upnp_count": seen.get("upnp_count"),
@@ -800,6 +806,355 @@ def host_to_dict(host: dict[str, Any], seen: dict[str, Any] | None = None) -> di
         "last_activity_confidence": seen.get("last_activity_confidence"),
         "last_activity_note": seen.get("last_activity_note"),
     }
+
+
+def build_forensic_findings(
+    exports: dict[str, Any],
+    known_hosts: list[dict[str, Any]],
+    wifi_records: list[dict[str, Any]],
+    observed_at: str,
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    findings.extend(tr064_snapshot_findings(exports.get("tr064_snapshot_json"), observed_at))
+    findings.extend(mesh_topology_findings(exports.get("mesh_list"), observed_at))
+    findings.extend(data_lua_findings(exports.get("data_lua_pages_json"), observed_at))
+    findings.extend(query_lua_findings(exports.get("query_lua_artifacts_json"), observed_at))
+    findings.extend(device_risk_findings(known_hosts, wifi_records, observed_at))
+    return findings
+
+
+def finding(
+    finding_type: str,
+    section: str,
+    key: str | None,
+    value: Any,
+    observed_at: str,
+    source: str,
+    raw: Any,
+    note: str,
+) -> dict[str, Any]:
+    rendered = json.dumps(value, sort_keys=True, default=str) if isinstance(value, dict | list) else str(value)
+    return {
+        "finding_type": finding_type,
+        "section": section,
+        "key": key,
+        "value": rendered[:2000],
+        "line_number": None,
+        "observed_at": observed_at,
+        "source": source,
+        "raw_text": rendered[:4000],
+        "evidence_level": "parsed_from_raw",
+        "evidence_note": note,
+        "raw_json": raw,
+    }
+
+
+def tr064_snapshot_findings(content: str | None, observed_at: str) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    findings: list[dict[str, Any]] = []
+    actions = data.get("actions") or {}
+    indexed = data.get("indexed_results") or {}
+
+    for key in ("host_filter_profiles", "lan_host_config", "wan_ip_info", "wan_ip_status", "wan_ip_external"):
+        response = (actions.get(key) or {}).get("response")
+        if response:
+            findings.append(
+                finding(
+                    key,
+                    "tr064_status",
+                    key,
+                    response,
+                    observed_at,
+                    "tr064_snapshot_json",
+                    response,
+                    "Read-only TR-064 action response parsed from the acquisition snapshot.",
+                )
+            )
+
+    for mapping_key in ("wan_ip_port_mappings", "wan_ppp_port_mappings"):
+        for item in (indexed.get(mapping_key) or {}).get("items") or []:
+            response = item.get("response") or {}
+            if not response:
+                continue
+            enabled = truthy(response.get("NewEnabled"))
+            label = (
+                f"{response.get('NewProtocol') or 'protocol'} "
+                f"{response.get('NewExternalPort') or '?'} -> "
+                f"{response.get('NewInternalClient') or '?'}:{response.get('NewInternalPort') or '?'}"
+            )
+            findings.append(
+                finding(
+                    "wan_port_mapping_enabled" if enabled else "wan_port_mapping_disabled",
+                    "wan_exposure",
+                    label,
+                    response,
+                    observed_at,
+                    "tr064_snapshot_json",
+                    response,
+                    "WAN port mapping parsed from TR-064 indexed port-mapping results.",
+                )
+            )
+
+    for key, bucket in indexed.items():
+        if not key.startswith("wlan_") or not key.endswith("_associations"):
+            continue
+        for item in bucket.get("items") or []:
+            response = item.get("response") or {}
+            if response:
+                findings.append(
+                    finding(
+                        "wlan_association_tr064",
+                        "wlan_association_snapshot",
+                        response.get("NewAssociatedDeviceMACAddress") or key,
+                        response,
+                        observed_at,
+                        "tr064_snapshot_json",
+                        response,
+                        "Current WLAN association parsed from TR-064 indexed association results.",
+                    )
+                )
+
+    for radio in data.get("wlan") or []:
+        info = (radio.get("info") or {}).get("response") or {}
+        stats = (radio.get("statistics") or {}).get("response") or {}
+        packet_stats = (radio.get("packet_statistics") or {}).get("response") or {}
+        if info or stats or packet_stats:
+            findings.append(
+                finding(
+                    "wlan_radio",
+                    "wlan_radio_state",
+                    f"radio_{radio.get('index')}",
+                    {"info": info, "statistics": stats, "packet_statistics": packet_stats},
+                    observed_at,
+                    "tr064_snapshot_json",
+                    radio,
+                    "Per-radio WLAN state and counters parsed from TR-064.",
+                )
+            )
+    return findings
+
+
+def mesh_topology_findings(content: str | None, observed_at: str) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    findings: list[dict[str, Any]] = []
+    for node in data.get("nodes") or []:
+        node_label = node.get("device_name") or node.get("device_friendly_name") or node.get("device_mac_address")
+        findings.append(
+            finding(
+                "mesh_node",
+                "mesh_topology",
+                node_label,
+                {
+                    "name": node_label,
+                    "mac": node.get("device_mac_address"),
+                    "uid": node.get("uid"),
+                    "ips": node.get("ip_addresses"),
+                },
+                observed_at,
+                "mesh_list",
+                node,
+                "Mesh node parsed from the official mesh topology artifact.",
+            )
+        )
+        for interface in node.get("node_interfaces") or []:
+            for link in interface.get("node_links") or []:
+                link_value = {
+                    "device": node_label,
+                    "interface": interface.get("name") or interface.get("type"),
+                    "link_type": link.get("type") or interface.get("type"),
+                    "state": link.get("state"),
+                    "last_connected": mesh_timestamp_to_iso(link.get("last_connected"))
+                    or unix_timestamp_to_iso(link.get("last_connected")),
+                    "rx": link.get("cur_data_rate_rx"),
+                    "tx": link.get("cur_data_rate_tx"),
+                    "raw": link,
+                }
+                findings.append(
+                    finding(
+                        "mesh_link",
+                        "mesh_topology",
+                        f"{node_label}:{link_value['interface']}",
+                        link_value,
+                        observed_at,
+                        "mesh_list",
+                        link,
+                        "Mesh link parsed from topology; last_connected is router-provided when present.",
+                    )
+                )
+    return findings
+
+
+def data_lua_findings(content: str | None, observed_at: str) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    try:
+        pages = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    findings: list[dict[str, Any]] = []
+    for page, payload in pages.items():
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            continue
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if page == "homeNet":
+            findings.extend(home_net_findings(data, observed_at))
+        elif page in {"netCnt", "netMoni", "inetstat", "dsl", "wlan", "wGuest", "mesh"} and data:
+            findings.append(
+                finding(
+                    f"data_lua_{page}",
+                    "webui_internal",
+                    page,
+                    summarize_payload(data),
+                    observed_at,
+                    "data_lua_pages_json",
+                    data,
+                    "Firmware-dependent data.lua page parsed as internal Web UI evidence.",
+                )
+            )
+    return findings
+
+
+def home_net_findings(data: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    devices = data.get("devices") or (data.get("topology") or {}).get("devices") or []
+    if isinstance(devices, dict):
+        devices = list(devices.values())
+    for device in devices if isinstance(devices, list) else []:
+        if not isinstance(device, dict):
+            continue
+        state = device.get("stateinfo") or {}
+        connection = device.get("conninfo") or {}
+        name = (device.get("nameinfo") or {}).get("name") or device.get("name") or device.get("UID")
+        findings.append(
+            finding(
+                "homenet_device",
+                "webui_homenet_topology",
+                name,
+                {
+                    "uid": device.get("UID") or device.get("uid"),
+                    "name": name,
+                    "mac": device.get("mac"),
+                    "active": state.get("active"),
+                    "online": device.get("online"),
+                    "guest": device.get("guest"),
+                    "blocked": device.get("blocked") or device.get("internetBlocked"),
+                    "kind": connection.get("kind"),
+                    "speed": connection.get("speed"),
+                    "parent": device.get("parent") or device.get("parentuid"),
+                    "ipinfo": device.get("ipinfo"),
+                },
+                observed_at,
+                "data_lua_pages_json",
+                device,
+                "Home network topology device parsed from internal data.lua page.",
+            )
+        )
+    return findings
+
+
+def query_lua_findings(content: str | None, observed_at: str) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    try:
+        artifacts = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    findings: list[dict[str, Any]] = []
+    for name, payload in artifacts.items():
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            continue
+        data = payload.get("data")
+        if not data:
+            continue
+        findings.append(
+            finding(
+                f"query_lua_{name}",
+                "webui_internal_query",
+                name,
+                summarize_payload(data),
+                observed_at,
+                "query_lua_artifacts_json",
+                data,
+                "Firmware-dependent query.lua response retained as parsed internal Web UI evidence.",
+            )
+        )
+    return findings
+
+
+def summarize_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        summary: dict[str, Any] = {"keys": sorted(str(key) for key in value.keys())[:40]}
+        for key, item in value.items():
+            if isinstance(item, list):
+                summary[f"{key}_count"] = len(item)
+            elif isinstance(item, dict):
+                summary[f"{key}_keys"] = sorted(str(child) for child in item.keys())[:20]
+        return summary
+    if isinstance(value, list):
+        return {"rows": len(value), "sample": value[:3]}
+    return {"value": value}
+
+
+def device_risk_findings(
+    known_hosts: list[dict[str, Any]], wifi_records: list[dict[str, Any]], observed_at: str
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    wifi_macs = {str(row.get("mac") or "").lower() for row in wifi_records if row.get("mac")}
+    for host in known_hosts:
+        risk_flags = []
+        if not host.get("vendor") and host.get("mac"):
+            risk_flags.append("unknown_vendor")
+        if truthy(host.get("blocked")):
+            risk_flags.append("blocked_or_restricted")
+        if truthy(host.get("guest")):
+            risk_flags.append("guest_network_device")
+        if truthy(host.get("allow_pcp_and_upnp")):
+            risk_flags.append("upnp_or_pcp_allowed")
+        if numeric_positive(host.get("pcp_count")) or numeric_positive(host.get("upnp_count")):
+            risk_flags.append("active_port_sharing_rules")
+        if host.get("mac") and str(host.get("mac")).lower() in wifi_macs and not host.get("last_connected"):
+            risk_flags.append("wifi_seen_without_exact_join_time")
+        if not risk_flags:
+            continue
+        findings.append(
+            finding(
+                "device_risk",
+                "device_risk",
+                host.get("hostname") or host.get("mac") or host.get("ip"),
+                {
+                    "hostname": host.get("hostname"),
+                    "mac": host.get("mac"),
+                    "ip": host.get("ip"),
+                    "interface": host.get("interface"),
+                    "first_seen": host.get("first_seen"),
+                    "last_connected": host.get("last_connected"),
+                    "last_activity": host.get("last_activity"),
+                    "risk_flags": risk_flags,
+                },
+                observed_at,
+                "derived_from_parsed_sources",
+                host,
+                "Risk cue derived from parsed host/WLAN evidence. Treat as triage guidance, not proof of compromise.",
+            )
+        )
+    return findings
+
+
+def numeric_positive(value: Any) -> bool:
+    try:
+        return float(str(value).strip()) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def filter_recent(entries: Iterable[FritzLogEntry], hours: int) -> list[FritzLogEntry]:

@@ -379,6 +379,86 @@
       background: var(--primary);
     }
 
+    .topology-row,
+    .exposure-row,
+    .coverage-row {
+      border: 1px solid var(--hairline);
+      border-radius: 8px;
+      background: var(--surface-2);
+      padding: 10px;
+    }
+
+    .exposure-row.enabled {
+      border-color: rgba(39, 166, 68, .35);
+    }
+
+    .coverage-artifacts,
+    .risk-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .coverage-artifacts span {
+      border: 1px solid var(--hairline);
+      border-radius: 999px;
+      padding: 3px 7px;
+      color: var(--ink-subtle);
+      background: var(--surface-3);
+    }
+
+    .coverage-artifacts span.present {
+      border-color: rgba(39, 166, 68, .35);
+      color: #8fe0a2;
+    }
+
+    .risk-device {
+      width: 100%;
+      height: auto;
+      padding: 10px;
+      text-align: left;
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+
+    .histogram {
+      display: grid;
+      grid-template-columns: repeat(14, minmax(12px, 1fr));
+      gap: 5px;
+      align-items: end;
+      min-height: 146px;
+      color: var(--ink-subtle);
+      font-size: 10px;
+    }
+
+    .histogram-bar {
+      display: grid;
+      grid-template-rows: 110px auto;
+      gap: 6px;
+      align-items: end;
+      min-width: 0;
+    }
+
+    .histogram-bar div {
+      width: 100%;
+      min-height: 4px;
+      align-self: end;
+      border-radius: 4px 4px 0 0;
+      background: var(--primary);
+    }
+
+    .histogram-bar span {
+      display: block;
+      overflow: hidden;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    .empty.compact {
+      padding: 12px;
+    }
+
     .tabs {
       display: flex;
       gap: 8px;

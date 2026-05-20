@@ -61,6 +61,14 @@ def get_hosts(fc: Any) -> list[dict[str, Any]]:
             host = fc.call_action("Hosts:1", "GetGenericHostEntry", NewIndex=index)
         except Exception:
             continue
+        mac = host.get("NewMACAddress")
+        if mac:
+            try:
+                specific = fc.call_action("Hosts:1", "GetSpecificHostEntry", NewMACAddress=mac)
+            except Exception:
+                specific = {}
+            if specific:
+                host.update(specific)
         hosts.append(host)
     return hosts
 
@@ -106,6 +114,17 @@ DATA_LUA_PAGES = (
     "users",
     "myfritz",
     "shareUsb",
+    "portShare",
+    "forwardRules",
+    "netSet",
+    "wlanSet",
+    "wlanRadio",
+    "wlanSecurity",
+    "wlanMesh",
+    "filter",
+    "kids",
+    "userSettings",
+    "remoteAccess",
 )
 
 
@@ -156,6 +175,9 @@ def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | N
     landevice_query = fetch_landevice_query(fc)
     if landevice_query:
         exports["landevice_query_json"] = landevice_query
+    query_artifacts = fetch_query_lua_artifacts(fc)
+    if query_artifacts:
+        exports["query_lua_artifacts_json"] = json.dumps(query_artifacts, sort_keys=True, default=str)
     tr064_snapshot = collect_tr064_snapshot(fc)
     if tr064_snapshot:
         exports["tr064_snapshot_json"] = json.dumps(tr064_snapshot, sort_keys=True, default=str)
@@ -300,6 +322,40 @@ def fetch_landevice_query(fc: Any) -> str | None:
         if text and "landevice" in text:
             return text
     return None
+
+
+def fetch_query_lua_artifacts(fc: Any) -> dict[str, Any]:
+    """Best-effort snapshots of unstable query.lua namespaces.
+
+    These are intentionally raw-first. FRITZ!OS firmware decides which query
+    paths exist; failures are retained so source coverage explains gaps.
+    """
+    queries = {
+        "landevice_all": "landevice:settings/landevice/list(UID,ip,iplist,mac,maclist,name,friendly_name,neighbour_name,vendorname,modelname,parentuid,parentsource,source,flags,modification_flags,interface,wlan_station_type,wlan_UIDs,plc_UIDs,ethernetport,active,online,guest,speed,dhcp,static_dhcp,deleteable,wakeup,auto_wakeup,firstused,lastused,blocked,allow_pcp_and_upnp,igd_fw_cnt_pcp,igd_fw_cnt_upnp,myfritz_enabled,url)",
+        "hostfilter_profiles": "filter:settings/profile/list(id,name,type,netappsid,blocked,autoupdate,disabled)",
+        "wlan_stations": "wlan:settings/station/list(mac,ip,name,UID,active,guest,ap,ssid,rssi,speed,flags)",
+        "wlan_radios": "wlan:settings/radio/list(uid,enabled,ssid,channel,autochannel,standard,mac,guest)",
+        "port_sharing": "forwardrules:settings/rule/list(description,enabled,protocol,port,end_port,fwip,fwport,sourceip)",
+        "vpn_users": "vpn:settings/connection/list(name,enabled,type,remote_ip,local_ip,last_connected)",
+        "wireguard": "wireguard:settings/peer/list(name,enabled,remote_endpoint,allowed_ips,last_handshake)",
+        "user_rights": "user:settings/user/list(name,enabled,box_admin,ftp_access,vpn_access,frominternet)",
+    }
+    artifacts: dict[str, Any] = {}
+    for name, query in queries.items():
+        try:
+            response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/query.lua", {name: query})
+        except Exception as exc:
+            artifacts[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "query": query}
+            continue
+        text = getattr(response, "text", "")
+        if not text:
+            artifacts[name] = {"ok": False, "error": "empty response", "query": query}
+            continue
+        try:
+            artifacts[name] = {"ok": True, "data": json.loads(text), "query": query}
+        except json.JSONDecodeError:
+            artifacts[name] = {"ok": True, "raw": text, "query": query}
+    return artifacts
 
 
 def collect_tr064_snapshot(fc: Any) -> dict[str, Any]:

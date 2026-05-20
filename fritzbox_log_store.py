@@ -18,6 +18,7 @@ EXPECTED_RAW_ARTIFACTS = [
     "host_list_xml",
     "wlan_device_list_xml",
     "landevice_query_json",
+    "query_lua_artifacts_json",
     "data_lua_pages_json",
     "tr064_snapshot_json",
     "call_list_xml",
@@ -140,6 +141,10 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             dhcp TEXT,
             static_dhcp TEXT,
             blocked TEXT,
+            guest TEXT,
+            vpn TEXT,
+            wan_access TEXT,
+            filter_profile_id TEXT,
             allow_pcp_and_upnp TEXT,
             pcp_count TEXT,
             upnp_count TEXT,
@@ -168,6 +173,136 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             raw_json TEXT NOT NULL,
             searchable TEXT NOT NULL,
             UNIQUE(run_id, line_number, raw_text),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS host_filter_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            profile_id TEXT,
+            name TEXT,
+            access_mode TEXT,
+            time_budget TEXT,
+            blocked TEXT,
+            devices_json TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS mesh_topology_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            node TEXT,
+            node_mac TEXT,
+            interface TEXT,
+            peer TEXT,
+            peer_mac TEXT,
+            link_type TEXT,
+            state TEXT,
+            last_connected TEXT,
+            rx TEXT,
+            tx TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS wan_port_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            protocol TEXT,
+            external_port TEXT,
+            internal_client TEXT,
+            internal_port TEXT,
+            description TEXT,
+            enabled TEXT,
+            remote_host TEXT,
+            lease_duration TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS wlan_radios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            radio_index TEXT,
+            ssid TEXT,
+            enabled TEXT,
+            status TEXT,
+            standard TEXT,
+            channel TEXT,
+            total_associations TEXT,
+            bytes_sent TEXT,
+            bytes_received TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS wlan_associations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            observed_at TEXT,
+            radio_index TEXT,
+            association_index TEXT,
+            mac TEXT,
+            ip TEXT,
+            hostname TEXT,
+            auth_state TEXT,
+            speed TEXT,
+            signal_strength TEXT,
+            channel TEXT,
+            guest TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS device_risk_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            device_key TEXT,
+            hostname TEXT,
+            mac TEXT,
+            ip TEXT,
+            risk_level TEXT,
+            risk_score TEXT,
+            reasons_json TEXT,
+            summary TEXT,
+            source TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'inferred',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
             FOREIGN KEY(run_id) REFERENCES export_runs(id)
         );
 
@@ -253,6 +388,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "dhcp": "TEXT",
             "static_dhcp": "TEXT",
             "blocked": "TEXT",
+            "guest": "TEXT",
+            "vpn": "TEXT",
+            "wan_access": "TEXT",
+            "filter_profile_id": "TEXT",
             "allow_pcp_and_upnp": "TEXT",
             "pcp_count": "TEXT",
             "upnp_count": "TEXT",
@@ -305,15 +444,22 @@ def repair_observation_table_ids(conn: sqlite3.Connection) -> None:
         "wifi_connection": lookup_wifi_id,
         "host": lookup_host_id,
         "support_finding": lookup_support_finding_id,
+        "host_filter_profile": lambda conn, row: lookup_keyed_record_id(conn, "host_filter_profiles", row),
+        "mesh_topology_link": lambda conn, row: lookup_keyed_record_id(conn, "mesh_topology_links", row),
+        "wan_port_mapping": lambda conn, row: lookup_keyed_record_id(conn, "wan_port_mappings", row),
+        "wlan_radio": lambda conn, row: lookup_keyed_record_id(conn, "wlan_radios", row),
+        "wlan_association": lambda conn, row: lookup_keyed_record_id(conn, "wlan_associations", row),
+        "device_risk_summary": lambda conn, row: lookup_keyed_record_id(conn, "device_risk_summaries", row),
     }
     rows = conn.execute(
         """
         SELECT id, record_type, record_table_id, content_json
         FROM record_observations
-        WHERE record_type IN ('event_log', 'wifi_connection', 'host', 'support_finding')
         """
     ).fetchall()
     for row in rows:
+        if str(row["record_type"]) not in lookup_map:
+            continue
         record_id = row["record_table_id"]
         try:
             content = json.loads(row["content_json"] or "{}")
@@ -534,10 +680,11 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     uid, friendly_name, neighbour_name, ip_list, mac_list, wlan_station_type,
                     wlan_uids, plc_uids, ethernet_port, vendor, model, speed, source_flags,
                     parent_uid, flags, modification_flags, dhcp, static_dhcp, blocked,
+                    guest, vpn, wan_access, filter_profile_id,
                     allow_pcp_and_upnp, pcp_count, upnp_count, myfritz_enabled,
                     last_activity_note, evidence_level, evidence_note, raw_json, searchable
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hostname, mac, ip) DO UPDATE SET
                     run_id = excluded.run_id,
                     interface = COALESCE(excluded.interface, hosts.interface),
@@ -570,6 +717,10 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     dhcp = COALESCE(excluded.dhcp, hosts.dhcp),
                     static_dhcp = COALESCE(excluded.static_dhcp, hosts.static_dhcp),
                     blocked = COALESCE(excluded.blocked, hosts.blocked),
+                    guest = COALESCE(excluded.guest, hosts.guest),
+                    vpn = COALESCE(excluded.vpn, hosts.vpn),
+                    wan_access = COALESCE(excluded.wan_access, hosts.wan_access),
+                    filter_profile_id = COALESCE(excluded.filter_profile_id, hosts.filter_profile_id),
                     allow_pcp_and_upnp = COALESCE(excluded.allow_pcp_and_upnp, hosts.allow_pcp_and_upnp),
                     pcp_count = COALESCE(excluded.pcp_count, hosts.pcp_count),
                     upnp_count = COALESCE(excluded.upnp_count, hosts.upnp_count),
@@ -613,6 +764,10 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     host.get("dhcp"),
                     host.get("static_dhcp"),
                     host.get("blocked"),
+                    host.get("guest"),
+                    host.get("vpn"),
+                    host.get("wan_access"),
+                    host.get("filter_profile_id"),
                     host.get("allow_pcp_and_upnp"),
                     host.get("pcp_count"),
                     host.get("upnp_count"),
@@ -642,6 +797,8 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                 source="Hosts:GetGenericHostEntry",
                 content=host,
             )
+
+        ingest_additional_evidence(conn, dataset, run_id, acquired_at, generated_at)
     conn.close()
     return run_id
 
@@ -732,6 +889,478 @@ def add_observation(
             content_json,
         ),
     )
+
+
+ADDITIONAL_EVIDENCE_TABLES: dict[str, dict[str, Any]] = {
+    "host_filter_profiles": {
+        "dataset_keys": ("host_filter_profiles", "host_filter_profile_evidence"),
+        "record_type": "host_filter_profile",
+        "fts_type": "host_filter_profiles",
+        "columns": ("profile_id", "name", "access_mode", "time_budget", "blocked", "devices_json", "source"),
+        "record_key_fields": ("profile_id", "name", "source"),
+        "sort": "COALESCE(t.name, '')",
+        "time_column": "",
+        "note": "Host filter/profile evidence parsed from FRITZ!Box read-only state.",
+    },
+    "mesh_topology_links": {
+        "dataset_keys": ("mesh_topology_links", "mesh_links"),
+        "record_type": "mesh_topology_link",
+        "fts_type": "mesh_topology_links",
+        "columns": (
+            "node",
+            "node_mac",
+            "interface",
+            "peer",
+            "peer_mac",
+            "link_type",
+            "state",
+            "last_connected",
+            "rx",
+            "tx",
+            "source",
+        ),
+        "record_key_fields": ("node_mac", "interface", "peer_mac", "link_type", "source"),
+        "sort": "COALESCE(t.last_connected, '')",
+        "time_column": "last_connected",
+        "note": "Mesh topology link parsed from FRITZ!Box mesh topology evidence.",
+    },
+    "wan_port_mappings": {
+        "dataset_keys": ("wan_port_mappings", "wan_exposure", "port_mappings"),
+        "record_type": "wan_port_mapping",
+        "fts_type": "wan_port_mappings",
+        "columns": (
+            "protocol",
+            "external_port",
+            "internal_client",
+            "internal_port",
+            "description",
+            "enabled",
+            "remote_host",
+            "lease_duration",
+            "source",
+        ),
+        "record_key_fields": ("protocol", "external_port", "internal_client", "internal_port", "source"),
+        "sort": "COALESCE(t.external_port, '')",
+        "time_column": "",
+        "note": "WAN exposure/port mapping parsed from FRITZ!Box WAN connection evidence.",
+    },
+    "wlan_radios": {
+        "dataset_keys": ("wlan_radios", "wlan_radio_details"),
+        "record_type": "wlan_radio",
+        "fts_type": "wlan_radios",
+        "columns": (
+            "radio_index",
+            "ssid",
+            "enabled",
+            "status",
+            "standard",
+            "channel",
+            "total_associations",
+            "bytes_sent",
+            "bytes_received",
+            "source",
+        ),
+        "record_key_fields": ("radio_index", "ssid", "source"),
+        "sort": "COALESCE(t.radio_index, '')",
+        "time_column": "",
+        "note": "WLAN radio state parsed from FRITZ!Box WLAN evidence.",
+    },
+    "wlan_associations": {
+        "dataset_keys": ("wlan_associations", "wlan_association_details"),
+        "record_type": "wlan_association",
+        "fts_type": "wlan_associations",
+        "columns": (
+            "observed_at",
+            "radio_index",
+            "association_index",
+            "mac",
+            "ip",
+            "hostname",
+            "auth_state",
+            "speed",
+            "signal_strength",
+            "channel",
+            "guest",
+            "source",
+        ),
+        "record_key_fields": ("observed_at", "radio_index", "association_index", "mac", "source"),
+        "sort": "COALESCE(t.observed_at, '')",
+        "time_column": "observed_at",
+        "note": "Current WLAN association detail parsed from FRITZ!Box WLAN evidence; this is an observation, not a session start time.",
+    },
+    "device_risk_summaries": {
+        "dataset_keys": ("device_risk_summaries", "device_risks"),
+        "record_type": "device_risk_summary",
+        "fts_type": "device_risk_summaries",
+        "columns": (
+            "device_key",
+            "hostname",
+            "mac",
+            "ip",
+            "risk_level",
+            "risk_score",
+            "reasons_json",
+            "summary",
+            "source",
+        ),
+        "record_key_fields": ("device_key", "mac", "ip", "source"),
+        "sort": "COALESCE(t.risk_score, '')",
+        "time_column": "",
+        "note": "Device risk summary derived from parsed FRITZ!Box host and exposure evidence.",
+    },
+}
+ADDITIONAL_RECORD_TYPE_ALIASES: dict[str, str] = {
+    "host_filter": "host_filter_profiles",
+    "host_filters": "host_filter_profiles",
+    "host_filter_profiles": "host_filter_profiles",
+    "mesh": "mesh_topology_links",
+    "mesh_links": "mesh_topology_links",
+    "mesh_topology_links": "mesh_topology_links",
+    "wan": "wan_port_mappings",
+    "wan_exposure": "wan_port_mappings",
+    "port_mappings": "wan_port_mappings",
+    "wan_port_mappings": "wan_port_mappings",
+    "wlan_radios": "wlan_radios",
+    "wlan_radio": "wlan_radios",
+    "wlan_associations": "wlan_associations",
+    "wlan_association": "wlan_associations",
+    "device_risks": "device_risk_summaries",
+    "device_risk": "device_risk_summaries",
+    "device_risk_summaries": "device_risk_summaries",
+}
+
+
+def ingest_additional_evidence(
+    conn: sqlite3.Connection,
+    dataset: dict[str, Any],
+    run_id: int,
+    acquired_at: str,
+    generated_at: str,
+) -> None:
+    extracted = extract_additional_evidence(dataset, generated_at)
+    for table, spec in ADDITIONAL_EVIDENCE_TABLES.items():
+        seen: set[str] = set()
+        for row in extracted.get(table, []):
+            normalized = normalize_additional_row(table, row)
+            record_key = keyed_record_key(normalized, spec["record_key_fields"])
+            if record_key in seen:
+                continue
+            seen.add(record_key)
+            searchable = searchable_text(normalized)
+            evidence_level = normalized.get("evidence_level") or (
+                "inferred" if table == "device_risk_summaries" else "parsed_from_raw"
+            )
+            evidence_note = normalized.get("evidence_note") or str(spec["note"])
+            columns = list(spec["columns"])
+            values = [json_column_value(normalized.get(column)) for column in columns]
+            column_sql = ", ".join(
+                ["run_id", "record_key", *columns, "evidence_level", "evidence_note", "raw_json", "searchable"]
+            )
+            placeholders = ", ".join("?" for _ in range(len(columns) + 6))
+            cursor = conn.execute(
+                f"""
+                INSERT OR IGNORE INTO {table}({column_sql})
+                VALUES ({placeholders})
+                """,
+                (
+                    run_id,
+                    record_key,
+                    *values,
+                    evidence_level,
+                    evidence_note,
+                    json.dumps(normalized, sort_keys=True, default=str),
+                    searchable,
+                ),
+            )
+            row_id = cursor.lastrowid if cursor.rowcount else lookup_keyed_record_id(conn, table, normalized)
+            if row_id and cursor.rowcount:
+                add_fts(conn, spec["fts_type"], int(row_id), searchable)
+            add_observation(
+                conn,
+                run_id=run_id,
+                record_type=spec["record_type"],
+                record_key=record_key,
+                record_table_id=int(row_id) if row_id else None,
+                observed_at=acquired_at,
+                event_time=normalized.get(str(spec["time_column"])) if spec["time_column"] else generated_at,
+                evidence_level=evidence_level,
+                evidence_note=evidence_note,
+                source=normalized.get("source"),
+                content={**normalized, "record_key": record_key},
+            )
+
+
+def extract_additional_evidence(dataset: dict[str, Any], generated_at: str) -> dict[str, list[dict[str, Any]]]:
+    rows: dict[str, list[dict[str, Any]]] = {table: [] for table in ADDITIONAL_EVIDENCE_TABLES}
+    for table, spec in ADDITIONAL_EVIDENCE_TABLES.items():
+        for key in spec["dataset_keys"]:
+            value = dataset.get(key)
+            if isinstance(value, list):
+                rows[table].extend([item for item in value if isinstance(item, dict)])
+            elif isinstance(value, dict):
+                rows[table].append(value)
+
+    raw_exports = dataset.get("raw_exports") or {}
+    tr064_raw = raw_exports.get("tr064_snapshot_json")
+    if isinstance(tr064_raw, str):
+        try:
+            tr064 = json.loads(tr064_raw)
+        except json.JSONDecodeError:
+            tr064 = {}
+    elif isinstance(tr064_raw, dict):
+        tr064 = tr064_raw
+    else:
+        tr064 = {}
+    if tr064:
+        rows["host_filter_profiles"].extend(extract_host_filter_profiles(tr064))
+        rows["wan_port_mappings"].extend(extract_wan_port_mappings(tr064))
+        rows["wlan_radios"].extend(extract_wlan_radios(tr064))
+        rows["wlan_associations"].extend(extract_wlan_associations(tr064, generated_at))
+
+    mesh_raw = raw_exports.get("mesh_list")
+    rows["mesh_topology_links"].extend(extract_mesh_links(mesh_raw))
+
+    if not rows["device_risk_summaries"]:
+        rows["device_risk_summaries"].extend(build_device_risk_summaries(dataset))
+    return rows
+
+
+def normalize_additional_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    if table == "host_filter_profiles":
+        normalized.setdefault("profile_id", first_value(row, "profile_id", "uid", "id", "NewProfileID", "NewID"))
+        normalized.setdefault("name", first_value(row, "name", "profile_name", "NewName", "NewProfileName"))
+        normalized.setdefault("access_mode", first_value(row, "access_mode", "mode", "NewAccessMode"))
+        normalized.setdefault("time_budget", first_value(row, "time_budget", "NewTimeBudget", "budget"))
+        normalized.setdefault("blocked", first_value(row, "blocked", "NewBlocked", "is_blocked"))
+        normalized.setdefault("devices_json", first_value(row, "devices_json", "devices", "assigned_devices"))
+        normalized.setdefault("source", "X_AVM-DE_HostFilter:GetFilterProfiles")
+    elif table == "mesh_topology_links":
+        normalized.setdefault("link_type", first_value(row, "link_type", "type"))
+        normalized.setdefault("node", first_value(row, "node", "device", "device_name"))
+        normalized.setdefault("peer", first_value(row, "peer", "remote", "remote_name"))
+        normalized.setdefault("rx", first_value(row, "rx", "cur_data_rate_rx"))
+        normalized.setdefault("tx", first_value(row, "tx", "cur_data_rate_tx"))
+        normalized.setdefault("source", "mesh_list")
+    elif table == "wan_port_mappings":
+        normalized.setdefault("protocol", first_value(row, "protocol", "NewProtocol"))
+        normalized.setdefault("external_port", first_value(row, "external_port", "NewExternalPort"))
+        normalized.setdefault("internal_client", first_value(row, "internal_client", "NewInternalClient"))
+        normalized.setdefault("internal_port", first_value(row, "internal_port", "NewInternalPort"))
+        normalized.setdefault("description", first_value(row, "description", "NewPortMappingDescription"))
+        normalized.setdefault("enabled", first_value(row, "enabled", "NewEnabled"))
+        normalized.setdefault("remote_host", first_value(row, "remote_host", "NewRemoteHost"))
+        normalized.setdefault("lease_duration", first_value(row, "lease_duration", "NewLeaseDuration"))
+        normalized.setdefault("source", "WANIPConn:GetGenericPortMappingEntry")
+    elif table == "wlan_radios":
+        normalized.setdefault("radio_index", first_value(row, "radio_index", "index"))
+        normalized.setdefault("total_associations", first_value(row, "total_associations", "associations"))
+        normalized.setdefault("source", "WLANConfiguration:GetInfo")
+    elif table == "wlan_associations":
+        normalized.setdefault("observed_at", first_value(row, "observed_at", "timestamp"))
+        normalized.setdefault(
+            "association_index", first_value(row, "association_index", "index", "NewAssociatedDeviceIndex")
+        )
+        normalized.setdefault("mac", first_value(row, "mac", "NewAssociatedDeviceMACAddress"))
+        normalized.setdefault("ip", first_value(row, "ip", "NewAssociatedDeviceIPAddress"))
+        normalized.setdefault("hostname", first_value(row, "hostname", "NewAssociatedDeviceName"))
+        normalized.setdefault("auth_state", first_value(row, "auth_state", "NewAssociatedDeviceAuthState"))
+        normalized.setdefault("source", "WLANConfiguration:GetGenericAssociatedDeviceInfo")
+    elif table == "device_risk_summaries":
+        device_key = first_value(row, "device_key", "mac", "ip", "hostname")
+        normalized.setdefault("device_key", device_key)
+        normalized.setdefault("reasons_json", first_value(row, "reasons_json", "reasons"))
+        normalized.setdefault("source", "derived_device_risk")
+    return normalized
+
+
+def extract_host_filter_profiles(tr064: dict[str, Any]) -> list[dict[str, Any]]:
+    response = ((tr064.get("actions") or {}).get("host_filter_profiles") or {}).get("response") or {}
+    profiles = response.get("NewProfileList") or response.get("profiles") or response.get("Profiles")
+    if isinstance(profiles, list):
+        return [
+            {**profile, "source": "X_AVM-DE_HostFilter:GetFilterProfiles"}
+            for profile in profiles
+            if isinstance(profile, dict)
+        ]
+    if isinstance(profiles, str) and profiles.strip():
+        return [{"name": profiles, "source": "X_AVM-DE_HostFilter:GetFilterProfiles", "raw_profile_list": profiles}]
+    return []
+
+
+def extract_wan_port_mappings(tr064: dict[str, Any]) -> list[dict[str, Any]]:
+    indexed = tr064.get("indexed_results") or {}
+    rows: list[dict[str, Any]] = []
+    for key in ("wan_ip_port_mappings", "wan_ppp_port_mappings"):
+        for item in (indexed.get(key) or {}).get("items") or []:
+            if not isinstance(item, dict) or not item.get("ok"):
+                continue
+            response = item.get("response") or {}
+            if isinstance(response, dict):
+                rows.append({**response, "source": key})
+    return rows
+
+
+def extract_wlan_radios(tr064: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for radio in tr064.get("wlan") or []:
+        if not isinstance(radio, dict):
+            continue
+        info = (radio.get("info") or {}).get("response") or {}
+        total = (radio.get("total_associations") or {}).get("response") or {}
+        channel = (radio.get("channel_info") or {}).get("response") or {}
+        stats = (radio.get("statistics") or {}).get("response") or {}
+        rows.append(
+            {
+                "radio_index": radio.get("index"),
+                "ssid": info.get("NewSSID"),
+                "enabled": info.get("NewEnable"),
+                "status": info.get("NewStatus"),
+                "standard": info.get("NewStandard"),
+                "channel": channel.get("NewChannel") or info.get("NewChannel"),
+                "total_associations": total.get("NewTotalAssociations") or info.get("NewTotalAssociations"),
+                "bytes_sent": stats.get("NewTotalBytesSent"),
+                "bytes_received": stats.get("NewTotalBytesReceived"),
+                "source": f"WLANConfiguration:{radio.get('index')}:GetInfo",
+            }
+        )
+    return rows
+
+
+def extract_wlan_associations(tr064: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key, value in (tr064.get("indexed_results") or {}).items():
+        match = re.fullmatch(r"wlan_(\d+)_associations", str(key))
+        if not match:
+            continue
+        for index, item in enumerate((value or {}).get("items") or []):
+            if not isinstance(item, dict) or not item.get("ok"):
+                continue
+            response = item.get("response") or {}
+            if isinstance(response, dict):
+                rows.append(
+                    {
+                        **response,
+                        "observed_at": observed_at,
+                        "radio_index": match.group(1),
+                        "association_index": response.get("NewAssociatedDeviceIndex") or str(index),
+                        "source": key,
+                    }
+                )
+    return rows
+
+
+def extract_mesh_links(content: Any) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    if isinstance(content, str):
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return []
+    elif isinstance(content, dict):
+        data = content
+    else:
+        return []
+    rows: list[dict[str, Any]] = []
+    for node in data.get("nodes") or []:
+        for interface in node.get("node_interfaces") or []:
+            for link in interface.get("node_links") or []:
+                rows.append(
+                    {
+                        "node": node.get("device_name") or node.get("device_friendly_name"),
+                        "node_mac": node.get("device_mac_address"),
+                        "interface": interface.get("name") or interface.get("type"),
+                        "peer": link.get("remote_name") or link.get("name"),
+                        "peer_mac": link.get("remote_mac") or link.get("mac"),
+                        "link_type": link.get("type") or interface.get("type"),
+                        "state": link.get("state"),
+                        "last_connected": unix_seconds_to_iso(link.get("last_connected")),
+                        "rx": link.get("cur_data_rate_rx"),
+                        "tx": link.get("cur_data_rate_tx"),
+                        "source": "mesh_list",
+                    }
+                )
+    return rows
+
+
+def build_device_risk_summaries(dataset: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    mappings_by_client: dict[str, int] = {}
+    for mapping in dataset.get("wan_port_mappings") or dataset.get("wan_exposure") or []:
+        if isinstance(mapping, dict) and mapping.get("internal_client"):
+            client = str(mapping["internal_client"])
+            mappings_by_client[client] = mappings_by_client.get(client, 0) + 1
+    for host in dataset.get("known_hosts") or []:
+        if not isinstance(host, dict):
+            continue
+        reasons: list[str] = []
+        score = 0
+        if truthy_value(host.get("allow_pcp_and_upnp")):
+            reasons.append("PCP/UPnP allowed for host")
+            score += 30
+        for key, label in (("pcp_count", "PCP mappings"), ("upnp_count", "UPnP mappings")):
+            try:
+                count = int(host.get(key) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count:
+                reasons.append(f"{count} {label}")
+                score += min(count * 10, 30)
+        if host.get("ip") in mappings_by_client:
+            reasons.append(f"{mappings_by_client[str(host['ip'])]} WAN port mappings target host")
+            score += 40
+        if truthy_value(host.get("myfritz_enabled")):
+            reasons.append("MyFRITZ enabled for host")
+            score += 10
+        if not reasons:
+            continue
+        level = "high" if score >= 60 else "medium" if score >= 30 else "low"
+        rows.append(
+            {
+                "device_key": host.get("mac") or host.get("ip") or host.get("hostname"),
+                "hostname": host.get("hostname"),
+                "mac": host.get("mac"),
+                "ip": host.get("ip"),
+                "risk_level": level,
+                "risk_score": str(score),
+                "reasons_json": reasons,
+                "summary": "; ".join(reasons),
+                "source": "derived_device_risk",
+                "evidence_level": "inferred",
+                "evidence_note": "Derived from host attributes and WAN exposure evidence; review raw settings before drawing conclusions.",
+            }
+        )
+    return rows
+
+
+def first_value(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def json_column_value(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, default=str)
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return value
+
+
+def keyed_record_key(row: dict[str, Any], fields: tuple[str, ...]) -> str:
+    values = {field: json_column_value(row.get(field)) for field in fields}
+    if not any(value not in (None, "") for value in values.values()):
+        values = row
+    return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "on", "enabled"}
 
 
 def event_evidence(event: dict[str, Any]) -> tuple[str, str]:
@@ -882,6 +1511,16 @@ def lookup_raw_artifact_id(conn: sqlite3.Connection, name: str, sha256: str) -> 
     return int(row["id"]) if row else None
 
 
+def lookup_keyed_record_id(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> int | None:
+    spec = ADDITIONAL_EVIDENCE_TABLES[table]
+    record_key = row.get("record_key") or keyed_record_key(row, spec["record_key_fields"])
+    found = conn.execute(
+        f"SELECT id FROM {table} WHERE record_key = ? ORDER BY id DESC LIMIT 1",
+        [record_key],
+    ).fetchone()
+    return int(found["id"]) if found else None
+
+
 def add_fts(conn: sqlite3.Connection, record_type: str, record_id: int, content: str) -> None:
     conn.execute(
         "INSERT INTO records_fts(record_type, record_id, content) VALUES (?, ?, ?)",
@@ -976,6 +1615,14 @@ def query_records(
         order = f"{sort_map.get(sort_by, sort_map['line_number'])} {direction}"
         fts_type = "support_findings"
         dedupe = "1=1"
+    elif record_type in ADDITIONAL_RECORD_TYPE_ALIASES:
+        table = ADDITIONAL_RECORD_TYPE_ALIASES[record_type]
+        spec = ADDITIONAL_EVIDENCE_TABLES[table]
+        sort_map = {column: f"COALESCE(t.{column}, '')" for column in spec["columns"]}
+        sort_map["record_key"] = "COALESCE(t.record_key, '')"
+        order = f"{sort_map.get(sort_by, spec['sort'])} {direction}"
+        fts_type = spec["fts_type"]
+        dedupe = "1=1"
     elif record_type == "raw":
         table = "raw_artifacts"
         sort_map = {
@@ -1000,6 +1647,7 @@ def query_records(
             "hosts": "host",
             "support_findings": "support_finding",
             "raw_artifacts": "raw_artifact",
+            **{table_name: spec["record_type"] for table_name, spec in ADDITIONAL_EVIDENCE_TABLES.items()},
         }[table]
         if fts_query:
             join = " JOIN records_fts f ON f.record_id = t.id AND f.record_type = ?"
@@ -1036,6 +1684,8 @@ def query_records(
                     {active_run_filter}
                 ) END""".format(active_run_filter=active_run_filter),
             ]
+        elif table in ADDITIONAL_EVIDENCE_TABLES:
+            time_column = str(ADDITIONAL_EVIDENCE_TABLES[table]["time_column"])
         if table == "hosts" and (start or end):
             range_clauses = []
             for column in host_time_columns:
@@ -1049,10 +1699,10 @@ def query_records(
                 range_clauses.append("(" + " AND ".join(column_checks) + ")")
             where.append("(" + " OR ".join(range_clauses) + ")")
         else:
-            if start:
+            if start and time_column:
                 where.append(f"COALESCE(t.{time_column}, '') >= ?")
                 params.append(start)
-            if end:
+            if end and time_column:
                 where.append(f"COALESCE(t.{time_column}, '') <= ?")
                 params.append(end)
         if table == "raw_artifacts":
@@ -1241,6 +1891,10 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
                     0
                 ]
             ),
+            **{
+                table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in ADDITIONAL_EVIDENCE_TABLES
+            },
         }
         last_exact_wifi = conn.execute(
             "SELECT MAX(derived_connected_at) FROM wifi_connections WHERE exact_connection_time_available = 1 AND "
@@ -1273,6 +1927,10 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             "hosts_with_first_seen": _run_record_count(
                 conn, scoped_run_id, "host", "hosts", "t.first_seen IS NOT NULL AND t.first_seen != ''"
             ),
+            **{
+                table: _run_record_count(conn, scoped_run_id, spec["record_type"], table)
+                for table, spec in ADDITIONAL_EVIDENCE_TABLES.items()
+            },
         }
         last_exact_wifi = conn.execute(
             """
@@ -1316,6 +1974,7 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             or counts["wifi_connections"] > 0
             or counts["hosts"] > 0
             or counts["support_findings"] > 0
+            or any(counts.get(table, 0) > 0 for table in ADDITIONAL_EVIDENCE_TABLES)
         ),
         "latest_run": latest,
         "selected_run_id": scoped_run_id,
@@ -1378,11 +2037,62 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
         warnings.append(
             "Encrypted configuration export was not collected; full settings backup evidence is unavailable."
         )
+    matrix_groups = [
+        {
+            "area": "Retained logs",
+            "artifacts": ["device_log_xml", "data_lua_pages_json", "support_data_txt"],
+            "detail": "Timeline, event classes, and raw log validation.",
+        },
+        {
+            "area": "Device inventory",
+            "artifacts": ["host_list_xml", "landevice_query_json", "wlan_device_list_xml", "mesh_list"],
+            "detail": "Host attribution, active state, mesh context, and last-used device state.",
+        },
+        {
+            "area": "Network exposure",
+            "artifacts": ["tr064_snapshot_json", "config_export_file"],
+            "detail": "WAN state, external address, port mappings, MyFRITZ!/UPnP hints, and settings backup evidence.",
+        },
+        {
+            "area": "Peripheral context",
+            "artifacts": [
+                "call_list_xml",
+                "phonebooks_xml_json",
+                "aha_device_list_xml",
+                "aha_switch_list_txt",
+                "aha_device_stats_json",
+            ],
+            "detail": "Telephony and smart-home context where supported by the router.",
+        },
+    ]
+    matrix = []
+    for group in matrix_groups:
+        artifacts = group["artifacts"]
+        found = [name for name in artifacts if name in present]
+        matrix.append(
+            {
+                "area": group["area"],
+                "present": len(found),
+                "expected": len(artifacts),
+                "state": "complete" if len(found) == len(artifacts) else "partial" if found else "missing",
+                "artifacts": [
+                    {
+                        "name": name,
+                        "present": name in present,
+                        "observations": int((present.get(name) or {}).get("observations") or 0),
+                        "last_observed": (present.get(name) or {}).get("last_observed"),
+                    }
+                    for name in artifacts
+                ],
+                "detail": group["detail"],
+            }
+        )
     return {
         "expected_raw_artifacts": expected,
         "present_raw_artifacts": rows,
         "missing_raw_artifacts": [name for name in expected if name not in present],
         "warnings": warnings,
+        "matrix": matrix,
     }
 
 
@@ -1508,6 +2218,8 @@ def analysis_snapshot(
     raw = raw_artifact_summaries(conn, scoped_run_id)
     mesh = mesh_summary(raw.get("mesh_list"))
     tr064 = tr064_summary(raw.get("tr064_snapshot_json"))
+    host_risk = host_risk_summary(conn, host_filter, host_params, tr064.get("wan", {}).get("port_mappings") or [])
+    last_used = last_used_histogram(conn, host_filter, host_params)
     conn.close()
     return {
         "category_counts": category_counts,
@@ -1520,6 +2232,8 @@ def analysis_snapshot(
         "source_coverage": source_coverage,
         "mesh_summary": mesh,
         "tr064_summary": tr064,
+        "host_risk_summary": host_risk,
+        "last_used_histogram": last_used,
         "retained": retained,
         "latest_run": dict(run) if run else None,
         "gaps": gaps,
@@ -1592,6 +2306,91 @@ def mesh_summary(content: str | None) -> dict[str, Any]:
     }
 
 
+def host_risk_summary(
+    conn: sqlite3.Connection,
+    host_filter: str,
+    host_params: list[Any],
+    port_mappings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT t.hostname, t.mac, t.ip, t.interface, t.active_now, t.blocked,
+                   t.allow_pcp_and_upnp, t.pcp_count, t.upnp_count, t.myfritz_enabled,
+                   t.last_activity, t.last_connected
+            FROM hosts t{host_filter}
+            """,
+            host_params,
+        )
+    ]
+    mappings_by_ip: dict[str, list[dict[str, Any]]] = {}
+    for mapping in port_mappings:
+        internal = str(mapping.get("internal_client") or "").strip()
+        if internal:
+            mappings_by_ip.setdefault(internal, []).append(mapping)
+
+    scored = []
+    totals = {"high": 0, "medium": 0, "low": 0}
+    for row in rows:
+        reasons = []
+        score = 0
+        mapped_ports = mappings_by_ip.get(str(row.get("ip") or ""), [])
+        if mapped_ports:
+            score += 5
+            reasons.append(f"{len(mapped_ports)} WAN port mapping(s)")
+        if truthy(row.get("allow_pcp_and_upnp")):
+            score += 3
+            reasons.append("PCP/UPnP allowed")
+        if positive_number(row.get("upnp_count")) or positive_number(row.get("pcp_count")):
+            score += 2
+            reasons.append("UPnP/PCP mapping counters")
+        if truthy(row.get("myfritz_enabled")):
+            score += 2
+            reasons.append("MyFRITZ enabled")
+        if truthy(row.get("active_now")):
+            score += 1
+            reasons.append("active at acquisition")
+        if truthy(row.get("blocked")):
+            score = max(0, score - 2)
+            reasons.append("blocked")
+        if score <= 0 and not reasons:
+            continue
+        level = "high" if score >= 5 else "medium" if score >= 3 else "low"
+        totals[level] += 1
+        scored.append(
+            {
+                "hostname": row.get("hostname"),
+                "mac": row.get("mac"),
+                "ip": row.get("ip"),
+                "interface": row.get("interface"),
+                "score": score,
+                "level": level,
+                "reasons": reasons,
+                "port_mappings": mapped_ports[:6],
+                "last_activity": row.get("last_activity") or row.get("last_connected"),
+            }
+        )
+    scored.sort(key=lambda item: (item["score"], item.get("last_activity") or ""), reverse=True)
+    return {"available": bool(rows), "totals": totals, "devices": scored[:10]}
+
+
+def last_used_histogram(conn: sqlite3.Connection, host_filter: str, host_params: list[Any]) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        f"""
+        SELECT substr(COALESCE(NULLIF(t.last_activity, ''), NULLIF(t.last_connected, ''), NULLIF(t.last_seen, '')), 1, 10) AS label,
+               COUNT(*) AS count
+        FROM hosts t{host_filter}
+        AND COALESCE(NULLIF(t.last_activity, ''), NULLIF(t.last_connected, ''), NULLIF(t.last_seen, '')) != ''
+        GROUP BY label
+        ORDER BY label DESC
+        LIMIT 14
+        """,
+        host_params,
+    ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
 def tr064_summary(content: str | None) -> dict[str, Any]:
     if not content:
         return {"available": False, "wlan_radios": [], "wan": {}}
@@ -1600,10 +2399,12 @@ def tr064_summary(content: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"available": False, "wlan_radios": [], "wan": {}}
     actions = data.get("actions") or {}
+    indexed = data.get("indexed_results") or {}
     wan_common = (actions.get("wan_common_link") or {}).get("response") or {}
     wan_ip = (actions.get("wan_ip_info") or {}).get("response") or {}
     wan_status = (actions.get("wan_ip_status") or {}).get("response") or {}
     wan_external = (actions.get("wan_ip_external") or {}).get("response") or {}
+    port_mappings = parse_port_mappings(indexed)
     radios = []
     for radio in data.get("wlan") or []:
         info = (radio.get("info") or {}).get("response") or {}
@@ -1634,9 +2435,49 @@ def tr064_summary(content: str | None) -> dict[str, Any]:
             or wan_common.get("NewX_AVM-DE_UpstreamCurrentMaxSpeed"),
             "connection_status": wan_status.get("NewConnectionStatus") or wan_ip.get("NewConnectionStatus"),
             "external_ip": wan_external.get("NewExternalIPAddress") or wan_ip.get("NewExternalIPAddress"),
+            "port_mapping_count": len(port_mappings),
+            "port_mappings": port_mappings,
         },
         "wlan_radios": radios,
     }
+
+
+def parse_port_mappings(indexed: dict[str, Any]) -> list[dict[str, Any]]:
+    mappings = []
+    for source in ("wan_ip_port_mappings", "wan_ppp_port_mappings"):
+        for item in (indexed.get(source) or {}).get("items") or []:
+            if not item.get("ok"):
+                continue
+            response = item.get("response") or {}
+            enabled = truthy(response.get("NewEnabled"))
+            mappings.append(
+                {
+                    "source": source,
+                    "enabled": enabled,
+                    "remote_host": response.get("NewRemoteHost"),
+                    "external_port": response.get("NewExternalPort"),
+                    "protocol": response.get("NewProtocol"),
+                    "internal_port": response.get("NewInternalPort"),
+                    "internal_client": response.get("NewInternalClient"),
+                    "description": response.get("NewPortMappingDescription"),
+                    "lease_duration": response.get("NewLeaseDuration"),
+                }
+            )
+    mappings.sort(key=lambda row: (not row.get("enabled"), str(row.get("external_port") or "")))
+    return mappings[:50]
+
+
+def truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"1", "true", "yes", "on", "enabled", "allow", "allowed"}
+
+
+def positive_number(value: Any) -> bool:
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def unix_seconds_to_iso(value: Any) -> str | None:
@@ -1788,6 +2629,7 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         "support_findings": "support_findings",
         "raw": "raw_artifacts",
         "raw_artifacts": "raw_artifacts",
+        **ADDITIONAL_RECORD_TYPE_ALIASES,
     }
     table = table_map.get(record_type)
     if not table:
@@ -1822,6 +2664,11 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         row.get("section"),
         row.get("name"),
         row.get("content"),
+        row.get("raw_json"),
+        row.get("summary"),
+        row.get("description"),
+        row.get("ssid"),
+        row.get("internal_client"),
     ]
     artifacts: list[dict[str, Any]] = []
     for needle in [item for item in needles if item]:
