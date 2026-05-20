@@ -119,7 +119,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     device_info = get_device_info(fc)
     router_time = get_router_time(fc)
     avm_exports = fetch_avm_exports(fc, args.address, args.port)
-    raw_log = avm_exports.get("device_log_text") or get_device_log(fc)
+    raw_log = avm_exports.get("device_log_text") or parse_data_lua_log(avm_exports.get("data_lua_pages_json")) or get_device_log(fc)
     entries = filter_recent(parse_device_log(raw_log), args.hours)
     events = []
     for entry in entries:
@@ -133,6 +133,7 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     event_log = [entry_to_dict(entry) for entry in sorted(entries, key=lambda item: item.timestamp.isoformat() if item.timestamp else "", reverse=True)]
     wifi_events = sorted(events, key=lambda item: item["timestamp"] or "", reverse=True)
     mesh_wifi_devices = parse_mesh_wifi_devices(avm_exports.get("mesh_list"))
+    wlan_associations = parse_wlan_device_lists(avm_exports, generated_at)
     landevice_records = parse_landevice_query(avm_exports.get("landevice_query_json"))
     seen_by_host = build_host_seen_index(
         hosts,
@@ -143,8 +144,10 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
         generated_at=generated_at,
     )
     known_hosts = [host_to_dict(host, seen_by_host.get(host_identity(host), {})) for host in hosts]
+    known_hosts.extend(lan_device_host_rows(landevice_records, known_hosts))
     active_hosts = [host for host in known_hosts if host["active_now"]]
     last_wifi_connection = next((event["timestamp"] for event in wifi_events if event["event"] == "connected"), None)
+    available_wifi_connections = build_available_wifi_connections(wifi_events, mesh_wifi_devices, wlan_associations)
 
     return {
         "generated_at": generated_at,
@@ -159,7 +162,8 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "summary": {
             "event_log_entries": len(event_log),
             "wifi_events": len(wifi_events),
-            "available_wifi_connections": len(build_available_wifi_connections(wifi_events, mesh_wifi_devices)),
+            "available_wifi_connections": len(available_wifi_connections),
+            "current_wlan_associations": len(wlan_associations),
             "known_hosts": len(known_hosts),
             "active_hosts": len(active_hosts),
             "last_wifi_connection": last_wifi_connection,
@@ -167,14 +171,23 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "newest_event": event_log[0]["timestamp"] if event_log else None,
         },
         "wifi_events": wifi_events,
-        "available_wifi_connections": build_available_wifi_connections(wifi_events, mesh_wifi_devices),
+        "available_wifi_connections": available_wifi_connections,
         "mesh_wifi_devices": mesh_wifi_devices,
+        "wlan_associations": wlan_associations,
         "event_log": event_log,
         "known_hosts": sorted(known_hosts, key=lambda item: (not item["active_now"], item["hostname"] or "", item["ip"] or "")),
         "raw_exports": {key: value for key, value in avm_exports.items() if key != "device_log_text"},
         "source_endpoints": {
             "tr064": ["DeviceInfo:GetDeviceLog", "Hosts:GetGenericHostEntry", "DeviceInfo:GetInfo", "Time:GetInfo"],
-            "avm_exports": ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml", "landevice_query_json"],
+            "avm_exports": [
+                "device_log_xml",
+                "mesh_list",
+                "host_list_xml",
+                "wlan_device_list_xml",
+                "landevice_query_json",
+                "data_lua_pages_json",
+                "tr064_snapshot_json",
+            ],
         },
         "notes": [
             "This export uses FRITZ!Box TR-064 DeviceInfo:GetDeviceLog and Hosts:GetGenericHostEntry plus the FRITZ!Box web UI LAN-device query when available.",
@@ -249,7 +262,6 @@ def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
         ("device_log_xml", "DeviceInfo:1", "X_AVM-DE_GetDeviceLogPath", "NewDeviceLogPath"),
         ("mesh_list", "Hosts:1", "X_AVM-DE_GetMeshListPath", "NewX_AVM-DE_MeshListPath"),
         ("host_list_xml", "Hosts:1", "X_AVM-DE_GetHostListPath", "NewX_AVM-DE_HostListPath"),
-        ("wlan_device_list_xml", "WLANConfiguration:1", "X_AVM-DE_GetWLANDeviceListPath", "NewX_AVM-DE_WLANDeviceListPath"),
     ]
     for key, service, action, field in path_specs:
         try:
@@ -262,28 +274,163 @@ def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
         if content is not None:
             exports[key] = content
 
+    wlan_device_lists: dict[str, str] = {}
+    for index in range(1, 5):
+        try:
+            path = fc.call_action(f"WLANConfiguration:{index}", "X_AVM-DE_GetWLANDeviceListPath").get("NewX_AVM-DE_WLANDeviceListPath")
+        except Exception:
+            continue
+        if not path:
+            continue
+        content = fetch_avm_path(address, port, str(path))
+        if content is None:
+            continue
+        key = f"wlan_device_list_xml_{index}"
+        exports[key] = content
+        wlan_device_lists[str(index)] = content
+    if wlan_device_lists:
+        exports["wlan_device_list_xml"] = json.dumps(wlan_device_lists, sort_keys=True)
+
     if "device_log_xml" in exports:
         parsed_log = parse_device_log_xml(exports["device_log_xml"])
         if parsed_log:
             exports["device_log_text"] = parsed_log
+    data_lua_pages = fetch_data_lua_pages(fc)
+    if data_lua_pages:
+        exports["data_lua_pages_json"] = json.dumps(data_lua_pages, sort_keys=True, default=str)
     landevice_query = fetch_landevice_query(fc)
     if landevice_query:
         exports["landevice_query_json"] = landevice_query
+    tr064_snapshot = collect_tr064_snapshot(fc)
+    if tr064_snapshot:
+        exports["tr064_snapshot_json"] = json.dumps(tr064_snapshot, sort_keys=True, default=str)
     return exports
 
 
+def fetch_data_lua_pages(fc: Any) -> dict[str, Any]:
+    pages: dict[str, Any] = {}
+    for page in ("homeNet", "log", "netCnt", "netMoni"):
+        try:
+            response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/data.lua", {"page": page})
+        except Exception as exc:
+            pages[page] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            continue
+        raw = getattr(response, "text", "")
+        if not raw:
+            pages[page] = {"ok": False, "error": "empty response"}
+            continue
+        try:
+            pages[page] = {"ok": True, "data": json.loads(raw)}
+        except json.JSONDecodeError:
+            pages[page] = {"ok": True, "raw": raw}
+    return pages
+
+
 def fetch_landevice_query(fc: Any) -> str | None:
-    query = (
-        "landevice:settings/landevice/list("
-        "UID,ip,mac,name,friendly_name,active,flags,interface,online,firstused,lastused"
-        ")"
-    )
+    rich_fields = [
+        "UID",
+        "ip",
+        "iplist",
+        "mac",
+        "maclist",
+        "name",
+        "friendly_name",
+        "neighbour_name",
+        "vendorname",
+        "modelname",
+        "manu_name",
+        "parentuid",
+        "parentsource",
+        "source",
+        "flags",
+        "modification_flags",
+        "interface",
+        "wlan_station_type",
+        "wlan_UIDs",
+        "plc_UIDs",
+        "ethernetport",
+        "active",
+        "online",
+        "speed",
+        "dhcp",
+        "static_dhcp",
+        "deleteable",
+        "wakeup",
+        "auto_wakeup",
+        "firstused",
+        "lastused",
+        "blocked",
+        "allow_pcp_and_upnp",
+        "igd_fw_cnt_pcp",
+        "igd_fw_cnt_upnp",
+        "myfritz_enabled",
+        "url",
+    ]
+    fallback_fields = ["UID", "ip", "mac", "name", "friendly_name", "active", "online", "interface", "firstused", "lastused"]
+    for fields in (rich_fields, fallback_fields):
+        query = f"landevice:settings/landevice/list({','.join(fields)})"
+        try:
+            response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/query.lua", {"mq_landevices": query})
+        except Exception:
+            continue
+        text = getattr(response, "text", "")
+        if text and "landevice" in text:
+            return text
+    return None
+
+
+def collect_tr064_snapshot(fc: Any) -> dict[str, Any]:
+    actions = [
+        ("device_info", "DeviceInfo:1", "GetInfo", {}),
+        ("time_info", "Time:1", "GetInfo", {}),
+        ("user_interface", "UserInterface:1", "GetInfo", {}),
+        ("app_config", "X_AVM-DE_AppSetup:1", "GetConfig", {}),
+        ("app_remote_info", "X_AVM-DE_AppSetup:1", "GetAppRemoteInfo", {}),
+        ("myfritz_info", "X_AVM-DE_MyFritz:1", "GetInfo", {}),
+        ("host_count", "Hosts:1", "GetHostNumberOfEntries", {}),
+        ("host_filter_profiles", "X_AVM-DE_HostFilter:1", "GetFilterProfiles", {}),
+        ("lan_host_config", "LANHostConfigManagement:1", "GetInfo", {}),
+        ("lan_eth_info", "LANEthernetInterfaceConfig:1", "GetInfo", {}),
+        ("lan_eth_stats", "LANEthernetInterfaceConfig:1", "GetStatistics", {}),
+        ("wan_common_link", "WANCommonIFC:1", "GetCommonLinkProperties", {}),
+        ("wan_common_bytes_sent", "WANCommonIFC:1", "GetTotalBytesSent", {}),
+        ("wan_common_bytes_received", "WANCommonIFC:1", "GetTotalBytesReceived", {}),
+        ("wan_common_packets_sent", "WANCommonIFC:1", "GetTotalPacketsSent", {}),
+        ("wan_common_packets_received", "WANCommonIFC:1", "GetTotalPacketsReceived", {}),
+        ("wan_common_online_monitor", "WANCommonIFC:1", "X_AVM-DE_GetOnlineMonitor", {}),
+        ("wan_ip_info", "WANIPConn:1", "GetInfo", {}),
+        ("wan_ip_status", "WANIPConn:1", "GetStatusInfo", {}),
+        ("wan_ip_external", "WANIPConn:1", "GetExternalIPAddress", {}),
+        ("wan_dsl_interface", "WANDSLInterfaceConfig:1", "GetInfo", {}),
+        ("wan_dsl_stats", "WANDSLInterfaceConfig:1", "GetStatisticsTotal", {}),
+        ("wan_dsl_link", "WANDSLLinkConfig:1", "GetInfo", {}),
+    ]
+    snapshot: dict[str, Any] = {"actions": {}, "wlan": []}
+    for key, service, action, arguments in actions:
+        snapshot["actions"][key] = safe_call_action(fc, service, action, arguments)
+    for index in range(1, 5):
+        service = f"WLANConfiguration:{index}"
+        radio = {
+            "index": index,
+            "info": safe_call_action(fc, service, "GetInfo", {}),
+            "statistics": safe_call_action(fc, service, "GetStatistics", {}),
+            "packet_statistics": safe_call_action(fc, service, "GetPacketStatistics", {}),
+            "total_associations": safe_call_action(fc, service, "GetTotalAssociations", {}),
+            "channel_info": safe_call_action(fc, service, "GetChannelInfo", {}),
+            "ext_info": safe_call_action(fc, service, "X_AVM-DE_GetWLANExtInfo", {}),
+            "wps_info": safe_call_action(fc, service, "X_AVM-DE_GetWPSInfo", {}),
+        }
+        if any(value.get("ok") for key, value in radio.items() if isinstance(value, dict)):
+            snapshot["wlan"].append(radio)
+    return snapshot
+
+
+def safe_call_action(fc: Any, service: str, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
-        response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/query.lua", {"mq_landevices": query})
-    except Exception:
-        return None
-    text = getattr(response, "text", "")
-    return text if text and "landevice" in text else None
+        response = fc.call_action(service, action, arguments=arguments) if arguments else fc.call_action(service, action)
+        return {"ok": True, "service": service, "action": action, "response": json.loads(json.dumps(response, default=str))}
+    except Exception as exc:
+        return {"ok": False, "service": service, "action": action, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def fetch_avm_path(address: str, port: int, path: str) -> str | None:
@@ -309,6 +456,84 @@ def parse_device_log_xml(content: str) -> str:
         if date and time and msg:
             lines.append(f"{date} {time} {msg}")
     return "\n".join(lines)
+
+
+def parse_data_lua_log(content: str | None) -> str:
+    if not content:
+        return ""
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return ""
+    log_page = payload.get("log") or {}
+    data = log_page.get("data") if isinstance(log_page, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    rows = data.get("log") or data.get("events") or []
+    if not isinstance(rows, list):
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        date = row.get("date") or row.get("Date")
+        time = row.get("time") or row.get("Time")
+        message = row.get("msg") or row.get("message") or row.get("Message")
+        if date and time and message:
+            lines.append(f"{date} {time} {message}")
+    return "\n".join(lines)
+
+
+def parse_wlan_device_lists(exports: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
+    lists: dict[str, str] = {}
+    combined = exports.get("wlan_device_list_xml")
+    if isinstance(combined, str):
+        try:
+            decoded = json.loads(combined)
+            if isinstance(decoded, dict):
+                lists.update({str(key): str(value) for key, value in decoded.items()})
+        except json.JSONDecodeError:
+            lists["1"] = combined
+    for key, value in exports.items():
+        match = re.fullmatch(r"wlan_device_list_xml_(\d+)", str(key))
+        if match and isinstance(value, str):
+            lists[match.group(1)] = value
+
+    records: list[dict[str, Any]] = []
+    for radio_index, content in sorted(lists.items()):
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            continue
+        for item in root.findall(".//Item"):
+            channel = element_text(item, "AssociatedDeviceChannel")
+            if channel in ("", "0", None):
+                continue
+            mac = parse_mac(element_text(item, "AssociatedDeviceMACAddress") or "")
+            ip = element_text(item, "AssociatedDeviceIPAddress")
+            records.append(
+                {
+                    "observed_at": observed_at,
+                    "radio_index": radio_index,
+                    "association_index": element_text(item, "AssociatedDeviceIndex"),
+                    "mac": mac,
+                    "ip": ip or None,
+                    "hostname": None,
+                    "auth_state": element_text(item, "AssociatedDeviceAuthState"),
+                    "speed": element_text(item, "X_AVM-DE_Speed"),
+                    "signal_strength": element_text(item, "X_AVM-DE_SignalStrength"),
+                    "channel": channel,
+                    "channel_width": element_text(item, "X_AVM-DE_ChannelWidth"),
+                    "guest": truthy(element_text(item, "AssociatedDeviceGuest")),
+                    "source": f"wlan_device_list_xml_{radio_index}",
+                }
+            )
+    return records
+
+
+def element_text(parent: ET.Element, name: str) -> str | None:
+    value = parent.findtext(name)
+    return value.strip() if isinstance(value, str) else None
 
 
 def parse_mesh_wifi_devices(content: str | None) -> list[dict[str, Any]]:
@@ -394,12 +619,34 @@ def parse_landevice_query(content: str | None) -> list[dict[str, Any]]:
         records.append(
             {
                 "uid": row.get("UID") or row.get("uid"),
-                "hostname": row.get("name") or row.get("friendly_name"),
+                "hostname": row.get("name") or row.get("friendly_name") or row.get("neighbour_name"),
                 "friendly_name": row.get("friendly_name"),
+                "neighbour_name": row.get("neighbour_name"),
                 "mac": parse_mac(str(row.get("mac") or "")),
                 "ip": row.get("ip") or None,
+                "ip_list": row.get("iplist") or None,
+                "mac_list": row.get("maclist") or None,
                 "interface": row.get("interface") or None,
+                "wlan_station_type": row.get("wlan_station_type") or None,
+                "wlan_uids": row.get("wlan_UIDs") or None,
+                "plc_uids": row.get("plc_UIDs") or None,
+                "ethernet_port": row.get("ethernetport") or None,
+                "vendor": row.get("vendorname") or row.get("manu_name") or None,
+                "model": row.get("modelname") or None,
+                "speed": row.get("speed") or None,
+                "source_flags": row.get("source") or None,
+                "parent_uid": row.get("parentuid") or None,
+                "flags": row.get("flags") or None,
+                "modification_flags": row.get("modification_flags") or None,
+                "dhcp": row.get("dhcp") or None,
+                "static_dhcp": row.get("static_dhcp") or None,
+                "blocked": row.get("blocked") or None,
+                "allow_pcp_and_upnp": row.get("allow_pcp_and_upnp") or None,
+                "pcp_count": row.get("igd_fw_cnt_pcp") or None,
+                "upnp_count": row.get("igd_fw_cnt_upnp") or None,
+                "myfritz_enabled": row.get("myfritz_enabled") or None,
                 "active_now": truthy(row.get("active")) or truthy(row.get("online")),
+                "online": truthy(row.get("online")),
                 "first_seen": unix_timestamp_to_iso(row.get("firstused")),
                 "last_connected": unix_timestamp_to_iso(row.get("lastused")),
                 "last_seen": unix_timestamp_to_iso(row.get("lastused")),
@@ -409,11 +656,79 @@ def parse_landevice_query(content: str | None) -> list[dict[str, Any]]:
     return records
 
 
+def lan_device_host_rows(lan_devices: list[dict[str, Any]], existing_hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    existing_keys = {
+        (
+            str(host.get("mac") or "").lower(),
+            str(host.get("ip") or ""),
+            str(host.get("hostname") or "").casefold(),
+        )
+        for host in existing_hosts
+    }
+    rows: list[dict[str, Any]] = []
+    for device in lan_devices:
+        key = (
+            str(device.get("mac") or "").lower(),
+            str(device.get("ip") or ""),
+            str(device.get("hostname") or "").casefold(),
+        )
+        if key in existing_keys:
+            continue
+        if not any(key):
+            continue
+        rows.append(
+            {
+                "hostname": device.get("hostname"),
+                "mac": device.get("mac"),
+                "ip": device.get("ip"),
+                "interface": device.get("interface"),
+                "interface_detail": device.get("interface"),
+                "active_now": bool(device.get("active_now")),
+                "online": device.get("online"),
+                "lease_time_remaining": None,
+                "uid": device.get("uid"),
+                "friendly_name": device.get("friendly_name"),
+                "neighbour_name": device.get("neighbour_name"),
+                "ip_list": device.get("ip_list"),
+                "mac_list": device.get("mac_list"),
+                "wlan_station_type": device.get("wlan_station_type"),
+                "wlan_uids": device.get("wlan_uids"),
+                "plc_uids": device.get("plc_uids"),
+                "ethernet_port": device.get("ethernet_port"),
+                "vendor": device.get("vendor"),
+                "model": device.get("model"),
+                "speed": device.get("speed"),
+                "source_flags": device.get("source_flags"),
+                "parent_uid": device.get("parent_uid"),
+                "flags": device.get("flags"),
+                "modification_flags": device.get("modification_flags"),
+                "dhcp": device.get("dhcp"),
+                "static_dhcp": device.get("static_dhcp"),
+                "blocked": device.get("blocked"),
+                "allow_pcp_and_upnp": device.get("allow_pcp_and_upnp"),
+                "pcp_count": device.get("pcp_count"),
+                "upnp_count": device.get("upnp_count"),
+                "myfritz_enabled": device.get("myfritz_enabled"),
+                "first_seen": device.get("first_seen"),
+                "last_seen": device.get("last_seen"),
+                "last_connected": device.get("last_connected"),
+                "last_activity": device.get("last_connected") or device.get("last_seen") or device.get("first_seen"),
+                "last_activity_source": "fritzbox_landevice_lastused" if device.get("last_connected") else "fritzbox_landevice_state",
+                "last_activity_confidence": "medium" if device.get("last_connected") else "low",
+                "last_activity_note": "FRITZ!Box web UI LAN-device state retained this device even when the official host list did not expose it.",
+            }
+        )
+        existing_keys.add(key)
+    return rows
+
+
 def build_available_wifi_connections(
     wifi_events: list[dict[str, Any]],
     mesh_wifi_devices: list[dict[str, Any]],
+    wlan_associations: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    wlan_associations = wlan_associations or []
     for event in wifi_events:
         records.append(
             {
@@ -448,6 +763,27 @@ def build_available_wifi_connections(
                 "source": device.get("source"),
                 "confidence": device.get("confidence"),
                 "message": f"Known WLAN device on channel {device.get('current_channel') or ''}".strip(),
+            }
+        )
+    for assoc in wlan_associations:
+        records.append(
+            {
+                "timestamp": assoc.get("observed_at"),
+                "derived_connected_at": assoc.get("observed_at"),
+                "derived_time_type": "wlan_association_snapshot",
+                "derived_time_confidence": "medium",
+                "exact_connection_time_available": False,
+                "event": "associated_now",
+                "hostname": assoc.get("hostname"),
+                "mac": assoc.get("mac"),
+                "ip": assoc.get("ip"),
+                "last_connected": assoc.get("observed_at"),
+                "source": assoc.get("source") or "wlan_device_list_xml",
+                "confidence": "official_current_association_snapshot",
+                "message": (
+                    f"Current WLAN association on radio {assoc.get('radio_index')}, "
+                    f"channel {assoc.get('channel') or 'unknown'}, signal {assoc.get('signal_strength') or 'unknown'}"
+                ),
             }
         )
     return sorted(records, key=lambda item: item.get("timestamp") or "", reverse=True)
@@ -578,6 +914,36 @@ def build_host_seen_index(
         for device in landevice_records:
             if not event_matches_host(device, host_mac, host_ip, host_name):
                 continue
+            for key in (
+                "uid",
+                "friendly_name",
+                "neighbour_name",
+                "ip_list",
+                "mac_list",
+                "wlan_station_type",
+                "wlan_uids",
+                "plc_uids",
+                "ethernet_port",
+                "vendor",
+                "model",
+                "speed",
+                "source_flags",
+                "parent_uid",
+                "flags",
+                "modification_flags",
+                "dhcp",
+                "static_dhcp",
+                "blocked",
+                "allow_pcp_and_upnp",
+                "pcp_count",
+                "upnp_count",
+                "myfritz_enabled",
+                "online",
+            ):
+                if device.get(key) not in (None, ""):
+                    index[identity][key] = device.get(key)
+            if device.get("interface"):
+                index[identity]["interface_detail"] = device.get("interface")
             if device.get("first_seen"):
                 timestamps.append(str(device["first_seen"]))
             if device.get("last_connected"):
@@ -662,8 +1028,33 @@ def host_to_dict(host: dict[str, Any], seen: dict[str, Any] | None = None) -> di
         "mac": host.get("NewMACAddress") or None,
         "ip": host.get("NewIPAddress") or None,
         "interface": host.get("NewInterfaceType") or None,
+        "interface_detail": seen.get("interface_detail"),
         "active_now": truthy(host.get("NewActive")),
+        "online": seen.get("online"),
         "lease_time_remaining": host.get("NewLeaseTimeRemaining"),
+        "uid": seen.get("uid"),
+        "friendly_name": seen.get("friendly_name"),
+        "neighbour_name": seen.get("neighbour_name"),
+        "ip_list": seen.get("ip_list"),
+        "mac_list": seen.get("mac_list"),
+        "wlan_station_type": seen.get("wlan_station_type"),
+        "wlan_uids": seen.get("wlan_uids"),
+        "plc_uids": seen.get("plc_uids"),
+        "ethernet_port": seen.get("ethernet_port"),
+        "vendor": seen.get("vendor"),
+        "model": seen.get("model"),
+        "speed": seen.get("speed"),
+        "source_flags": seen.get("source_flags"),
+        "parent_uid": seen.get("parent_uid"),
+        "flags": seen.get("flags"),
+        "modification_flags": seen.get("modification_flags"),
+        "dhcp": seen.get("dhcp"),
+        "static_dhcp": seen.get("static_dhcp"),
+        "blocked": seen.get("blocked"),
+        "allow_pcp_and_upnp": seen.get("allow_pcp_and_upnp"),
+        "pcp_count": seen.get("pcp_count"),
+        "upnp_count": seen.get("upnp_count"),
+        "myfritz_enabled": seen.get("myfritz_enabled"),
         "first_seen": seen.get("first_seen"),
         "last_seen": seen.get("last_seen"),
         "last_connected": seen.get("last_connected"),

@@ -99,10 +99,35 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             mac TEXT,
             ip TEXT,
             interface TEXT,
+            interface_detail TEXT,
             active_now INTEGER NOT NULL,
+            online INTEGER,
             first_seen TEXT,
             last_seen TEXT,
             last_connected TEXT,
+            uid TEXT,
+            friendly_name TEXT,
+            neighbour_name TEXT,
+            ip_list TEXT,
+            mac_list TEXT,
+            wlan_station_type TEXT,
+            wlan_uids TEXT,
+            plc_uids TEXT,
+            ethernet_port TEXT,
+            vendor TEXT,
+            model TEXT,
+            speed TEXT,
+            source_flags TEXT,
+            parent_uid TEXT,
+            flags TEXT,
+            modification_flags TEXT,
+            dhcp TEXT,
+            static_dhcp TEXT,
+            blocked TEXT,
+            allow_pcp_and_upnp TEXT,
+            pcp_count TEXT,
+            upnp_count TEXT,
+            myfritz_enabled TEXT,
             evidence_level TEXT NOT NULL DEFAULT 'enriched_from_current_host_table',
             evidence_note TEXT,
             raw_json TEXT NOT NULL,
@@ -168,6 +193,31 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         {
             "evidence_level": "TEXT NOT NULL DEFAULT 'enriched_from_current_host_table'",
             "evidence_note": "TEXT",
+            "interface_detail": "TEXT",
+            "online": "INTEGER",
+            "uid": "TEXT",
+            "friendly_name": "TEXT",
+            "neighbour_name": "TEXT",
+            "ip_list": "TEXT",
+            "mac_list": "TEXT",
+            "wlan_station_type": "TEXT",
+            "wlan_uids": "TEXT",
+            "plc_uids": "TEXT",
+            "ethernet_port": "TEXT",
+            "vendor": "TEXT",
+            "model": "TEXT",
+            "speed": "TEXT",
+            "source_flags": "TEXT",
+            "parent_uid": "TEXT",
+            "flags": "TEXT",
+            "modification_flags": "TEXT",
+            "dhcp": "TEXT",
+            "static_dhcp": "TEXT",
+            "blocked": "TEXT",
+            "allow_pcp_and_upnp": "TEXT",
+            "pcp_count": "TEXT",
+            "upnp_count": "TEXT",
+            "myfritz_enabled": "TEXT",
             "last_activity": "TEXT",
             "last_activity_source": "TEXT",
             "last_activity_confidence": "TEXT",
@@ -386,11 +436,56 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO hosts(
-                    run_id, hostname, mac, ip, interface, active_now, first_seen, last_seen,
+                    run_id, hostname, mac, ip, interface, interface_detail, active_now, online,
+                    first_seen, last_seen,
                     last_connected, last_activity, last_activity_source, last_activity_confidence,
+                    uid, friendly_name, neighbour_name, ip_list, mac_list, wlan_station_type,
+                    wlan_uids, plc_uids, ethernet_port, vendor, model, speed, source_flags,
+                    parent_uid, flags, modification_flags, dhcp, static_dhcp, blocked,
+                    allow_pcp_and_upnp, pcp_count, upnp_count, myfritz_enabled,
                     last_activity_note, evidence_level, evidence_note, raw_json, searchable
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(hostname, mac, ip) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    interface = COALESCE(excluded.interface, hosts.interface),
+                    interface_detail = COALESCE(excluded.interface_detail, hosts.interface_detail),
+                    active_now = excluded.active_now,
+                    online = COALESCE(excluded.online, hosts.online),
+                    first_seen = COALESCE(MIN(NULLIF(hosts.first_seen, ''), NULLIF(excluded.first_seen, '')), excluded.first_seen, hosts.first_seen),
+                    last_seen = MAX(COALESCE(hosts.last_seen, ''), COALESCE(excluded.last_seen, '')),
+                    last_connected = MAX(COALESCE(hosts.last_connected, ''), COALESCE(excluded.last_connected, '')),
+                    last_activity = MAX(COALESCE(hosts.last_activity, ''), COALESCE(excluded.last_activity, '')),
+                    last_activity_source = COALESCE(excluded.last_activity_source, hosts.last_activity_source),
+                    last_activity_confidence = COALESCE(excluded.last_activity_confidence, hosts.last_activity_confidence),
+                    last_activity_note = COALESCE(excluded.last_activity_note, hosts.last_activity_note),
+                    uid = COALESCE(excluded.uid, hosts.uid),
+                    friendly_name = COALESCE(excluded.friendly_name, hosts.friendly_name),
+                    neighbour_name = COALESCE(excluded.neighbour_name, hosts.neighbour_name),
+                    ip_list = COALESCE(excluded.ip_list, hosts.ip_list),
+                    mac_list = COALESCE(excluded.mac_list, hosts.mac_list),
+                    wlan_station_type = COALESCE(excluded.wlan_station_type, hosts.wlan_station_type),
+                    wlan_uids = COALESCE(excluded.wlan_uids, hosts.wlan_uids),
+                    plc_uids = COALESCE(excluded.plc_uids, hosts.plc_uids),
+                    ethernet_port = COALESCE(excluded.ethernet_port, hosts.ethernet_port),
+                    vendor = COALESCE(excluded.vendor, hosts.vendor),
+                    model = COALESCE(excluded.model, hosts.model),
+                    speed = COALESCE(excluded.speed, hosts.speed),
+                    source_flags = COALESCE(excluded.source_flags, hosts.source_flags),
+                    parent_uid = COALESCE(excluded.parent_uid, hosts.parent_uid),
+                    flags = COALESCE(excluded.flags, hosts.flags),
+                    modification_flags = COALESCE(excluded.modification_flags, hosts.modification_flags),
+                    dhcp = COALESCE(excluded.dhcp, hosts.dhcp),
+                    static_dhcp = COALESCE(excluded.static_dhcp, hosts.static_dhcp),
+                    blocked = COALESCE(excluded.blocked, hosts.blocked),
+                    allow_pcp_and_upnp = COALESCE(excluded.allow_pcp_and_upnp, hosts.allow_pcp_and_upnp),
+                    pcp_count = COALESCE(excluded.pcp_count, hosts.pcp_count),
+                    upnp_count = COALESCE(excluded.upnp_count, hosts.upnp_count),
+                    myfritz_enabled = COALESCE(excluded.myfritz_enabled, hosts.myfritz_enabled),
+                    evidence_level = excluded.evidence_level,
+                    evidence_note = excluded.evidence_note,
+                    raw_json = excluded.raw_json,
+                    searchable = excluded.searchable
                 """,
                 (
                     run_id,
@@ -398,13 +493,38 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     host.get("mac"),
                     host.get("ip"),
                     host.get("interface"),
+                    host.get("interface_detail"),
                     1 if host.get("active_now") else 0,
+                    1 if host.get("online") else 0 if host.get("online") is not None else None,
                     host.get("first_seen"),
                     host.get("last_seen"),
                     host.get("last_connected"),
                     host.get("last_activity"),
                     host.get("last_activity_source"),
                     host.get("last_activity_confidence"),
+                    host.get("uid"),
+                    host.get("friendly_name"),
+                    host.get("neighbour_name"),
+                    host.get("ip_list"),
+                    host.get("mac_list"),
+                    host.get("wlan_station_type"),
+                    host.get("wlan_uids"),
+                    host.get("plc_uids"),
+                    host.get("ethernet_port"),
+                    host.get("vendor"),
+                    host.get("model"),
+                    host.get("speed"),
+                    host.get("source_flags"),
+                    host.get("parent_uid"),
+                    host.get("flags"),
+                    host.get("modification_flags"),
+                    host.get("dhcp"),
+                    host.get("static_dhcp"),
+                    host.get("blocked"),
+                    host.get("allow_pcp_and_upnp"),
+                    host.get("pcp_count"),
+                    host.get("upnp_count"),
+                    host.get("myfritz_enabled"),
                     host.get("last_activity_note"),
                     evidence_level,
                     evidence_note,
@@ -461,7 +581,15 @@ def acquisition_metadata(dataset: dict[str, Any], acquired_at: str) -> dict[str,
         "source_endpoints": dataset.get("source_endpoints")
         or {
             "tr064": ["DeviceInfo:GetDeviceLog", "Hosts:GetGenericHostEntry"],
-            "avm_exports": ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml", "landevice_query_json"],
+            "avm_exports": [
+                "device_log_xml",
+                "mesh_list",
+                "host_list_xml",
+                "wlan_device_list_xml",
+                "landevice_query_json",
+                "data_lua_pages_json",
+                "tr064_snapshot_json",
+            ],
         },
     }
 
@@ -1026,7 +1154,15 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
 
 
 def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
-    expected = ["device_log_xml", "mesh_list", "host_list_xml", "wlan_device_list_xml", "landevice_query_json"]
+    expected = [
+        "device_log_xml",
+        "mesh_list",
+        "host_list_xml",
+        "wlan_device_list_xml",
+        "landevice_query_json",
+        "data_lua_pages_json",
+        "tr064_snapshot_json",
+    ]
     params: list[Any] = []
     if run_id is None:
         where = "WHERE record_type = 'raw_artifact'"
@@ -1055,6 +1191,10 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
         warnings.append("Retained device log XML was not collected; timeline completeness is reduced.")
     if "host_list_xml" not in present:
         warnings.append("Host list XML was not collected; device attribution is reduced.")
+    if "tr064_snapshot_json" not in present:
+        warnings.append("TR-064 router/WAN/WLAN status snapshot was not collected; network-state visualizations are reduced.")
+    if "data_lua_pages_json" not in present:
+        warnings.append("Unofficial FRITZ!Box data.lua pages were not collected; UI-only topology/log/counter evidence is reduced.")
     return {
         "expected_raw_artifacts": expected,
         "present_raw_artifacts": rows,
@@ -1102,6 +1242,43 @@ def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "", r
             confidence_params,
         )
     ]
+    host_run_sql, host_run_params = _run_observation_sql("host", scoped_run_id)
+    host_filter, host_params = _combine_filter(" WHERE 1=1", [], host_run_sql, host_run_params)
+    interface_counts = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(t.interface, ''), NULLIF(t.interface_detail, ''), 'unknown') AS label,
+                   COUNT(*) AS count
+            FROM hosts t{host_filter}
+            GROUP BY label
+            ORDER BY count DESC
+            """,
+            host_params,
+        )
+    ]
+    vendor_counts = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(t.vendor, ''), NULLIF(t.model, ''), 'unknown') AS label,
+                   COUNT(*) AS count
+            FROM hosts t{host_filter}
+            GROUP BY label
+            ORDER BY count DESC
+            LIMIT 8
+            """,
+            host_params,
+        )
+    ]
+    timestamp_coverage = {
+        "first_seen": _host_count(conn, host_filter, host_params, "t.first_seen IS NOT NULL AND t.first_seen != ''"),
+        "last_seen": _host_count(conn, host_filter, host_params, "t.last_seen IS NOT NULL AND t.last_seen != ''"),
+        "last_connected": _host_count(conn, host_filter, host_params, "t.last_connected IS NOT NULL AND t.last_connected != ''"),
+        "last_activity": _host_count(conn, host_filter, host_params, "t.last_activity IS NOT NULL AND t.last_activity != ''"),
+        "active_now": _host_count(conn, host_filter, host_params, "t.active_now = 1"),
+        "online": _host_count(conn, host_filter, host_params, "t.online = 1"),
+    }
     if scoped_run_id is None:
         retained = dict(
             conn.execute(
@@ -1127,16 +1304,145 @@ def analysis_snapshot(path: Path = DEFAULT_DB, start: str = "", end: str = "", r
             [scoped_run_id],
         ).fetchone()
     gaps = _event_gaps(conn, scoped_run_id)
+    source_coverage = acquisition_source_coverage(conn, scoped_run_id)
+    raw = raw_artifact_summaries(conn, scoped_run_id)
+    mesh = mesh_summary(raw.get("mesh_list"))
+    tr064 = tr064_summary(raw.get("tr064_snapshot_json"))
     conn.close()
     return {
         "category_counts": category_counts,
         "auth_counts": auth_counts,
         "hourly_counts": hourly,
         "confidence_counts": confidence,
+        "interface_counts": interface_counts,
+        "vendor_counts": vendor_counts,
+        "timestamp_coverage": timestamp_coverage,
+        "source_coverage": source_coverage,
+        "mesh_summary": mesh,
+        "tr064_summary": tr064,
         "retained": retained,
         "latest_run": dict(run) if run else None,
         "gaps": gaps,
     }
+
+
+def _host_count(conn: sqlite3.Connection, host_filter: str, host_params: list[Any], predicate: str) -> int:
+    filter_sql = host_filter + f" AND {predicate}"
+    return int(conn.execute(f"SELECT COUNT(*) FROM hosts t{filter_sql}", host_params).fetchone()[0])
+
+
+def raw_artifact_summaries(conn: sqlite3.Connection, run_id: int | None) -> dict[str, str]:
+    params: list[Any] = []
+    if run_id is None:
+        where = "WHERE record_type = 'raw_artifact'"
+    else:
+        where = "WHERE record_type = 'raw_artifact' AND run_id = ?"
+        params.append(run_id)
+    rows = conn.execute(
+        f"""
+        SELECT json_extract(content_json, '$.name') AS name,
+               json_extract(content_json, '$.content') AS content
+        FROM record_observations
+        {where}
+        ORDER BY id DESC
+        """,
+        params,
+    ).fetchall()
+    artifacts: dict[str, str] = {}
+    for row in rows:
+        artifacts.setdefault(str(row["name"]), str(row["content"] or ""))
+    return artifacts
+
+
+def mesh_summary(content: str | None) -> dict[str, Any]:
+    if not content:
+        return {"available": False, "nodes": 0, "links": [], "link_counts": []}
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return {"available": False, "nodes": 0, "links": [], "link_counts": []}
+    links: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for node in data.get("nodes") or []:
+        for interface in node.get("node_interfaces") or []:
+            for link in interface.get("node_links") or []:
+                label = f"{link.get('type') or interface.get('type') or 'unknown'} / {link.get('state') or 'unknown'}"
+                counts[label] = counts.get(label, 0) + 1
+                links.append(
+                    {
+                        "device": node.get("device_name") or node.get("device_friendly_name") or node.get("device_mac_address"),
+                        "interface": interface.get("name") or interface.get("type"),
+                        "type": link.get("type") or interface.get("type"),
+                        "state": link.get("state"),
+                        "last_connected": unix_seconds_to_iso(link.get("last_connected")),
+                        "rx": link.get("cur_data_rate_rx"),
+                        "tx": link.get("cur_data_rate_tx"),
+                    }
+                )
+    return {
+        "available": True,
+        "nodes": len(data.get("nodes") or []),
+        "links": links[:20],
+        "link_counts": [{"label": key, "count": value} for key, value in sorted(counts.items(), key=lambda item: item[1], reverse=True)],
+    }
+
+
+def tr064_summary(content: str | None) -> dict[str, Any]:
+    if not content:
+        return {"available": False, "wlan_radios": [], "wan": {}}
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return {"available": False, "wlan_radios": [], "wan": {}}
+    actions = data.get("actions") or {}
+    wan_common = ((actions.get("wan_common_link") or {}).get("response") or {})
+    wan_ip = ((actions.get("wan_ip_info") or {}).get("response") or {})
+    wan_status = ((actions.get("wan_ip_status") or {}).get("response") or {})
+    wan_external = ((actions.get("wan_ip_external") or {}).get("response") or {})
+    radios = []
+    for radio in data.get("wlan") or []:
+        info = ((radio.get("info") or {}).get("response") or {})
+        total = ((radio.get("total_associations") or {}).get("response") or {})
+        channel = ((radio.get("channel_info") or {}).get("response") or {})
+        stats = ((radio.get("statistics") or {}).get("response") or {})
+        radios.append(
+            {
+                "index": radio.get("index"),
+                "enabled": info.get("NewEnable"),
+                "status": info.get("NewStatus"),
+                "ssid": info.get("NewSSID"),
+                "channel": channel.get("NewChannel") or info.get("NewChannel"),
+                "standard": info.get("NewStandard"),
+                "associations": total.get("NewTotalAssociations") or info.get("NewTotalAssociations"),
+                "bytes_sent": stats.get("NewTotalBytesSent"),
+                "bytes_received": stats.get("NewTotalBytesReceived"),
+            }
+        )
+    return {
+        "available": True,
+        "wan": {
+            "access_type": wan_common.get("NewWANAccessType"),
+            "physical_status": wan_common.get("NewPhysicalLinkStatus"),
+            "downstream": wan_common.get("NewLayer1DownstreamMaxBitRate") or wan_common.get("NewX_AVM-DE_DownstreamCurrentMaxSpeed"),
+            "upstream": wan_common.get("NewLayer1UpstreamMaxBitRate") or wan_common.get("NewX_AVM-DE_UpstreamCurrentMaxSpeed"),
+            "connection_status": wan_status.get("NewConnectionStatus") or wan_ip.get("NewConnectionStatus"),
+            "external_ip": wan_external.get("NewExternalIPAddress") or wan_ip.get("NewExternalIPAddress"),
+        },
+        "wlan_radios": radios,
+    }
+
+
+def unix_seconds_to_iso(value: Any) -> str | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(numeric).astimezone().isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def query_entities(path: Path = DEFAULT_DB, query: str = "", limit: int = 100, run_id: str | int = "latest") -> dict[str, Any]:

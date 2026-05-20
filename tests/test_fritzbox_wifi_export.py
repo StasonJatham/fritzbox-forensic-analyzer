@@ -106,3 +106,61 @@ def test_landevice_query_derives_ui_last_connected_time() -> None:
     assert host["last_seen"].startswith("2026-05-02T")
     assert host["last_connected"].startswith("2026-05-02T")
     assert host["last_activity_source"] == "fritzbox_landevice_lastused"
+
+
+def test_wlan_device_list_xml_creates_current_association_rows() -> None:
+    records = fritzbox_wifi_export.parse_wlan_device_lists(
+        {
+            "wlan_device_list_xml_2": """
+            <List>
+              <TotalAssociations>1</TotalAssociations>
+              <Item>
+                <AssociatedDeviceIndex>1</AssociatedDeviceIndex>
+                <AssociatedDeviceMACAddress>AA:BB:CC:DD:EE:FF</AssociatedDeviceMACAddress>
+                <AssociatedDeviceIPAddress>192.0.2.50</AssociatedDeviceIPAddress>
+                <AssociatedDeviceAuthState>1</AssociatedDeviceAuthState>
+                <X_AVM-DE_Speed>866</X_AVM-DE_Speed>
+                <X_AVM-DE_SignalStrength>91</X_AVM-DE_SignalStrength>
+                <AssociatedDeviceChannel>6</AssociatedDeviceChannel>
+                <X_AVM-DE_ChannelWidth>80</X_AVM-DE_ChannelWidth>
+                <AssociatedDeviceGuest>1</AssociatedDeviceGuest>
+              </Item>
+            </List>
+            """
+        },
+        "2026-05-20T12:00:00+02:00",
+    )
+    wifi = fritzbox_wifi_export.build_available_wifi_connections([], [], records)
+
+    assert records[0]["radio_index"] == "2"
+    assert records[0]["mac"] == "aa:bb:cc:dd:ee:ff"
+    assert records[0]["guest"] is True
+    assert wifi[0]["derived_time_type"] == "wlan_association_snapshot"
+    assert wifi[0]["source"] == "wlan_device_list_xml_2"
+
+
+def test_data_lua_log_json_can_be_used_as_log_fallback() -> None:
+    raw = fritzbox_wifi_export.parse_data_lua_log(
+        '{"log":{"ok":true,"data":{"log":[{"date":"20.05.26","time":"12:00:00","msg":"WLAN-Gerät angemeldet: phone"}]}}}'
+    )
+
+    entries = fritzbox_wifi_export.parse_device_log(raw)
+
+    assert entries[0].message == "WLAN-Gerät angemeldet: phone"
+    assert entries[0].timestamp is not None
+
+
+def test_landevice_records_add_hosts_missing_from_official_host_list() -> None:
+    records = fritzbox_wifi_export.parse_landevice_query(
+        '{"mq_landevices":[{"UID":"landevice42","ip":"192.0.2.77","mac":"AA:BB:CC:DD:EE:77",'
+        '"name":"stale-phone","friendly_name":"Stale Phone","interface":"802.11","online":"0",'
+        '"vendorname":"ExampleVendor","firstused":1777272000,"lastused":1777725960}]}'
+    )
+
+    rows = fritzbox_wifi_export.lan_device_host_rows(records, [])
+
+    assert rows[0]["hostname"] == "stale-phone"
+    assert rows[0]["friendly_name"] == "Stale Phone"
+    assert rows[0]["vendor"] == "ExampleVendor"
+    assert rows[0]["last_connected"].startswith("2026-05-02T")
+    assert rows[0]["last_activity_source"] == "fritzbox_landevice_lastused"

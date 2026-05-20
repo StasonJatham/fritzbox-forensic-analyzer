@@ -46,9 +46,11 @@ function evidenceLabel(value) {
     retained_log_match: "router log match",
     wifi_event: "WiFi log",
     mesh_last_observed: "mesh observed",
+    wlan_association_snapshot: "WLAN associated now",
     active_host_snapshot: "active at fetch",
     fritzbox_landevice_lastused: "FRITZ!Box last used",
     landevice_query_json: "LAN device state",
+    data_lua_pages_json: "Web UI data.lua",
     device_log_xml: "device log",
     host_list_xml: "host list",
     mesh_list: "mesh list",
@@ -388,16 +390,56 @@ function renderCharts() {
   }).join("");
   renderMiniChart("category-chart", analysis.category_counts || []);
   renderMiniChart("confidence-chart", analysis.confidence_counts || []);
+  renderMiniChart("interface-chart", analysis.interface_counts || []);
+  renderMiniChart("timestamp-chart", Object.entries(analysis.timestamp_coverage || {}).map(([label, count]) => ({ label, count })));
+  renderMiniChart("mesh-links", analysis.mesh_summary?.link_counts || []);
+  renderSourceCoverage(analysis.source_coverage || {});
+  renderWlanRadios(analysis.tr064_summary?.wlan_radios || []);
+  renderWanState(analysis.tr064_summary?.wan || {});
 }
 
 function renderMiniChart(id, rows) {
   const max = Math.max(1, ...rows.map((row) => row.count || 0));
   $(id).innerHTML = rows.length ? rows.slice(0, 7).map((row) => `
     <div>
-      <div class="mini-row"><span>${escapeHtml(display(row.label, "unknown"))}</span><strong>${escapeHtml(row.count || 0)}</strong></div>
+      <div class="mini-row"><span>${escapeHtml(evidenceLabel(display(row.label, "unknown")))}</span><strong>${escapeHtml(row.count || 0)}</strong></div>
       <div class="mini-meter"><div style="width:${Math.max(4, Math.round(((row.count || 0) / max) * 100))}%"></div></div>
     </div>
   `).join("") : `<div class="empty">No chart data.</div>`;
+}
+
+function renderSourceCoverage(coverage) {
+  const present = new Set((coverage.present_raw_artifacts || []).map((row) => row.name));
+  const expected = coverage.expected_raw_artifacts || [];
+  $("source-coverage").innerHTML = expected.length ? expected.map((name) => `
+    <div class="mini-row">
+      <span>${escapeHtml(evidenceLabel(name))}</span>
+      <strong>${present.has(name) ? "present" : "missing"}</strong>
+    </div>
+  `).join("") : `<div class="empty">No source coverage data.</div>`;
+}
+
+function renderWlanRadios(radios) {
+  $("wlan-radio-list").innerHTML = radios.length ? radios.map((radio) => `
+    <div>
+      <div class="mini-row"><span>${escapeHtml(display(radio.ssid, `Radio ${radio.index}`))}</span><strong>${escapeHtml(display(radio.associations, "0"))} assoc</strong></div>
+      <div class="subtitle">${escapeHtml([radio.status, radio.enabled ? "enabled" : "disabled", radio.channel ? `ch ${radio.channel}` : "", radio.standard].filter(Boolean).join(" / "))}</div>
+    </div>
+  `).join("") : `<div class="empty">No WLAN radio snapshot.</div>`;
+}
+
+function renderWanState(wan) {
+  const rows = [
+    ["Status", wan.connection_status],
+    ["Physical", wan.physical_status],
+    ["Access", wan.access_type],
+    ["Downstream", wan.downstream],
+    ["Upstream", wan.upstream],
+    ["External IP", wan.external_ip]
+  ].filter(([, value]) => display(value, "") !== "");
+  $("wan-state").innerHTML = rows.length ? rows.map(([label, value]) => `
+    <div class="mini-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display(value))}</strong></div>
+  `).join("") : `<div class="empty">No WAN snapshot.</div>`;
 }
 
 function renderTimeline(rows) {

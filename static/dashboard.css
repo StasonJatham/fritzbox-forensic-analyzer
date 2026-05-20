@@ -311,6 +311,13 @@
       margin-bottom: 16px;
     }
 
+    .forensic-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
     .chart-panel, .entity-panel {
       border: 1px solid var(--hairline);
       border-radius: 12px;
@@ -669,7 +676,7 @@
       }
 
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .charts, .forensic-bar, .settings-inner, .acquisition-panel, .status-grid { grid-template-columns: 1fr; }
+      .charts, .forensic-grid, .forensic-bar, .settings-inner, .acquisition-panel, .status-grid { grid-template-columns: 1fr; }
       .limit-strip { justify-content: flex-start; }
       .tabs {
         max-width: 100%;
