@@ -12,6 +12,22 @@ from typing import Any
 
 
 DEFAULT_DB = Path(os.getenv("FRITZBOX_ANALYSIS_DB", "fritzbox-analysis.sqlite3"))
+EXPECTED_RAW_ARTIFACTS = [
+    "device_log_xml",
+    "mesh_list",
+    "host_list_xml",
+    "wlan_device_list_xml",
+    "landevice_query_json",
+    "data_lua_pages_json",
+    "tr064_snapshot_json",
+    "call_list_xml",
+    "phonebooks_xml_json",
+    "aha_device_list_xml",
+    "aha_switch_list_txt",
+    "aha_device_stats_json",
+    "config_export_file",
+    "support_data_txt",
+]
 WIFI_DEDUPE_SQL = """
     id IN (
         SELECT MAX(id) FROM wifi_connections
@@ -347,19 +363,22 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
             if not isinstance(content, str):
                 content = json.dumps(content, sort_keys=True)
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO raw_artifacts(run_id, name, sha256, content, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (run_id, name, digest, content, generated_at),
             )
+            row_id = cursor.lastrowid if cursor.rowcount else lookup_raw_artifact_id(conn, name, digest)
+            if row_id and cursor.rowcount:
+                add_fts(conn, "raw_artifacts", int(row_id), f"{name} {digest} {content}")
             add_observation(
                 conn,
                 run_id=run_id,
                 record_type="raw_artifact",
                 record_key=f"{name}:{digest}",
-                record_table_id=None,
+                record_table_id=int(row_id) if row_id else None,
                 observed_at=acquired_at,
                 event_time=generated_at,
                 evidence_level="raw",
@@ -656,16 +675,7 @@ def acquisition_metadata(dataset: dict[str, Any], acquired_at: str) -> dict[str,
         "source_endpoints": dataset.get("source_endpoints")
         or {
             "tr064": ["DeviceInfo:GetDeviceLog", "Hosts:GetGenericHostEntry"],
-            "avm_exports": [
-                "device_log_xml",
-                "mesh_list",
-                "host_list_xml",
-                "wlan_device_list_xml",
-                "landevice_query_json",
-                "data_lua_pages_json",
-                "tr064_snapshot_json",
-                "support_data_txt",
-            ],
+            "avm_exports": EXPECTED_RAW_ARTIFACTS,
         },
     }
 
@@ -864,6 +874,14 @@ def lookup_support_finding_id(conn: sqlite3.Connection, finding: dict[str, Any])
     return int(row["id"]) if row else None
 
 
+def lookup_raw_artifact_id(conn: sqlite3.Connection, name: str, sha256: str) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM raw_artifacts WHERE name = ? AND sha256 = ? ORDER BY id DESC LIMIT 1",
+        (name, sha256),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
 def add_fts(conn: sqlite3.Connection, record_type: str, record_id: int, content: str) -> None:
     conn.execute(
         "INSERT INTO records_fts(record_type, record_id, content) VALUES (?, ?, ?)",
@@ -958,6 +976,16 @@ def query_records(
         order = f"{sort_map.get(sort_by, sort_map['line_number'])} {direction}"
         fts_type = "support_findings"
         dedupe = "1=1"
+    elif record_type == "raw":
+        table = "raw_artifacts"
+        sort_map = {
+            "created_at": "COALESCE(t.created_at, '')",
+            "name": "COALESCE(t.name, '')",
+            "sha256": "COALESCE(t.sha256, '')",
+        }
+        order = f"{sort_map.get(sort_by, sort_map['created_at'])} {direction}"
+        fts_type = "raw_artifacts"
+        dedupe = "1=1"
     else:
         table = None
         fts_type = None
@@ -971,6 +999,7 @@ def query_records(
             "wifi_connections": "wifi_connection",
             "hosts": "host",
             "support_findings": "support_finding",
+            "raw_artifacts": "raw_artifact",
         }[table]
         if fts_query:
             join = " JOIN records_fts f ON f.record_id = t.id AND f.record_type = ?"
@@ -991,6 +1020,8 @@ def query_records(
             time_column = "derived_connected_at"
         elif table == "support_findings":
             time_column = "observed_at"
+        elif table == "raw_artifacts":
+            time_column = "created_at"
         elif table == "hosts":
             active_run_filter = f" AND run_id = {scoped_run_id}" if scoped_run_id is not None else ""
             host_time_columns = [
@@ -1024,10 +1055,14 @@ def query_records(
             if end:
                 where.append(f"COALESCE(t.{time_column}, '') <= ?")
                 params.append(end)
-        if evidence_level != "all":
+        if table == "raw_artifacts":
+            pass
+        elif evidence_level != "all":
             where.append("COALESCE(t.evidence_level, '') = ?")
             params.append(evidence_level)
-        if time_type != "all":
+        if table == "raw_artifacts":
+            pass
+        elif time_type != "all":
             if table == "event_log":
                 where.append("1=1" if time_type == "exact" else "1=0")
             elif table == "wifi_connections":
@@ -1294,16 +1329,7 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
 
 
 def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
-    expected = [
-        "device_log_xml",
-        "mesh_list",
-        "host_list_xml",
-        "wlan_device_list_xml",
-        "landevice_query_json",
-        "data_lua_pages_json",
-        "tr064_snapshot_json",
-        "support_data_txt",
-    ]
+    expected = EXPECTED_RAW_ARTIFACTS
     params: list[Any] = []
     if run_id is None:
         where = "WHERE record_type = 'raw_artifact'"
@@ -1345,6 +1371,12 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
     if "support_data_txt" not in present:
         warnings.append(
             "FRITZ!Box support data was not collected; deep diagnostic settings/service-state evidence is unavailable."
+        )
+    if "call_list_xml" not in present:
+        warnings.append("Telephony call-list XML was not collected; phone/call context is unavailable.")
+    if "config_export_file" not in present:
+        warnings.append(
+            "Encrypted configuration export was not collected; full settings backup evidence is unavailable."
         )
     return {
         "expected_raw_artifacts": expected,
@@ -1754,6 +1786,8 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         "hosts": "hosts",
         "support": "support_findings",
         "support_findings": "support_findings",
+        "raw": "raw_artifacts",
+        "raw_artifacts": "raw_artifacts",
     }
     table = table_map.get(record_type)
     if not table:
@@ -1764,6 +1798,19 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         conn.close()
         return {"record": None, "artifacts": []}
     row = dict(record)
+    if table == "raw_artifacts":
+        conn.close()
+        return {
+            "record": row,
+            "artifacts": [
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "created_at": row["created_at"],
+                    "snippet": _snippet(row["content"], row["content"][:80]),
+                }
+            ],
+        }
     needles = [
         row.get("message"),
         row.get("mac"),
@@ -1773,6 +1820,8 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         row.get("value"),
         row.get("key"),
         row.get("section"),
+        row.get("name"),
+        row.get("content"),
     ]
     artifacts: list[dict[str, Any]] = []
     for needle in [item for item in needles if item]:

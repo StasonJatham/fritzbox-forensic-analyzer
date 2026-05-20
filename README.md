@@ -10,9 +10,9 @@ This project is built for local incident response and home-network forensics. It
 
 ## What It Does
 
-- Pulls retained FRITZ!Box logs, host tables, mesh state, WLAN association snapshots, TR-064 router/WAN/WLAN status, FRITZ!Box web UI LAN-device state, and support-data diagnostics when available.
+- Pulls retained FRITZ!Box logs, host tables, mesh state, WLAN association snapshots, broad read-only TR-064 data, internal Web UI Lua data, telephony call/phonebook artifacts, AHA smart-home state, encrypted configuration export metadata, and support-data diagnostics when available.
 - Stores raw artifacts, parsed events, host records, WiFi observations, and run metadata in SQLite.
-- Provides backend full-text search across logs, hosts, WiFi records, entities, and timeline rows.
+- Provides backend full-text search across logs, hosts, WiFi records, support findings, raw artifacts, entities, and timeline rows.
 - Shows an analyst dashboard with stored-evidence review, explicit acquisition runs, sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, and raw evidence drawers.
 - Exports raw artifacts and a forensic acquisition package for offline review.
 - Imports previously exported forensic packages or JSON datasets as separate analysis profiles, so analysts can switch between multiple FRITZ!Boxes without merging evidence into one dataset.
@@ -37,6 +37,8 @@ Low-confidence rows such as `mesh_last_observed` are contextual observations, no
 FRITZ!Box web UI device-state values such as `firstused` and `lastused` can provide valuable "first seen" and "last connected/used" timestamps. These values are retained router state, not a complete per-session connection log. The dashboard shows source coverage so analysts can see whether that internal LAN-device artifact was collected for a run.
 
 The collector also attempts selected unofficial FRITZ!Box Lua endpoints such as `query.lua`, `data.lua`, and the hidden support-data workflow behind `support.lua`. These are valuable because they mirror parts of the router UI and diagnostic bundle, but they are not stable public APIs. The raw responses are preserved and labeled separately from official TR-064 evidence.
+
+Maximum acquisition mode also attempts firmware-dependent telephony, AHA/smart-home, configuration-backup, and dynamically discovered read-only TR-064 actions. These artifacts can be sensitive and may include phone call metadata, phonebook entries, smart-home device identifiers, router settings, internal service state, public IP information, and topology identifiers. The analyzer keeps them as raw evidence first, then parses only fields that can be labeled with a source and confidence.
 
 ## Quick Start
 
@@ -113,6 +115,7 @@ Real router data can reveal personal devices, locations, account names, public I
 - raw artifact archives
 - acquisition packages
 - `support_data_txt` raw artifacts
+- `call_list_xml`, `phonebooks_xml_json`, `config_export_file`, and AHA smart-home raw artifacts
 - JSON, CSV, or screenshot exports from a real network
 
 This repository intentionally does not include real screenshots, sample exports, or captured router data.

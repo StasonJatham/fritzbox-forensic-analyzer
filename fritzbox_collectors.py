@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.request
 from typing import Any
 
@@ -64,7 +65,51 @@ def get_hosts(fc: Any) -> list[dict[str, Any]]:
     return hosts
 
 
-def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
+READ_ONLY_ACTION_PREFIXES = ("Get", "X_AVM-DE_Get")
+BLOCKED_ACTION_WORDS = (
+    "Add",
+    "Create",
+    "Delete",
+    "Dial",
+    "Force",
+    "Import",
+    "Mark",
+    "Reboot",
+    "Reset",
+    "Set",
+    "Start",
+    "Stop",
+    "Update",
+    "Wake",
+)
+DATA_LUA_PAGES = (
+    "homeNet",
+    "log",
+    "netCnt",
+    "netMoni",
+    "overview",
+    "netDev",
+    "mesh",
+    "wlan",
+    "wGuest",
+    "inetstat",
+    "dsl",
+    "docInfo",
+    "syslog",
+    "foncalls",
+    "phonebook",
+    "dect",
+    "usb",
+    "nas",
+    "vpn",
+    "wireguard",
+    "users",
+    "myfritz",
+    "shareUsb",
+)
+
+
+def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | None = None) -> dict[str, Any]:
     exports: dict[str, Any] = {}
     path_specs = [
         ("device_log_xml", "DeviceInfo:1", "X_AVM-DE_GetDeviceLogPath", "NewDeviceLogPath"),
@@ -78,7 +123,7 @@ def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
             continue
         if not path:
             continue
-        content = fetch_avm_path(address, port, str(path))
+        content = fetch_avm_path(address, port, str(path), fc=fc)
         if content is not None:
             exports[key] = content
 
@@ -92,7 +137,7 @@ def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
             continue
         if not path:
             continue
-        content = fetch_avm_path(address, port, str(path))
+        content = fetch_avm_path(address, port, str(path), fc=fc)
         if content is None:
             continue
         key = f"wlan_device_list_xml_{index}"
@@ -114,6 +159,12 @@ def fetch_avm_exports(fc: Any, address: str, port: int) -> dict[str, Any]:
     tr064_snapshot = collect_tr064_snapshot(fc)
     if tr064_snapshot:
         exports["tr064_snapshot_json"] = json.dumps(tr064_snapshot, sort_keys=True, default=str)
+    exports.update(fetch_telephony_exports(fc, address, port))
+    exports.update(fetch_aha_artifacts(fc))
+    if export_password:
+        config_export = fetch_config_export(fc, address, port, export_password)
+        if config_export:
+            exports["config_export_file"] = config_export
     support_data = fetch_support_data(fc)
     if support_data:
         exports["support_data_txt"] = support_data
@@ -170,7 +221,7 @@ def is_support_data_response(text: str) -> bool:
 
 def fetch_data_lua_pages(fc: Any) -> dict[str, Any]:
     pages: dict[str, Any] = {}
-    for page in ("homeNet", "log", "netCnt", "netMoni"):
+    for page in DATA_LUA_PAGES:
         try:
             response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/data.lua", {"page": page})
         except Exception as exc:
@@ -277,7 +328,13 @@ def collect_tr064_snapshot(fc: Any) -> dict[str, Any]:
         ("wan_dsl_stats", "WANDSLInterfaceConfig:1", "GetStatisticsTotal", {}),
         ("wan_dsl_link", "WANDSLLinkConfig:1", "GetInfo", {}),
     ]
-    snapshot: dict[str, Any] = {"actions": {}, "wlan": []}
+    snapshot: dict[str, Any] = {
+        "actions": {},
+        "wlan": [],
+        "service_inventory": tr064_service_inventory(fc),
+        "dynamic_readonly": collect_dynamic_readonly_actions(fc),
+        "indexed_results": collect_indexed_results(fc),
+    }
     for key, service, action, arguments in actions:
         snapshot["actions"][key] = safe_call_action(fc, service, action, arguments)
     for index in range(1, 5):
@@ -297,6 +354,136 @@ def collect_tr064_snapshot(fc: Any) -> dict[str, Any]:
     return snapshot
 
 
+def tr064_service_inventory(fc: Any) -> list[dict[str, Any]]:
+    inventory: list[dict[str, Any]] = []
+    for service_name, service in sorted((getattr(fc, "services", {}) or {}).items()):
+        actions = []
+        try:
+            action_items = sorted(service.actions.items())
+        except Exception:
+            action_items = []
+        for action_name, action in action_items:
+            actions.append(
+                {
+                    "name": action_name,
+                    "input_arguments": action_input_arguments(action),
+                    "output_arguments": action_output_arguments(action),
+                    "read_only_candidate": is_read_only_action(action_name),
+                }
+            )
+        inventory.append(
+            {
+                "service": service_name,
+                "service_type": getattr(service, "serviceType", None),
+                "control_url": getattr(service, "controlURL", None),
+                "scpd_url": getattr(service, "SCPDURL", None),
+                "actions": actions,
+            }
+        )
+    return inventory
+
+
+def collect_dynamic_readonly_actions(fc: Any, max_actions: int = 220) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    called = 0
+    for service_name, service in sorted((getattr(fc, "services", {}) or {}).items()):
+        try:
+            action_items = sorted(service.actions.items())
+        except Exception:
+            continue
+        for action_name, action in action_items:
+            if called >= max_actions:
+                return results
+            if not is_read_only_action(action_name):
+                continue
+            if action_input_arguments(action):
+                continue
+            key = f"{service_name}:{action_name}"
+            results[key] = safe_call_action(fc, service_name, action_name, {})
+            called += 1
+    return results
+
+
+def collect_indexed_results(fc: Any) -> dict[str, Any]:
+    specs = [
+        (
+            "Hosts:1",
+            "GetHostNumberOfEntries",
+            "NewHostNumberOfEntries",
+            "GetGenericHostEntry",
+            "NewIndex",
+            "hosts_generic",
+        ),
+        (
+            "WANIPConn:1",
+            "GetPortMappingNumberOfEntries",
+            "NewPortMappingNumberOfEntries",
+            "GetGenericPortMappingEntry",
+            "NewPortMappingIndex",
+            "wan_ip_port_mappings",
+        ),
+        (
+            "WANPPPConn:1",
+            "GetPortMappingNumberOfEntries",
+            "NewPortMappingNumberOfEntries",
+            "GetGenericPortMappingEntry",
+            "NewPortMappingIndex",
+            "wan_ppp_port_mappings",
+        ),
+    ]
+    indexed: dict[str, Any] = {}
+    for service, count_action, count_field, item_action, index_arg, key in specs:
+        count_result = safe_call_action(fc, service, count_action, {})
+        indexed[key] = {"count": count_result, "items": []}
+        if not count_result.get("ok"):
+            continue
+        try:
+            count = int((count_result.get("response") or {}).get(count_field) or 0)
+        except (TypeError, ValueError):
+            continue
+        for index in range(min(count, 512)):
+            indexed[key]["items"].append(safe_call_action(fc, service, item_action, {index_arg: index}))
+
+    for radio_index in range(1, 5):
+        service = f"WLANConfiguration:{radio_index}"
+        count_result = safe_call_action(fc, service, "GetTotalAssociations", {})
+        key = f"wlan_{radio_index}_associations"
+        indexed[key] = {"count": count_result, "items": []}
+        if not count_result.get("ok"):
+            continue
+        try:
+            count = int((count_result.get("response") or {}).get("NewTotalAssociations") or 0)
+        except (TypeError, ValueError):
+            continue
+        for index in range(min(count, 256)):
+            indexed[key]["items"].append(
+                safe_call_action(fc, service, "GetGenericAssociatedDeviceInfo", {"NewAssociatedDeviceIndex": index})
+            )
+    return indexed
+
+
+def is_read_only_action(action_name: str) -> bool:
+    if not action_name.startswith(READ_ONLY_ACTION_PREFIXES):
+        return False
+    return not any(word in action_name for word in BLOCKED_ACTION_WORDS)
+
+
+def action_input_arguments(action: Any) -> list[str]:
+    return [
+        name
+        for name, argument in getattr(action, "arguments", {}).items()
+        if getattr(argument, "direction", None) == "in"
+    ]
+
+
+def action_output_arguments(action: Any) -> list[str]:
+    return [
+        name
+        for name, argument in getattr(action, "arguments", {}).items()
+        if getattr(argument, "direction", None) == "out"
+    ]
+
+
 def safe_call_action(fc: Any, service: str, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         response = (
@@ -312,7 +499,77 @@ def safe_call_action(fc: Any, service: str, action: str, arguments: dict[str, An
         return {"ok": False, "service": service, "action": action, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def fetch_avm_path(address: str, port: int, path: str) -> str | None:
+def fetch_telephony_exports(fc: Any, address: str, port: int) -> dict[str, str]:
+    exports: dict[str, str] = {}
+    call_list = safe_call_action(fc, "X_AVM-DE_OnTel:1", "GetCallList", {})
+    call_list_url = (call_list.get("response") or {}).get("NewCallListURL")
+    if call_list_url:
+        content = fetch_avm_path(address, port, str(call_list_url), fc=fc)
+        if content is not None:
+            exports["call_list_xml"] = content
+
+    phonebooks = safe_call_action(fc, "X_AVM-DE_OnTel:1", "GetPhonebookList", {})
+    phonebook_ids = re.findall(r"\d+", str((phonebooks.get("response") or {}).get("NewPhonebookList") or ""))
+    phonebook_exports: dict[str, str] = {}
+    for phonebook_id in phonebook_ids[:20]:
+        result = safe_call_action(fc, "X_AVM-DE_OnTel:1", "GetPhonebook", {"NewPhonebookID": int(phonebook_id)})
+        url = (result.get("response") or {}).get("NewPhonebookURL")
+        if not url:
+            continue
+        content = fetch_avm_path(address, port, str(url), fc=fc)
+        if content is not None:
+            phonebook_exports[phonebook_id] = content
+    if phonebook_exports:
+        exports["phonebooks_xml_json"] = json.dumps(phonebook_exports, sort_keys=True)
+    return exports
+
+
+def fetch_aha_artifacts(fc: Any) -> dict[str, str]:
+    artifacts: dict[str, str] = {}
+    for command, artifact_name in (
+        ("getdevicelistinfos", "aha_device_list_xml"),
+        ("getswitchlist", "aha_switch_list_txt"),
+    ):
+        try:
+            response = fc.call_http(command)
+        except Exception:
+            continue
+        content = response.get("content")
+        if content:
+            artifacts[artifact_name] = str(content)
+
+    switch_list = artifacts.get("aha_switch_list_txt", "")
+    stats: dict[str, Any] = {}
+    for ain in re.split(r"\s*,\s*", switch_list.strip()):
+        if not ain:
+            continue
+        try:
+            stats[ain] = fc.call_http("getbasicdevicestats", ain).get("content")
+        except Exception as exc:
+            stats[ain] = {"error": f"{type(exc).__name__}: {exc}"}
+    if stats:
+        artifacts["aha_device_stats_json"] = json.dumps(stats, sort_keys=True, default=str)
+    return artifacts
+
+
+def fetch_config_export(fc: Any, address: str, port: int, export_password: str) -> str | None:
+    result = safe_call_action(
+        fc,
+        "DeviceConfig:1",
+        "X_AVM-DE_GetConfigFile",
+        {"NewX_AVM-DE_Password": export_password},
+    )
+    path = (result.get("response") or {}).get("NewX_AVM-DE_ConfigFileUrl")
+    if not path:
+        return None
+    return fetch_avm_path(address, port, str(path), fc=fc)
+
+
+def fetch_avm_path(address: str, port: int, path: str, fc: Any | None = None) -> str | None:
+    if fc is not None:
+        content = fetch_authenticated_path(fc, path)
+        if content is not None:
+            return content
     for base in (f"http://{address}:{port}", f"http://{address}"):
         try:
             with urllib.request.urlopen(base + path, timeout=5) as response:
@@ -320,3 +577,28 @@ def fetch_avm_path(address: str, port: int, path: str) -> str | None:
         except Exception:
             continue
     return None
+
+
+def fetch_authenticated_path(fc: Any, path: str) -> str | None:
+    http = getattr(fc, "http_interface", None)
+    if http is None:
+        return None
+    session = getattr(getattr(http, "fc", None), "session", None)
+    if session is None:
+        return None
+    url = path if path.startswith(("http://", "https://")) else f"{http.router_url}{path}"
+    try:
+        with session.get(url, timeout=15) as response:
+            if getattr(response, "status_code", None) != 200:
+                return None
+            return response.content.decode("utf-8", errors="replace")
+    except TypeError:
+        try:
+            with session.get(url) as response:
+                if getattr(response, "status_code", None) != 200:
+                    return None
+                return response.content.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    except Exception:
+        return None

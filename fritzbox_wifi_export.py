@@ -100,7 +100,8 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
     hosts_by_mac = index_hosts_by_mac(hosts)
     device_info = get_device_info(fc)
     router_time = get_router_time(fc)
-    avm_exports = fetch_avm_exports(fc, args.address, args.port)
+    export_password = os.getenv("FRITZBOX_EXPORT_PASSWORD") or password
+    avm_exports = fetch_avm_exports(fc, args.address, args.port, export_password=export_password)
     raw_log = (
         avm_exports.get("device_log_text")
         or parse_data_lua_log(avm_exports.get("data_lua_pages_json"))
@@ -184,15 +185,23 @@ def export_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 "landevice_query_json",
                 "data_lua_pages_json",
                 "tr064_snapshot_json",
+                "call_list_xml",
+                "phonebooks_xml_json",
+                "aha_device_list_xml",
+                "aha_switch_list_txt",
+                "aha_device_stats_json",
+                "config_export_file",
                 "support_data_txt",
             ],
         },
         "notes": [
-            "This export uses FRITZ!Box TR-064 DeviceInfo:GetDeviceLog and Hosts:GetGenericHostEntry plus the FRITZ!Box web UI LAN-device query when available.",
+            "This export uses FRITZ!Box TR-064, AVM export paths, internal Web UI endpoints, support data, telephony artifacts, AHA smart-home endpoints, and the encrypted configuration export when available.",
             "It can only show event-log entries still retained by the router.",
             "LAN-device firstused/lastused values are router-retained device state, not a complete session log.",
             "Mesh WLAN device rows are current/known-device records, not guaranteed historical association records.",
+            "Unofficial data.lua/query.lua artifacts are firmware-dependent and labeled as internal Web UI evidence.",
             "Support-data exports are high-sensitivity diagnostic artifacts and may contain settings, identifiers, logs, and service state.",
+            "Configuration exports are high-sensitivity encrypted artifacts and may still reveal metadata in headers.",
             "If a separate access point handles WiFi, the FRITZ!Box may only show that access point as an Ethernet host.",
         ],
     }

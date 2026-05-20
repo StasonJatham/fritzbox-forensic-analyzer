@@ -56,6 +56,13 @@ function evidenceLabel(value) {
     mesh_list: "mesh list",
     support_data_txt: "support data",
     wlan_device_list_xml: "WLAN device list",
+    tr064_snapshot_json: "TR-064 snapshot",
+    call_list_xml: "call list",
+    phonebooks_xml_json: "phonebooks",
+    aha_device_list_xml: "AHA device list",
+    aha_switch_list_txt: "AHA switch list",
+    aha_device_stats_json: "AHA device stats",
+    config_export_file: "config export",
     high: "high",
     medium: "medium",
     low: "low"
@@ -508,6 +515,13 @@ function renderTable() {
       rowAction(row), row.line_number, pill(row.finding_type, row.finding_type), row.section, row.key,
       row.value || row.raw_text, confidenceBadge(row)
     ]), rows);
+  } else if (state.view === "raw") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Created", "created_at"], ["Artifact", "name"], ["SHA-256", "sha256"], ["Size", ""], ["Preview", ""]
+    ], rows.map((row) => [
+      rowAction(row), formatTime(row.created_at), evidenceLabel(row.name), row.sha256,
+      text(row.content).length, text(row.content).slice(0, 220)
+    ]), rows);
   } else if (state.view === "entities") {
     $("table").innerHTML = table([
       ["Action", ""], ["Host", "hostname"], ["MAC", "mac"], ["IP", "ip"], ["Interface", "interface"], ["Active", "active_now"],
@@ -532,7 +546,8 @@ function rowAction(row) {
     state.view === "wifi" ? "wifi" :
     state.view === "log" ? "log" :
     state.view === "hosts" ? "hosts" :
-    state.view === "support" ? "support" : ""
+    state.view === "support" ? "support" :
+    state.view === "raw" ? "raw" : ""
   );
   const id = row.record_id || row.id || "";
   return `<button class="row-action" data-action="evidence" data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">Open</button>`;
@@ -583,7 +598,8 @@ function table(headers, rows, sourceRows = []) {
         state.view === "wifi" ? "wifi" :
         state.view === "log" ? "log" :
         state.view === "hosts" ? "hosts" :
-        state.view === "support" ? "support" : ""
+        state.view === "support" ? "support" :
+        state.view === "raw" ? "raw" : ""
       );
       const id = source.record_id || source.id || "";
       return `<tr data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">${row.map((cell, cellIndex) => {
@@ -602,6 +618,7 @@ function defaultSortForView(view) {
   if (view === "timeline") return "timestamp";
   if (view === "entities") return "last_seen";
   if (view === "support") return "line_number";
+  if (view === "raw") return "created_at";
   return "derived_connected_at";
 }
 
