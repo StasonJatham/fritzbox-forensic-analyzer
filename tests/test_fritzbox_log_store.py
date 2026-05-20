@@ -255,12 +255,18 @@ def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
     )
 
     hosts = query_records(db, "active-phone", "hosts")
+    presence = query_records(db, "active-phone", "presence")
+    snapshot = latest_snapshot(db)
 
     assert hosts["total"] == 1
     assert hosts["rows"][0]["last_connected"] is None
     assert hosts["rows"][0]["last_activity"]
     assert hosts["rows"][0]["last_activity_source"] == "active_host_snapshot"
     assert hosts["rows"][0]["last_activity_confidence"] == "medium"
+    assert presence["total"] == 1
+    assert presence["rows"][0]["hostname"] == "active-phone"
+    assert snapshot["presence_summary"]["active_snapshot"] == 2
+    assert snapshot["presence_summary"]["last_connected"] == 1
     assert (
         query_records(db, "", "hosts", start="2026-05-20T00:00:00+02:00", end="2026-05-21T00:00:00+02:00")["total"] == 2
     )

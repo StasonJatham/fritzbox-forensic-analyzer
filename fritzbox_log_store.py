@@ -1574,7 +1574,7 @@ def query_records(
         order = f"{sort_map.get(sort_by, sort_map['derived_connected_at'])} {direction}"
         fts_type = "wifi_connections"
         dedupe = "1=1" if scoped_run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()
-    elif record_type == "hosts":
+    elif record_type in ("hosts", "presence"):
         table = "hosts"
         sort_map = {
             "hostname": "COALESCE(t.hostname, '')",
@@ -1586,6 +1586,8 @@ def query_records(
             "last_seen": "COALESCE(t.last_seen, '')",
             "last_connected": "COALESCE(t.last_connected, '')",
             "last_activity": "COALESCE(t.last_activity, t.last_seen, t.last_connected, '')",
+            "presence_source": "COALESCE(t.last_activity_source, '')",
+            "presence_confidence": "COALESCE(t.last_activity_confidence, '')",
         }
         order = f"{sort_map.get(sort_by, sort_map['last_activity'])} {direction}"
         fts_type = "hosts"
@@ -1966,6 +1968,7 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
         ):
             latest[key.removesuffix("_json")] = _decode_json(latest.pop(key, None))
     source_coverage = acquisition_source_coverage(conn, scoped_run_id)
+    presence = presence_summary(conn, scoped_run_id)
     conn.close()
     return {
         "has_data": (
@@ -1983,7 +1986,38 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
         "counts": counts,
         "last_exact_wifi": last_exact_wifi,
         "last_device_connected": last_device_connected,
+        "presence_summary": presence,
         "source_coverage": source_coverage,
+    }
+
+
+def presence_summary(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
+    run_sql, run_params = _run_observation_sql("host", run_id)
+    where = f"WHERE {run_sql}" if run_sql else ""
+    params = run_params
+    row = dict(
+        conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN active_now = 1 THEN 1 ELSE 0 END) AS active_now,
+                SUM(CASE WHEN first_seen IS NOT NULL AND first_seen != '' THEN 1 ELSE 0 END) AS first_seen,
+                SUM(CASE WHEN last_connected IS NOT NULL AND last_connected != '' THEN 1 ELSE 0 END) AS last_connected,
+                SUM(CASE WHEN last_activity IS NOT NULL AND last_activity != '' THEN 1 ELSE 0 END) AS last_activity,
+                SUM(CASE WHEN last_activity_source = 'exact_wifi_connection' THEN 1 ELSE 0 END) AS exact_wifi,
+                SUM(CASE WHEN last_activity_source = 'fritzbox_landevice_lastused' THEN 1 ELSE 0 END) AS device_state,
+                SUM(CASE WHEN active_now = 1 THEN 1 ELSE 0 END) AS active_snapshot,
+                MAX(last_activity) AS newest_activity,
+                MIN(first_seen) AS oldest_first_seen
+            FROM hosts t
+            {where}
+            """,
+            params,
+        ).fetchone()
+    )
+    return {
+        key: (value or 0 if key not in {"newest_activity", "oldest_first_seen"} else value)
+        for key, value in row.items()
     }
 
 

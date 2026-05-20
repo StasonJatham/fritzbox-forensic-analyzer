@@ -414,6 +414,7 @@ function renderCharts() {
   renderWanExposure(analysis.tr064_summary?.wan || {});
   renderDeviceRisk(analysis.host_risk_summary || {});
   renderLastUsedHistogram(analysis.last_used_histogram || []);
+  renderPresenceSummary(state.latest?.presence_summary || {});
 }
 
 function renderMiniChart(id, rows) {
@@ -555,6 +556,22 @@ function renderLastUsedHistogram(rows) {
   }).join("") : `<div class="empty">No retained last-used timestamps.</div>`;
 }
 
+function renderPresenceSummary(summary) {
+  const rows = [
+    ["Devices", summary.total],
+    ["First seen", summary.first_seen],
+    ["Last connected/used", summary.last_connected],
+    ["Last activity", summary.last_activity],
+    ["Exact WiFi log", summary.exact_wifi],
+    ["FRITZ!Box lastused", summary.device_state],
+    ["Active snapshot", summary.active_snapshot],
+    ["Newest activity", summary.newest_activity ? formatTime(summary.newest_activity) : ""]
+  ];
+  $("presence-summary").innerHTML = rows.some(([, value]) => value) ? rows.map(([label, value]) => `
+    <div class="mini-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display(value, "0"))}</strong></div>
+  `).join("") : `<div class="empty">No device presence timestamps yet.</div>`;
+}
+
 function renderTimeline(rows) {
   $("timeline").innerHTML = rows.map((row) => `
     <button class="timeline-row ${escapeHtml(cssToken(row.event_class || row.category))}" data-record-type="${escapeHtml(row.record_type || "")}" data-record-id="${escapeHtml(row.record_id || "")}">
@@ -594,6 +611,16 @@ function renderTable() {
     ], rows.map((row) => [
       rowAction(row), formatTime(row.derived_connected_at || row.timestamp), row.derived_time_type || row.event,
       row.hostname, row.mac, row.ip, confidenceBadge(row), row.source, row.derived_time_confidence || row.confidence
+    ]), rows);
+  } else if (state.view === "presence") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Device", "hostname"], ["MAC", "mac"], ["IP", "ip"], ["Interface", "interface"],
+      ["First Seen", "first_seen"], ["Last Connected / Used", "last_connected"], ["Last Activity", "last_activity"],
+      ["Observed Span", ""], ["Now", "active_now"], ["Evidence", "presence_confidence"], ["Source", "presence_source"]
+    ], rows.map((row) => [
+      rowAction(row), row.hostname, row.mac, row.ip, row.interface,
+      formatTime(row.first_seen), formatTime(row.last_connected), formatTime(row.last_activity),
+      presenceSpan(row), row.active_now ? "active" : "not active", activityBadge(row), evidenceLabel(row.last_activity_source)
     ]), rows);
   } else if (state.view === "hosts") {
     $("table").innerHTML = table([
@@ -698,6 +725,7 @@ function rowAction(row) {
   const type = row.record_type || (
     state.view === "wifi" ? "wifi" :
     state.view === "log" ? "log" :
+    state.view === "presence" ? "hosts" :
     state.view === "hosts" ? "hosts" :
     state.view === "support" ? "support" :
     state.view === "raw" ? "raw" :
@@ -751,6 +779,7 @@ function table(headers, rows, sourceRows = []) {
       const type = source.record_type || (
         state.view === "wifi" ? "wifi" :
         state.view === "log" ? "log" :
+        state.view === "presence" ? "hosts" :
         state.view === "hosts" ? "hosts" :
         state.view === "support" ? "support" :
         state.view === "raw" ? "raw" :
@@ -769,6 +798,7 @@ function table(headers, rows, sourceRows = []) {
 
 function defaultSortForView(view) {
   if (view === "hosts") return "last_activity";
+  if (view === "presence") return "last_activity";
   if (view === "log") return "timestamp";
   if (view === "timeline") return "timestamp";
   if (view === "entities") return "last_seen";
@@ -781,6 +811,26 @@ function defaultSortForView(view) {
   if (view === "host_filter_profiles") return "name";
   if (view === "device_risk_summaries") return "risk_score";
   return "derived_connected_at";
+}
+
+function presenceSpan(row) {
+  const start = parseDate(row.first_seen);
+  const end = parseDate(row.last_activity || row.last_connected || row.last_seen);
+  if (!start || !end || end < start) return "";
+  const seconds = Math.round((end - start) / 1000);
+  if (seconds < 60) return "< 1 min";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function additionalEvidenceView(view) {
