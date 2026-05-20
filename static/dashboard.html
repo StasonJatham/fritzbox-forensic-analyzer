@@ -19,14 +19,110 @@
           <div class="subtitle" id="subtitle">Local evidence workbench</div>
         </div>
       </div>
-      <div class="controls">
-        <input class="search" id="search" placeholder="Search evidence, host, MAC, IP">
-        <select id="profile">
-          <option value="local">Local workspace</option>
-        </select>
-        <select id="run">
-          <option value="latest">Latest acquisition</option>
-        </select>
+      <div class="header-actions">
+        <button id="refresh" type="button">Load Stored</button>
+        <button id="import-package" type="button">Import</button>
+        <input id="import-file" class="hidden-file" type="file" accept=".zip,.json,application/zip,application/json">
+        <button id="download-package" type="button">Package</button>
+      </div>
+    </div>
+    <div class="wrap section-nav" aria-label="Primary sections">
+      <button class="section-tab" type="button" data-section="overview">Overview</button>
+      <button class="section-tab active" type="button" data-section="search">Search</button>
+      <button class="section-tab" type="button" data-section="devices">Devices</button>
+      <button class="section-tab" type="button" data-section="network">Network</button>
+      <button class="section-tab" type="button" data-section="artifacts">Artifacts</button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <details class="command-panel" id="command-panel">
+      <summary>
+        <span>Acquisition Commands</span>
+        <span id="settings-note">Settings are stored locally in fritzbox-analysis.sqlite3.</span>
+      </summary>
+      <form class="settings-inner" id="settings-form" autocomplete="off">
+        <label>FRITZ!Box IP<input id="cfg-address" autocomplete="username" placeholder="192.168.178.1"></label>
+        <label>Admin Password<input id="cfg-password" type="password" autocomplete="current-password" placeholder="Leave blank to keep saved"></label>
+        <label>Acquisition Window<select id="hours"><option value="24">24h</option><option value="168">7d</option><option value="720">30d</option><option value="3000" selected>All retained</option></select></label>
+        <button id="save-settings" type="button">Save Settings</button>
+        <button id="run-acquisition" type="button">Run Acquisition</button>
+      </form>
+      <div class="command-grid">
+        <label>Profile<select id="profile"><option value="local">Local workspace</option></select></label>
+        <label>Run<select id="run"><option value="latest">Latest acquisition</option></select></label>
+        <label>Start Time<input id="range-start" type="datetime-local"></label>
+        <label>End Time<input id="range-end" type="datetime-local"></label>
+        <label>Poll Interval<select id="poll-interval"><option value="5">5 min</option><option value="10">10 min</option><option value="15" selected>15 min</option></select></label>
+        <label>Polling State<div class="check-row" id="poll-status">Stopped</div></label>
+        <button id="apply-range" type="button">Apply Range</button>
+        <button id="toggle-poll" type="button">Start Polling</button>
+        <button id="download-raw" type="button">Download Raw</button>
+      </div>
+    </details>
+
+    <section class="forensic-notice" id="forensic-notice">
+      <strong>Evidence model:</strong> this tool shows what the FRITZ!Box retained and exposed at acquisition time.
+      Absence of a row is not proof an event did not happen. Mesh observations are inferred context, not exact WiFi join times.
+    </section>
+    <p class="status" id="status"></p>
+
+    <section class="app-section" data-section-panel="overview">
+      <div class="section-head">
+        <div>
+          <p class="section-title">Overview</p>
+          <h2>Acquisition coverage and high-value signals</h2>
+        </div>
+        <div class="limit-strip">
+          <span class="pill parsed_from_raw">Exact retained log</span>
+          <span class="pill inferred">Inferred context</span>
+          <span class="pill enriched_from_current_host_table">Host table context</span>
+        </div>
+      </div>
+      <section class="acquisition-panel">
+        <div>
+          <p class="section-title">Acquisition Status</p>
+          <div class="status-grid" id="acquisition-status">
+            <span>No stored acquisition loaded.</span>
+          </div>
+        </div>
+      </section>
+      <section class="metrics">
+        <div class="metric"><div class="label">WiFi Rows</div><div class="value" id="m-wifi">0</div><div class="accent"></div></div>
+        <div class="metric"><div class="label">Retained Logs</div><div class="value" id="m-log">0</div><div class="accent"></div></div>
+        <div class="metric"><div class="label">Known Hosts</div><div class="value" id="m-hosts">0</div><div class="accent"></div></div>
+        <div class="metric"><div class="label">Active Hosts</div><div class="value" id="m-active">0</div><div class="accent"></div></div>
+        <div class="metric"><div class="label">Last Device Use</div><div class="value small" id="m-last">None retained</div><div class="accent"></div></div>
+      </section>
+      <section class="charts overview-grid">
+        <div class="chart-panel wide">
+          <p class="section-title">Connection / Event High Times</p>
+          <div class="bar-chart" id="hour-chart"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">Event Classes</p>
+          <div class="mini-list" id="category-chart"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">Evidence Confidence</p>
+          <div class="mini-list" id="confidence-chart"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">Source Coverage</p>
+          <div class="mini-list" id="source-coverage"></div>
+        </div>
+      </section>
+    </section>
+
+    <section class="app-section active" data-section-panel="search">
+      <div class="section-head">
+        <div>
+          <p class="section-title">Search</p>
+          <h2>Full-text evidence search</h2>
+        </div>
+      </div>
+      <div class="search-console">
+        <input class="search" id="search" placeholder="Search logs, evidence, hostnames, MACs, IPs">
         <select id="category">
           <option value="all">All categories</option>
           <option value="wifi">WiFi</option>
@@ -47,148 +143,146 @@
           <option value="derived">Derived</option>
           <option value="mesh_last_observed">Mesh observed</option>
         </select>
-        <button id="refresh">Load Stored</button>
-        <button id="import-package" type="button">Import ZIP/JSON</button>
-        <input id="import-file" class="hidden-file" type="file" accept=".zip,.json,application/zip,application/json">
-        <button id="download-raw">Download Raw</button>
-        <button id="download-package">Forensic Package</button>
       </div>
-    </div>
-    <div class="settings">
-      <form class="wrap settings-inner" id="settings-form" autocomplete="off">
-        <label>FRITZ!Box IP<input id="cfg-address" autocomplete="username" placeholder="192.168.178.1"></label>
-        <label>Admin Password<input id="cfg-password" type="password" autocomplete="current-password" placeholder="Leave blank to keep saved"></label>
-        <label>Acquisition Window<select id="hours"><option value="24">24h</option><option value="168">7d</option><option value="720">30d</option><option value="3000" selected>All retained</option></select></label>
-        <button id="save-settings" type="button">Save Settings</button>
-        <button id="run-acquisition" type="button">Run Acquisition</button>
-      </form>
-      <div class="wrap settings-note" id="settings-note">Settings are stored locally in fritzbox-analysis.sqlite3.</div>
-    </div>
-  </header>
-  <main class="wrap">
-    <section class="forensic-notice" id="forensic-notice">
-      <strong>Evidence model:</strong> this tool shows what the FRITZ!Box retained and exposed at acquisition time.
-      Absence of a row is not proof an event did not happen. Mesh observations are inferred context, not exact WiFi join times.
+      <div class="subnav" aria-label="Search views">
+        <button class="tab active" type="button" data-view="all">All Evidence</button>
+        <button class="tab" type="button" data-view="timeline">Timeline</button>
+        <button class="tab" type="button" data-view="log">Router Log</button>
+        <button class="tab" type="button" data-view="wifi">WiFi Connections</button>
+        <button class="tab" type="button" data-view="raw">Raw Artifacts</button>
+      </div>
+      <section class="workspace">
+        <aside>
+          <p class="section-title">Recent Signal</p>
+          <div class="timeline" id="timeline"></div>
+          <div class="entity-panel">
+            <p class="section-title">Entities</p>
+            <div class="entity-list" id="entities"></div>
+          </div>
+        </aside>
+        <div>
+          <div class="table-head">
+            <div>
+              <p class="section-title">Parsed Fields</p>
+              <h3 id="table-title">All Evidence</h3>
+            </div>
+            <div class="subtitle">Open a row for raw evidence matches.</div>
+          </div>
+          <div class="section-table search-table-slot" data-shared-table-slot="search">
+            <div class="table-shell" id="table"></div>
+          </div>
+        </div>
+      </section>
     </section>
-    <section class="acquisition-panel">
-      <div>
-        <p class="section-title">Acquisition Status</p>
-        <div class="status-grid" id="acquisition-status">
-          <span>No stored acquisition loaded.</span>
+
+    <section class="app-section" data-section-panel="devices">
+      <div class="section-head">
+        <div>
+          <p class="section-title">Devices</p>
+          <h2>Entities, presence, and host inventory</h2>
         </div>
       </div>
-      <div class="limit-strip">
-        <span class="pill parsed_from_raw">Exact retained log</span>
-        <span class="pill inferred">Inferred context</span>
-        <span class="pill enriched_from_current_host_table">Host table context</span>
+      <div class="subnav" aria-label="Device views">
+        <button class="tab" type="button" data-view="entities">Entities</button>
+        <button class="tab" type="button" data-view="presence">Presence</button>
+        <button class="tab" type="button" data-view="hosts">Host Table</button>
+        <button class="tab" type="button" data-view="device_risk_summaries">Device Risk</button>
       </div>
-    </section>
-    <section class="forensic-bar">
-      <label>Start Time<input id="range-start" type="datetime-local"></label>
-      <label>End Time<input id="range-end" type="datetime-local"></label>
-      <label>Poll Interval<select id="poll-interval"><option value="5">5 min</option><option value="10">10 min</option><option value="15" selected>15 min</option></select></label>
-      <label>Polling State<div class="check-row" id="poll-status">Stopped</div></label>
-      <button id="apply-range">Apply Range</button>
-      <button id="toggle-poll">Start Polling</button>
-    </section>
-    <section class="metrics">
-      <div class="metric"><div class="label">WiFi Rows</div><div class="value" id="m-wifi">0</div><div class="accent"></div></div>
-      <div class="metric"><div class="label">Retained Logs</div><div class="value" id="m-log">0</div><div class="accent"></div></div>
-      <div class="metric"><div class="label">Known Hosts</div><div class="value" id="m-hosts">0</div><div class="accent"></div></div>
-      <div class="metric"><div class="label">Active Hosts</div><div class="value" id="m-active">0</div><div class="accent"></div></div>
-      <div class="metric"><div class="label">Last Device Use</div><div class="value small" id="m-last">None retained</div><div class="accent"></div></div>
-    </section>
-    <section class="charts">
-      <div class="chart-panel">
-        <p class="section-title">Connection / Event High Times</p>
-        <div class="bar-chart" id="hour-chart"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Event Classes</p>
-        <div class="mini-list" id="category-chart"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Evidence Confidence</p>
-        <div class="mini-list" id="confidence-chart"></div>
-      </div>
-    </section>
-    <section class="forensic-grid">
-      <div class="chart-panel">
-        <p class="section-title">Interface Mix</p>
-        <div class="mini-list" id="interface-chart"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Device Timestamp Coverage</p>
-        <div class="mini-list" id="timestamp-chart"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">WLAN Radios</p>
-        <div class="mini-list" id="wlan-radio-list"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">WAN State</p>
-        <div class="mini-list" id="wan-state"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Mesh Links</p>
-        <div class="mini-list" id="mesh-links"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">WAN Exposure</p>
-        <div class="mini-list" id="wan-exposure"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Device Risk</p>
-        <div class="mini-list" id="device-risk"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Last-Used Histogram</p>
-        <div class="histogram" id="last-used-histogram"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Device Presence</p>
-        <div class="mini-list" id="presence-summary"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Advertisements / Broadcast Hints</p>
-        <div class="mini-list" id="advertisement-hints"></div>
-      </div>
-      <div class="chart-panel">
-        <p class="section-title">Source Coverage</p>
-        <div class="mini-list" id="source-coverage"></div>
-      </div>
-    </section>
-    <div class="tabs">
-      <button class="tab active" data-view="timeline">Timeline</button>
-      <button class="tab" data-view="wifi">WiFi Connections</button>
-      <button class="tab" data-view="log">Router Log</button>
-      <button class="tab" data-view="presence">Device Presence</button>
-      <button class="tab" data-view="hosts">Host Table</button>
-      <button class="tab" data-view="support">Support Data</button>
-      <button class="tab" data-view="raw">Raw Artifacts</button>
-      <button class="tab" data-view="wan_port_mappings">WAN Exposure</button>
-      <button class="tab" data-view="mesh_topology_links">Mesh Links</button>
-      <button class="tab" data-view="wlan_radios">WLAN Radios</button>
-      <button class="tab" data-view="wlan_associations">WLAN Associations</button>
-      <button class="tab" data-view="advertisement_hints">Ad / Broadcast Hints</button>
-      <button class="tab" data-view="network_status_snapshots">Network Status</button>
-      <button class="tab" data-view="host_filter_profiles">Host Filters</button>
-      <button class="tab" data-view="device_risk_summaries">Device Risk</button>
-      <button class="tab" data-view="entities">Entity Pivot</button>
-    </div>
-    <p class="status" id="status"></p>
-    <section class="workspace">
-      <aside>
-        <p class="section-title">Recent Signal</p>
-        <div class="timeline" id="timeline"></div>
-        <div class="entity-panel">
-          <p class="section-title">Entities</p>
-          <div class="entity-list" id="entities"></div>
+      <section class="forensic-grid">
+        <div class="chart-panel">
+          <p class="section-title">Device Presence</p>
+          <div class="mini-list" id="presence-summary"></div>
         </div>
-      </aside>
-      <div class="table-shell" id="table"></div>
+        <div class="chart-panel">
+          <p class="section-title">Device Timestamp Coverage</p>
+          <div class="mini-list" id="timestamp-chart"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">Interface Mix</p>
+          <div class="mini-list" id="interface-chart"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">Device Risk</p>
+          <div class="mini-list" id="device-risk"></div>
+        </div>
+        <div class="chart-panel wide">
+          <p class="section-title">Last-Used Histogram</p>
+          <div class="histogram" id="last-used-histogram"></div>
+        </div>
+      </section>
+      <div class="section-table" data-shared-table-slot="devices"></div>
+    </section>
+
+    <section class="app-section" data-section-panel="network">
+      <div class="section-head">
+        <div>
+          <p class="section-title">Network</p>
+          <h2>Wireless, mesh, WAN, and broadcast signals</h2>
+        </div>
+      </div>
+      <div class="subnav" aria-label="Network views">
+        <button class="tab" type="button" data-view="wlan_associations">WLAN Associations</button>
+        <button class="tab" type="button" data-view="wlan_radios">WLAN Radios</button>
+        <button class="tab" type="button" data-view="mesh_topology_links">Mesh Links</button>
+        <button class="tab" type="button" data-view="wan_port_mappings">WAN Exposure</button>
+        <button class="tab" type="button" data-view="network_status_snapshots">Network Status</button>
+        <button class="tab" type="button" data-view="advertisement_hints">Ad / Broadcast Hints</button>
+      </div>
+      <section class="forensic-grid">
+        <div class="chart-panel">
+          <p class="section-title">WLAN Radios</p>
+          <div class="mini-list" id="wlan-radio-list"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">WAN State</p>
+          <div class="mini-list" id="wan-state"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">Mesh Links</p>
+          <div class="mini-list" id="mesh-links"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">WAN Exposure</p>
+          <div class="mini-list" id="wan-exposure"></div>
+        </div>
+        <div class="chart-panel wide">
+          <p class="section-title">Advertisements / Broadcast Hints</p>
+          <div class="mini-list" id="advertisement-hints"></div>
+        </div>
+      </section>
+      <div class="section-table" data-shared-table-slot="network"></div>
+    </section>
+
+    <section class="app-section" data-section-panel="artifacts">
+      <div class="section-head">
+        <div>
+          <p class="section-title">Artifacts</p>
+          <h2>Raw sources, findings, filters, and exports</h2>
+        </div>
+        <div class="header-actions">
+          <button id="artifact-download-raw" type="button">Download Raw</button>
+          <button id="artifact-download-package" type="button">Forensic Package</button>
+        </div>
+      </div>
+      <div class="subnav" aria-label="Artifact views">
+        <button class="tab" type="button" data-view="raw">Raw Artifacts</button>
+        <button class="tab" type="button" data-view="support">Support Findings</button>
+        <button class="tab" type="button" data-view="host_filter_profiles">Host Filters</button>
+      </div>
+      <section class="forensic-grid">
+        <div class="chart-panel wide">
+          <p class="section-title">Source Coverage</p>
+          <div class="mini-list" id="artifact-source-coverage"></div>
+        </div>
+        <div class="chart-panel">
+          <p class="section-title">Evidence Confidence</p>
+          <div class="mini-list" id="artifact-confidence-chart"></div>
+        </div>
+      </section>
+      <div class="section-table" data-shared-table-slot="artifacts"></div>
     </section>
   </main>
+
   <div class="drawer" id="drawer">
     <div class="drawer-backdrop" id="drawer-close-backdrop"></div>
     <div class="drawer-panel">
@@ -197,7 +291,7 @@
           <h2 style="margin:0;font-size:18px;">Evidence</h2>
           <div class="subtitle">Parsed row and matching retained raw artifact snippet</div>
         </div>
-        <button id="drawer-close">Close</button>
+        <button id="drawer-close" type="button">Close</button>
       </div>
       <div id="drawer-body"></div>
     </div>

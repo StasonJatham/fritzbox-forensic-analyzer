@@ -6,7 +6,8 @@ const state = {
   runId: "latest",
   data: null,
   analysis: null,
-  view: "timeline",
+  section: "search",
+  view: "all",
   query: "",
   category: "all",
   evidenceLevel: "all",
@@ -25,6 +26,33 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+const SECTION_DEFAULT_VIEWS = {
+  search: "all",
+  devices: "entities",
+  network: "wlan_associations",
+  artifacts: "raw"
+};
+
+const VIEW_LABELS = {
+  all: "All Evidence",
+  timeline: "Timeline",
+  log: "Router Log",
+  wifi: "WiFi Connections",
+  raw: "Raw Artifacts",
+  entities: "Entities",
+  presence: "Device Presence",
+  hosts: "Host Table",
+  device_risk_summaries: "Device Risk",
+  wlan_associations: "WLAN Associations",
+  wlan_radios: "WLAN Radios",
+  mesh_topology_links: "Mesh Links",
+  wan_port_mappings: "WAN Exposure",
+  network_status_snapshots: "Network Status",
+  advertisement_hints: "Ad / Broadcast Hints",
+  support: "Support Findings",
+  host_filter_profiles: "Host Filters"
+};
 
 function text(value) {
   return value === null || value === undefined ? "" : String(value);
@@ -419,6 +447,7 @@ function renderCharts() {
   }).join("");
   renderMiniChart("category-chart", analysis.category_counts || []);
   renderMiniChart("confidence-chart", analysis.confidence_counts || []);
+  renderMiniChart("artifact-confidence-chart", analysis.confidence_counts || []);
   renderMiniChart("interface-chart", analysis.interface_counts || []);
   renderMiniChart("timestamp-chart", Object.entries(analysis.timestamp_coverage || {}).map(([label, count]) => ({ label, count })));
   renderMeshLinks(analysis.mesh_summary || {});
@@ -433,6 +462,7 @@ function renderCharts() {
 }
 
 function renderMiniChart(id, rows) {
+  if (!$(id)) return;
   const max = Math.max(1, ...rows.map((row) => row.count || 0));
   $(id).innerHTML = rows.length ? rows.slice(0, 7).map((row) => `
     <div>
@@ -469,7 +499,9 @@ function renderSourceCoverage(coverage) {
       </div>
     </div>
   `).join("");
-  $("source-coverage").innerHTML = details || summary || `<div class="empty">No source coverage data.</div>`;
+  const html = details || summary || `<div class="empty">No source coverage data.</div>`;
+  $("source-coverage").innerHTML = html;
+  if ($("artifact-source-coverage")) $("artifact-source-coverage").innerHTML = html;
 }
 
 function renderWlanRadios(radios) {
@@ -644,7 +676,13 @@ function renderTable() {
     $("status").textContent = `0 of ${state.total} rows`;
     return;
   }
-  if (state.view === "wifi") {
+  if (state.view === "all") {
+    $("table").innerHTML = table([
+      ["Action", ""], ["Type", "record_type"], ["Record", "record_id"], ["Parsed / Raw Text", ""]
+    ], rows.map((row) => [
+      rowAction(row), evidenceLabel(row.record_type), row.record_id, row.content
+    ]), rows);
+  } else if (state.view === "wifi") {
     $("table").innerHTML = table([
       ["Action", ""], ["Derived Time", "derived_connected_at"], ["Type", "type"], ["Host", "hostname"], ["MAC", "mac"],
       ["IP", "ip"], ["Confidence", "evidence"], ["Source", "source"], ["Evidence", "evidence"]
@@ -855,6 +893,7 @@ function table(headers, rows, sourceRows = []) {
 
 function defaultSortForView(view) {
   if (view === "hosts") return "last_activity";
+  if (view === "all") return "record_type";
   if (view === "presence") return "last_activity";
   if (view === "log") return "timestamp";
   if (view === "timeline") return "timestamp";
@@ -968,6 +1007,53 @@ async function togglePolling() {
   await loadPolling();
 }
 
+function moveSharedTable(section) {
+  const tableElement = $("table");
+  const targetSection = section === "overview" ? "search" : section;
+  const slot = document.querySelector(`[data-shared-table-slot="${targetSection}"]`);
+  if (slot && tableElement && tableElement.parentElement !== slot) {
+    slot.appendChild(tableElement);
+  }
+}
+
+function updateViewChrome() {
+  document.querySelectorAll(".section-tab").forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.section === state.section);
+  });
+  document.querySelectorAll("[data-section-panel]").forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.sectionPanel === state.section);
+  });
+  document.querySelectorAll(".tab").forEach((tab) => {
+    const panel = tab.closest("[data-section-panel]");
+    const activeSection = panel?.dataset.sectionPanel === state.section;
+    tab.classList.toggle("active", activeSection && tab.dataset.view === state.view);
+  });
+  if ($("category")) $("category").disabled = !["log", "timeline"].includes(state.view);
+  if ($("table-title")) $("table-title").textContent = VIEW_LABELS[state.view] || evidenceLabel(state.view);
+}
+
+function setView(view, { load = true } = {}) {
+  state.view = view;
+  state.sortBy = defaultSortForView(state.view);
+  state.sortDir = "desc";
+  updateViewChrome();
+  if (load) loadRows(true);
+}
+
+function setSection(section, { load = true, preserveView = false } = {}) {
+  state.section = section;
+  updateViewChrome();
+  if (section === "overview") return;
+  moveSharedTable(section);
+  const nextView = preserveView ? state.view : (SECTION_DEFAULT_VIEWS[section] || state.view);
+  if (state.view !== nextView) {
+    setView(nextView, { load });
+    return;
+  }
+  updateViewChrome();
+  if (load) loadRows(true);
+}
+
 function debounce(fn, delay = 220) {
   let timer;
   return (...args) => {
@@ -988,14 +1074,15 @@ async function readError(response) {
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-    tab.classList.add("active");
-    state.view = tab.dataset.view;
-    state.sortBy = defaultSortForView(state.view);
-    state.sortDir = "desc";
-    $("category").disabled = !["log", "timeline"].includes(state.view);
-    loadRows(true);
+    const panel = tab.closest("[data-section-panel]");
+    const section = panel?.dataset.sectionPanel || state.section;
+    setSection(section, { load: false, preserveView: true });
+    setView(tab.dataset.view);
   });
+});
+
+document.querySelectorAll(".section-tab").forEach((tab) => {
+  tab.addEventListener("click", () => setSection(tab.dataset.section));
 });
 
 $("table").addEventListener("click", (event) => {
@@ -1068,6 +1155,8 @@ $("download-raw").addEventListener("click", () => {
 $("download-package").addEventListener("click", () => {
   window.location.href = `/api/acquisition-package/download?profile=${encodeURIComponent(state.profile)}`;
 });
+$("artifact-download-raw").addEventListener("click", () => $("download-raw").click());
+$("artifact-download-package").addEventListener("click", () => $("download-package").click());
 $("save-settings").addEventListener("click", saveSettings);
 $("toggle-poll").addEventListener("click", togglePolling);
 $("table").addEventListener("scroll", () => {
@@ -1103,7 +1192,7 @@ $("drawer-body").addEventListener("click", (event) => {
 });
 $("drawer-close").addEventListener("click", () => $("drawer").classList.remove("open"));
 $("drawer-close-backdrop").addEventListener("click", () => $("drawer").classList.remove("open"));
-$("category").disabled = false;
+setSection("search", { load: false });
 loadSettings().then(async () => {
   await loadProfiles();
   await loadRuns();
