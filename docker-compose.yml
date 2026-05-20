@@ -1,0 +1,16 @@
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      FRITZBOX_ANALYSIS_DB: /app/data/fritzbox-analysis.sqlite3
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - fritzbox-forensic-data:/app/data
+
+volumes:
+  fritzbox-forensic-data:

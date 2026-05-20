@@ -1,0 +1,31 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Local credentials and forensic evidence
+.env
+.fritzbox.env
+fritzbox-analysis.sqlite3
+fritzbox-analysis.sqlite3-*
+*.sqlite3
+*.sqlite3-*
+fritzbox_raw_exports/
+raw_artifacts/
+exports/
+fritzbox-export*.json
+fritzbox-wifi-history*.json
+forensic-package*.zip
+acquisition-package*.zip
+*.zip
+*.csv
+*.jsonl
+
+# Local UI/debug artifacts
+.playwright-cli/
+dashboard-screenshot.png
+*.log

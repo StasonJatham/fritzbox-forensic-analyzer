@@ -1,0 +1,139 @@
+from pathlib import Path
+
+from fritzbox_log_store import get_settings, ingest_dataset, init_db, query_records, save_settings
+
+
+def test_query_records_uses_backend_fts_and_pagination(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.23",
+                    "mac": None,
+                    "message": "Anmeldung falsches Kennwort",
+                }
+            ],
+            "available_wifi_connections": [
+                {
+                    "derived_connected_at": "2026-05-20T11:00:00+02:00",
+                    "derived_time_type": "mesh_last_observed",
+                    "derived_time_confidence": "low",
+                    "exact_connection_time_available": False,
+                    "event": "known_wifi_device",
+                    "hostname": "iPhone",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.21",
+                    "source": "mesh_list",
+                    "confidence": "known_wifi_device_no_connection_timestamp",
+                    "message": "Known WLAN device",
+                }
+            ],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    wifi = query_records(db, "iphone", "wifi", limit=10, offset=0)
+    log = query_records(db, "falsches kennwort", "log", limit=1, offset=0, category="auth")
+
+    assert wifi["total"] == 1
+    assert wifi["rows"][0]["hostname"] == "iPhone"
+    assert log["total"] == 1
+    assert log["rows"][0]["ip"] == "192.0.2.23"
+
+
+def test_settings_store_preserves_password_when_blank(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    saved = save_settings(
+        {
+            "address": "192.168.178.1",
+            "user": "analyst",
+            "password": "secret",
+            "port": 49000,
+            "tls": False,
+        },
+        db,
+    )
+    save_settings({"address": "192.168.178.2", "user": "", "password": "", "port": 49443, "tls": True}, db)
+    public = get_settings(db)
+    private = get_settings(db, include_secret=True)
+
+    assert saved["has_password"] is True
+    assert public["address"] == "192.168.178.2"
+    assert public["user"] == ""
+    assert public["has_password"] is True
+    assert "password" not in public
+    assert private["password"] == "secret"
+    assert private["tls"] is True
+
+
+def test_query_records_sorts_and_pages(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {},
+            "event_log": [
+                {"timestamp": "2026-05-20T10:00:00+02:00", "category": "system", "ip": None, "mac": None, "message": "older"},
+                {"timestamp": "2026-05-20T11:00:00+02:00", "category": "system", "ip": None, "mac": None, "message": "newer"},
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    first = query_records(db, "", "log", limit=1, offset=0, sort_by="timestamp", sort_dir="asc")
+    second = query_records(db, "", "log", limit=1, offset=1, sort_by="timestamp", sort_dir="asc")
+
+    assert first["total"] == 2
+    assert first["rows"][0]["message"] == "older"
+    assert second["rows"][0]["message"] == "newer"
+
+
+def test_ingest_preserves_repeated_observations_per_run(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    dataset = {
+        "generated_at": "2026-05-20T12:00:00+02:00",
+        "window_hours": 100,
+        "router": {"address": "192.168.178.1"},
+        "summary": {},
+        "raw_exports": {"device_log_xml": "<DeviceLog />"},
+        "event_log": [
+            {
+                "timestamp": "2026-05-20T12:00:00+02:00",
+                "category": "auth",
+                "ip": "192.0.2.23",
+                "mac": None,
+                "message": "Anmeldung falsches Kennwort",
+            }
+        ],
+        "available_wifi_connections": [],
+        "known_hosts": [],
+    }
+
+    ingest_dataset(dataset, db)
+    ingest_dataset(dataset, db)
+
+    conn = init_db(db)
+    try:
+        canonical_events = conn.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]
+        observations = conn.execute("SELECT COUNT(*) FROM record_observations WHERE record_type = 'event_log'").fetchone()[0]
+        evidence = conn.execute("SELECT evidence_level FROM event_log LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert canonical_events == 1
+    assert observations == 2
+    assert evidence == "parsed_from_raw"

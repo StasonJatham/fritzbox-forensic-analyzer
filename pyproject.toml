@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fritzbox-forensic-analyzer"
+version = "0.1.0"
+description = "Local FRITZ!Box forensic log analyzer with raw evidence preservation, SQLite full-text search, and an analyst dashboard."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "StasonJatham" }]
+keywords = [
+  "fritzbox",
+  "fritzbox forensics",
+  "avm",
+  "router logs",
+  "wifi connection history",
+  "tr-064",
+  "network forensics",
+  "incident response",
+  "soc analyst",
+  "sqlite fts"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Web Environment",
+  "Framework :: FastAPI",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: System :: Networking :: Monitoring"
+]
+dependencies = [
+  "fastapi>=0.111",
+  "fritzconnection>=1.15",
+  "uvicorn[standard]>=0.30"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "ruff>=0.8"
+]
+
+[project.urls]
+Homepage = "https://github.com/StasonJatham/fritzbox-forensic-analyzer"
+Repository = "https://github.com/StasonJatham/fritzbox-forensic-analyzer"
+Issues = "https://github.com/StasonJatham/fritzbox-forensic-analyzer/issues"
+
+[project.scripts]
+fritzbox-wifi-export = "fritzbox_wifi_export:main"
+fritzbox-forensics-dashboard = "fritzbox_wifi_dashboard:main"
+
+[tool.setuptools]
+py-modules = ["fritzbox_wifi_export", "fritzbox_log_store", "fritzbox_wifi_dashboard"]
+include-package-data = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
