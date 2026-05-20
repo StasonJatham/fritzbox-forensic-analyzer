@@ -1,5 +1,9 @@
 # FRITZ!Box Forensic Analyzer
 
+<p align="center">
+  <img src="static/logo.svg" alt="FRITZ!Box Forensic Analyzer logo" width="128">
+</p>
+
 Local FRITZ!Box forensic analysis for AVM router logs, WiFi connection history, host tables, TR-064 data, and retained raw evidence. The tool collects the data a FRITZ!Box still exposes, stores it in SQLite with full-text search, and presents it in a clean SOC analyst dashboard for timeline review, entity pivoting, and evidence validation.
 
 This project is built for local incident response and home-network forensics. It does not use packet capture and does not need tcpdump.
