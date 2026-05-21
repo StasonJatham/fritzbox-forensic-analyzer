@@ -14,6 +14,9 @@ fritzbox-analysis.sqlite3
 fritzbox-analysis.sqlite3-*
 *.sqlite3
 *.sqlite3-*
+*.db
+*.db-*
+*.egg-info/
 fritzbox_raw_exports/
 raw_artifacts/
 exports/
@@ -28,5 +31,6 @@ acquisition-package*.zip
 
 # Local UI/debug artifacts
 .playwright-cli/
+output/
 dashboard-screenshot.png
 *.log

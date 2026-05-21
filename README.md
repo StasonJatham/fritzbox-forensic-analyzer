@@ -18,6 +18,25 @@ This project is built for local incident response and home-network forensics. It
 - Imports previously exported forensic packages or JSON datasets as separate analysis profiles, so analysts can switch between multiple FRITZ!Boxes without merging evidence into one dataset.
 - Preserves evidence confidence labels so exact log entries are not confused with inferred observations.
 
+## Documentation
+
+The [docs](docs/README.md) directory contains the detailed FRITZ!Box forensics reference:
+
+- [Data Sources](docs/data-sources.md): endpoint-by-endpoint mapping from FRITZ!Box surfaces to raw artifacts, parsed tables, forensic value, and caveats.
+- [Evidence Model](docs/evidence-model.md): how raw artifacts become SQLite rows, FTS records, investigation results, and confidence labels.
+- [Python Examples](docs/python-examples.md): small scripts for TR-064, AVM export paths, `query.lua`, `data.lua`, support data, and SQLite FTS.
+- [Limitations](docs/limitations.md): what can and cannot be proven from retained FRITZ!Box data.
+
+Example scripts:
+
+```bash
+python docs/examples/tr064_device_log.py
+python docs/examples/avm_export_paths.py
+python docs/examples/webui_lua_sources.py
+python docs/examples/support_data_download.py
+python docs/examples/sqlite_full_text_search.py "failed login"
+```
+
 ## Forensic Scope
 
 The analyzer is useful for FRITZ!Box forensic triage when the router is the only available data source. It can help answer questions such as:
@@ -42,6 +61,8 @@ Maximum acquisition mode also attempts firmware-dependent telephony, AHA/smart-h
 
 ## Quick Start
 
+For a minimal local runbook after moving the project to `/Users/karl/Code/fritzforensic`, see [LOCAL_START.md](LOCAL_START.md).
+
 ```bash
 git clone https://github.com/StasonJatham/fritzbox-forensic-analyzer.git
 cd fritzbox-forensic-analyzer
@@ -62,6 +83,8 @@ The UI only requires the FRITZ!Box IP address and admin password. It auto-detect
 
 Use **Forensic Package** to export a full analysis package. Use **Import Package** to load that ZIP, or a CLI JSON dataset, later as a separate profile, then switch between profiles from the router/profile selector in the header.
 
+Acquisition is a background pipeline, not a single blocking web request. The dashboard enqueues one acquisition job at a time, reports stage progress, writes every successful endpoint response immediately under `output/raw-acquisition-*`, records failed endpoints as local `.error.txt` files plus manifest rows, and parses/imports into SQLite afterward. A bad `data.lua`, `query.lua`, support-data, or TR-064 action should reduce source coverage, not fail the whole run.
+
 ## CLI Export
 
 ```bash
@@ -81,7 +104,33 @@ FRITZBOX_USER=
 FRITZBOX_PASSWORD=change-me
 FRITZBOX_PORT=49000
 FRITZBOX_TLS=0
+FRITZBOX_REQUEST_TIMEOUT=20
+FRITZBOX_WEBUI_TIMEOUT=12
+FRITZBOX_ACQUISITION_DELAY=0.75
+FRITZBOX_HARD_TIMEOUT=30
+FRITZBOX_SUPPORT_HARD_TIMEOUT=180
+FRITZBOX_DYNAMIC_TR064_MAX_ACTIONS=220
+FRITZBOX_MAX_HOSTS=512
+FRITZBOX_MAX_PORT_MAPPINGS=512
+FRITZBOX_MAX_WLAN_ASSOCIATIONS=256
+FRITZBOX_LOG_LEVEL=INFO
+FRITZBOX_LOG_FILE=logs/fritzforensic.log
 ```
+
+Runtime logs are written to `logs/fritzforensic.log` by default with rotation. Use `FRITZBOX_LOG_LEVEL=DEBUG` for endpoint-by-endpoint acquisition debugging. Secret-looking values such as SIDs, passwords, tokens, and keys are redacted before they hit the log file.
+
+## DynDNS + WireGuard Planner
+
+The project includes a dry-run helper for repeatable FRITZ!Box remote-access setup planning:
+
+```bash
+fritzbox-vpn-provision --env-example
+fritzbox-vpn-provision --output vpn-plan.json
+```
+
+The planner reads current router state, checks custom DynDNS and existing WireGuard/VPN entries, then reports idempotent steps. It does **not** change router settings by default. `--apply` is intentionally disabled until a firmware-specific Web UI write workflow is mapped and tested for the target FRITZ!OS version.
+
+Why dry-run first: FRITZ!Box exposes useful read-only state through TR-064 and internal Lua pages, but adding a WireGuard single-device connection is a Web UI wizard flow and may require router confirmation. The helper refuses to replace existing DynDNS domains or matching WireGuard client names unless explicit replacement flags are configured.
 
 ## Docker
 
@@ -92,6 +141,10 @@ docker compose up --build
 ```
 
 The dashboard binds to `127.0.0.1:8765` by default. The SQLite database is stored in a Docker volume.
+
+## Dashboard Security
+
+Keep the dashboard bound to `127.0.0.1` unless you are on a trusted network and understand the evidence exposure. Non-local binds require `FRITZBOX_ALLOW_PUBLIC_BIND=1`; when public bind is enabled, `/api/*` requires `FRITZBOX_API_TOKEN` via `X-API-Token` or `Authorization: Bearer`.
 
 ## Data Model
 

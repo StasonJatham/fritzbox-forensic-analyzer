@@ -54,12 +54,21 @@ Issues = "https://github.com/StasonJatham/fritzbox-forensic-analyzer/issues"
 [project.scripts]
 fritzbox-wifi-export = "fritzbox_wifi_export:main"
 fritzbox-forensics-dashboard = "fritzbox_wifi_dashboard:main"
+fritzbox-vpn-provision = "fritzbox_vpn_provision:main"
 
 [tool.setuptools]
 py-modules = [
+  "fritzbox_api_models",
   "fritzbox_collectors",
+  "fritzbox_live_capture",
+  "fritzbox_logging",
   "fritzbox_log_store",
   "fritzbox_parsers",
+  "fritzbox_raw_acquisition",
+  "fritzbox_siem",
+  "fritzbox_siem_coverage",
+  "fritzbox_siem_parser",
+  "fritzbox_vpn_provision",
   "fritzbox_wifi_dashboard",
   "fritzbox_wifi_export"
 ]

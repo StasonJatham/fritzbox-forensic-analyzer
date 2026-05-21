@@ -7,9 +7,95 @@ import re
 from typing import Any, Iterable
 import xml.etree.ElementTree as ET
 
+from fritzbox_siem_parser import parse_fritzbox_log_message
+
 LOG_TS_RE = re.compile(
     r"^(?P<date>\d{1,2}\.\d{1,2}\.(?:\d{2}|\d{4}))\s+"
     r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s+(?P<message>.*)$"
+)
+SUPPORT_TS_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})\s+"
+    r"(?P<time>\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\s+-\s+(?P<message>.*)$"
+)
+STEERING_HISTORY_RE = re.compile(
+    r"OPTIMISATION\s+RCPI\s+STA\s+(?P<sta>[0-9a-fA-F:]{17})\s+"
+    r"from\s+(?P<source_bssid>[0-9a-fA-F:]{17})\s+"
+    r"\(RX\s+(?P<source_rssi>-?\d+)\s+dBm\)\s+"
+    r"start\s+(?P<start>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+"
+    r"\([^)]+\)\s+mode\s+(?P<mode>\S+)\s+to\s+(?P<target>.*?)\s+"
+    r"(?:(?:moved)\s+(?P<moved>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\([^)]+\)\s+)?"
+    r"ended\s+with\s+(?P<result>.*?)\s+at\s+(?P<end>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+    re.I,
+)
+WLAN_EVENTS_ROW_RE = re.compile(
+    r"^\s*(?P<timestamp>\d{8}-\d{6})\s*/\s*"
+    r"(?P<iface>[^/]+?)\s*/\s*"
+    r"(?P<mac>[0-9a-fA-F:]{17})\s*/\s*"
+    r"(?P<event_id>\d+)\s*/\s*"
+    r"(?P<band>\d+)\s*/\s*"
+    r"(?P<rate>\d+)\s*/.*?/\s*"
+    r"(?P<channel>\d+)\s*/\s*"
+    r"(?P<prev_channel>\d+)\s*/\s*"
+    r"(?P<details>0x[0-9a-fA-F]+)\s*$"
+)
+STATION_HISTORY_ROW_RE = re.compile(
+    r"^\s*(?P<role>\d+)\s*/\s*(?P<iface>ath\d+)\s*/\s*"
+    r"(?P<connected>\d{8}-\d{6}|)\s*"
+    r"\((?P<connect_status>0x[0-9a-fA-F]+)\s+(?P<connect_initiator>0x[0-9a-fA-F]+)\s+"
+    r"(?P<connect_reason>0x[0-9a-fA-F]+)\)\s*/\s*"
+    r"(?P<disconnected>\d{8}-\d{6}|)\s*"
+    r"\((?P<disconnect_status>0x[0-9a-fA-F]+)\s+(?P<disconnect_initiator>0x[0-9a-fA-F]+)\s+"
+    r"(?P<disconnect_reason>0x[0-9a-fA-F]+)\)\s*/\s*"
+    r"(?P<wlan_mode>0x[0-9a-fA-F]+)\s*/\s*(?P<quality>\d+)\s*$"
+)
+WLAN_SCAN_RESULT_RE = re.compile(
+    r"^\[\s*(?P<index>\d+)\]:\s+'(?P<bssid>[0-9a-fA-F:]{17})'\s+"
+    r"(?P<frequency>\d+)/(?P<center_frequency>\d+)/\s*(?P<width>\S+)/(?P<flags>\S+)/\s*"
+    r"(?P<channel_low>\d+)-\s*(?P<channel_high>\d+)\s+'(?P<ssid>[^']*)'.*?"
+    r"(?P<rssi>-?\d+)\s+dBm\s+\[(?P<mode>[^\]]*)\]\s+\[(?P<caps>[^\]]*)\]",
+    re.I,
+)
+WLAN_SCAN_TIME_RE = re.compile(
+    r"^Scan time:\s*(?P<date>\d{1,2}\.\d{1,2}\.\d{4})\s+(?P<time>\d{1,2}:\d{2}:\d{2})",
+    re.I,
+)
+WLAN_SCAN_EVENT_RE = re.compile(
+    r"^\[(?P<index>\d+)\]\s+t=(?P<date>\d{1,2}\.\d{1,2}\.\d{4})\s+"
+    r"(?P<time>\d{1,2}:\d{2}:\d{2})/\[[^\]]+\]:\s+"
+    r"(?P<event>[A-Z_]+)\s*,\s+radio\s+'(?P<radio>[^']+)'(?:\s+\"(?P<reason>[^\"]*)\")?",
+    re.I,
+)
+WLAN_INTERFERENCE_RE = re.compile(
+    r"^\[(?P<index>\d+)\]\s+t=(?P<date>\d{1,2}\.\d{1,2}\.\d{4})\s+"
+    r"(?P<time>\d{1,2}:\d{2}:\d{2})/\[[^\]]+\]:\s+"
+    r"(?P<event>[A-Z_]+)\s*,\s+radio\s+'(?P<radio>[^']+)',\s+primary freq\s+"
+    r"(?P<frequency>\d+)\s+MHz,\s+(?P<state>active|inactive),\s+"
+    r"(?P<change>[^.]+)",
+    re.I,
+)
+WLAN_CHANNEL_LOAD_RE = re.compile(
+    r"^(?P<frequency>\d+)\s+MHz\s+\(\s*(?P<channel>\d+)\)\s+\|\s+(?P<load>\d+)\s+%",
+    re.I,
+)
+AP_STA_EVENT_RE = re.compile(
+    r"(?P<iface>ath\d+):\s+(?P<event>AP-STA-CONNECTED|AP-STA-DISCONNECTED|EAPOL-4WAY-HS-COMPLETED)\s+"
+    r"(?P<mac>[0-9a-fA-F:]{17})",
+    re.I,
+)
+WPA_HANDSHAKE_RE = re.compile(
+    r"(?P<iface>ath\d+):\s+STA\s+(?P<mac>[0-9a-fA-F:]{17})\s+WPA:\s+"
+    r"(?P<kind>pairwise|group)\s+key handshake completed\s+\((?P<cipher>[^)]+)\)",
+    re.I,
+)
+RADIUS_ACCOUNTING_RE = re.compile(
+    r"(?P<iface>ath\d+):\s+STA\s+(?P<mac>[0-9a-fA-F:]{17})\s+RADIUS:\s+"
+    r"starting accounting session\s+(?P<session>\S+)",
+    re.I,
+)
+ASSOCIATION_REQUEST_RE = re.compile(
+    r"STA\s+(?P<mac>[0-9a-fA-F:]{17}).*Association Request|"
+    r"Association Request.*STA\s+(?P<mac2>[0-9a-fA-F:]{17})",
+    re.I,
 )
 MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -21,6 +107,9 @@ WIFI_EVENT_KEYWORDS = (
     "wlan",
     "wi-fi",
     "wifi",
+    "802.11",
+    "ieee802.11",
+    "ieee 802.11",
 )
 CONNECTED_KEYWORDS = (
     "angemeldet",
@@ -28,6 +117,7 @@ CONNECTED_KEYWORDS = (
     "connected",
     "registered",
     "anmeldung",
+    "associated",
 )
 DISCONNECTED_KEYWORDS = (
     "abgemeldet",
@@ -35,6 +125,7 @@ DISCONNECTED_KEYWORDS = (
     "disconnected",
     "unregistered",
     "abmeldung",
+    "disassociated",
 )
 SUPPORT_KEYWORDS = (
     "auth",
@@ -66,6 +157,7 @@ class FritzLogEntry:
     timestamp: datetime | None
     message: str
     raw: str
+    source: str = "device_log"
 
 
 def parse_device_log_xml(content: str) -> str:
@@ -279,8 +371,13 @@ def parse_mesh_wifi_devices(content: str | None) -> list[dict[str, Any]]:
                     "ssid": iface.get("ssid") or None,
                     "security": iface.get("security"),
                     "current_channel": iface.get("current_channel"),
+                    "primary_frequency": (iface.get("current_channel_info") or {}).get("primary_freq"),
+                    "primary_center": (iface.get("current_channel_info") or {}).get("primary_center"),
                     "channel_width": (iface.get("current_channel_info") or {}).get("channel_width"),
                     "phymodes": iface.get("phymodes") or [],
+                    "latency_status_code": latency.get("status_code"),
+                    "rt_latency": metrics.get("rt_latency"),
+                    "ip_attributes": [addr.get("attributes") for addr in node.get("ip_addresses", [])],
                     "last_observed": last_observed,
                     "last_connected": None,
                     "source": "mesh_list",
@@ -484,22 +581,61 @@ def build_available_wifi_connections(
     records: list[dict[str, Any]] = []
     wlan_associations = wlan_associations or []
     for event in wifi_events:
+        event_name = event.get("event")
+        derived_time_type = "connection_event" if event_name == "connected" else "disconnect_or_other_event"
+        derived_confidence = "high" if event_name == "connected" else "medium"
+        if event_name == "authenticated":
+            derived_time_type = "80211_authentication_event"
+            derived_confidence = "medium"
+        elif event_name == "steering_observation":
+            derived_time_type = "80211_steering_history"
+            derived_confidence = "medium"
+        elif event_name == "station_history_interval":
+            derived_time_type = "80211_station_history_interval"
+            derived_confidence = "high"
+        elif event_name == "wlan_event_table_row":
+            derived_time_type = "80211_wlan_events_table"
+            derived_confidence = "medium"
+        elif event_name in {
+            "wpa_pairwise_handshake",
+            "wpa_group_handshake",
+            "radius_accounting_start",
+            "association_request_observed",
+            "ap_sta_connected",
+            "ap_sta_disconnected",
+            "eapol_4way_completed",
+        }:
+            derived_time_type = f"80211_{event_name}"
+            derived_confidence = "high" if event_name in {"ap_sta_connected", "wpa_pairwise_handshake"} else "medium"
+        timestamped_presence_events = {
+            "connected",
+            "steering_observation",
+            "station_history_interval",
+            "wlan_event_table_row",
+            "wpa_pairwise_handshake",
+            "wpa_group_handshake",
+            "radius_accounting_start",
+            "association_request_observed",
+            "ap_sta_connected",
+            "eapol_4way_completed",
+        }
+        exact_connection_events = {"connected", "station_history_interval", "ap_sta_connected"}
         records.append(
             {
                 "timestamp": event.get("timestamp"),
-                "derived_connected_at": event.get("timestamp") if event.get("event") == "connected" else None,
-                "derived_time_type": "connection_event"
-                if event.get("event") == "connected"
-                else "disconnect_or_other_event",
-                "derived_time_confidence": "high" if event.get("event") == "connected" else "medium",
-                "exact_connection_time_available": event.get("event") == "connected",
-                "event": event.get("event"),
+                "derived_connected_at": event.get("timestamp") if event_name in timestamped_presence_events else None,
+                "derived_time_type": derived_time_type,
+                "derived_time_confidence": derived_confidence,
+                "exact_connection_time_available": event_name in exact_connection_events,
+                "event": event_name,
                 "hostname": event.get("hostname"),
                 "mac": event.get("mac"),
                 "ip": event.get("ip"),
-                "last_connected": event.get("timestamp") if event.get("event") == "connected" else None,
-                "source": "device_log",
-                "confidence": "connection_event",
+                "last_connected": event.get("timestamp") if event_name in exact_connection_events else None,
+                "source": event.get("source") or "device_log",
+                "confidence": "support_steering_history"
+                if event_name == "steering_observation"
+                else event.get("confidence") or "connection_event",
                 "message": event.get("message"),
             }
         )
@@ -518,7 +654,11 @@ def build_available_wifi_connections(
                 "last_connected": device.get("last_connected"),
                 "source": device.get("source"),
                 "confidence": device.get("confidence"),
-                "message": f"Known WLAN device on channel {device.get('current_channel') or ''}".strip(),
+                "message": (
+                    f"Known WLAN device on channel {device.get('current_channel') or 'unknown'}, "
+                    f"frequency {device.get('primary_frequency') or 'unknown'} kHz, "
+                    f"width {device.get('channel_width') or 'unknown'}"
+                ),
             }
         )
     for assoc in wlan_associations:
@@ -545,40 +685,301 @@ def build_available_wifi_connections(
     return sorted(records, key=lambda item: item.get("timestamp") or "", reverse=True)
 
 
-def parse_device_log(raw_log: str) -> list[FritzLogEntry]:
+def parse_support_wifi_observations(content: str | None) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    observations: list[dict[str, Any]] = []
+    section = ""
+    current_station_mac: str | None = None
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        line = raw_line.rstrip()
+        section_candidate = support_section_title(line)
+        if section_candidate:
+            section = section_candidate
+            current_station_mac = None
+            continue
+        if "STATION_LIST" in section and re.match(r"^\s+mac\s+=", line):
+            current_station_mac = parse_mac(line) or current_station_mac
+            continue
+        wlan_row = WLAN_EVENTS_ROW_RE.match(line)
+        if wlan_row:
+            timestamp = parse_compact_support_timestamp(wlan_row.group("timestamp"))
+            event_id = wlan_row.group("event_id")
+            observations.append(
+                {
+                    "timestamp": timestamp.isoformat() if timestamp else None,
+                    "event": "wlan_event_table_row",
+                    "hostname": None,
+                    "mac": parse_mac(wlan_row.group("mac")),
+                    "ip": None,
+                    "interface": clean_dash(wlan_row.group("iface")),
+                    "radio_band": wlan_row.group("band"),
+                    "rate": wlan_row.group("rate"),
+                    "channel": wlan_row.group("channel"),
+                    "previous_channel": wlan_row.group("prev_channel"),
+                    "raw_event_id": event_id,
+                    "raw_details": wlan_row.group("details"),
+                    "source": "support_data_wlan_events",
+                    "confidence": "support_wlan_events_table",
+                    "message": (
+                        f"WLAN_EVENTS row: event_id={event_id} band={wlan_row.group('band')} "
+                        f"rate={wlan_row.group('rate')} channel={wlan_row.group('channel')} "
+                        f"details={wlan_row.group('details')}"
+                    ),
+                    "line_number": line_number,
+                }
+            )
+            continue
+        station_row = STATION_HISTORY_ROW_RE.match(line)
+        if station_row and current_station_mac:
+            connected_at = parse_compact_support_timestamp(station_row.group("connected"))
+            disconnected_at = parse_compact_support_timestamp(station_row.group("disconnected"))
+            if connected_at is None:
+                continue
+            observations.append(
+                {
+                    "timestamp": connected_at.isoformat(),
+                    "event": "station_history_interval",
+                    "hostname": None,
+                    "mac": current_station_mac,
+                    "ip": None,
+                    "interface": station_row.group("iface"),
+                    "role": station_row.group("role"),
+                    "disconnected_at": disconnected_at.isoformat() if disconnected_at else None,
+                    "connect_status": station_row.group("connect_status"),
+                    "connect_initiator": station_row.group("connect_initiator"),
+                    "connect_reason": station_row.group("connect_reason"),
+                    "disconnect_status": station_row.group("disconnect_status"),
+                    "disconnect_initiator": station_row.group("disconnect_initiator"),
+                    "disconnect_reason": station_row.group("disconnect_reason"),
+                    "wlan_mode": station_row.group("wlan_mode"),
+                    "quality": station_row.group("quality"),
+                    "source": "support_data_station_list",
+                    "confidence": "support_station_history_interval",
+                    "message": (
+                        f"STATION_LIST retained interval on {station_row.group('iface')}: "
+                        f"connected {station_row.group('connected')}, "
+                        f"disconnected {station_row.group('disconnected') or 'open'}, "
+                        f"quality {station_row.group('quality')}"
+                    ),
+                    "line_number": line_number,
+                }
+            )
+    return observations
+
+
+def parse_support_wlan_environment(
+    content: str | None, observed_at: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not content:
+        return [], []
+    scan_hints: list[dict[str, Any]] = []
+    status_rows: list[dict[str, Any]] = []
+    section = ""
+    scan_radio: str | None = None
+    scan_time: str | None = None
+    current_station_mac: str | None = None
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        section_candidate = support_section_title(line)
+        if section_candidate:
+            section = section_candidate
+            current_station_mac = None
+            if "WLAN_SCAN_RESULTS" not in section:
+                scan_radio = None
+                scan_time = None
+            continue
+
+        if "WLAN_SCAN_RESULTS" in section:
+            if line.startswith("Scan results for radio"):
+                scan_radio = first_quoted_value(line)
+                continue
+            scan_time_match = WLAN_SCAN_TIME_RE.match(line.strip())
+            if scan_time_match:
+                timestamp = parse_fritz_timestamp(scan_time_match.group("date"), scan_time_match.group("time"))
+                scan_time = timestamp.isoformat() if timestamp else observed_at
+                continue
+            scan_row = WLAN_SCAN_RESULT_RE.match(line.strip())
+            if scan_row:
+                scan_hints.append(
+                    {
+                        "observed_at": scan_time or observed_at,
+                        "hint_type": "wlan_environment_scan_bssid",
+                        "protocol": "802.11 scan result",
+                        "hostname": scan_row.group("ssid") or None,
+                        "mac": parse_mac(scan_row.group("bssid")),
+                        "ip": None,
+                        "direction": "neighbor_ap_seen_by_router",
+                        "confidence": "medium",
+                        "summary": (
+                            f"Nearby AP scan result on radio {scan_radio or 'unknown'}: "
+                            f"SSID '{scan_row.group('ssid') or '<hidden>'}', "
+                            f"RSSI {scan_row.group('rssi')} dBm, "
+                            f"frequency {scan_row.group('frequency')} MHz, "
+                            f"channels {scan_row.group('channel_low')}-{scan_row.group('channel_high')}, "
+                            f"mode {scan_row.group('mode').strip()}, caps {scan_row.group('caps').strip()}."
+                        ),
+                        "source": "support_wlan_scan_results",
+                    }
+                )
+                continue
+
+        if "SCAN_EVENTS" in section:
+            event = WLAN_SCAN_EVENT_RE.match(line.strip())
+            if event:
+                timestamp = parse_fritz_timestamp(event.group("date"), event.group("time"))
+                status_rows.append(
+                    {
+                        "observed_at": timestamp.isoformat() if timestamp else observed_at,
+                        "area": "wlan_scan_event",
+                        "metric": event.group("event").lower(),
+                        "value": event.group("radio"),
+                        "unit": event.group("reason") or "",
+                        "source": "support_scan_events",
+                        "confidence": "medium",
+                    }
+                )
+                continue
+
+        if "ENV_INTERFERENCE_HISTORY" in section:
+            interference = WLAN_INTERFERENCE_RE.match(line.strip())
+            if interference:
+                timestamp = parse_fritz_timestamp(interference.group("date"), interference.group("time"))
+                status_rows.append(
+                    {
+                        "observed_at": timestamp.isoformat() if timestamp else observed_at,
+                        "area": "wlan_interference",
+                        "metric": interference.group("event").lower(),
+                        "value": (
+                            f"radio {interference.group('radio')} {interference.group('state')} "
+                            f"{interference.group('frequency')} MHz"
+                        ),
+                        "unit": interference.group("change"),
+                        "source": "support_env_interference_history",
+                        "confidence": "medium",
+                    }
+                )
+                continue
+
+        if "WLAN_CHANNEL_INFO" in section:
+            load = WLAN_CHANNEL_LOAD_RE.match(line.strip())
+            if load:
+                status_rows.append(
+                    {
+                        "observed_at": observed_at,
+                        "area": "wlan_channel_load",
+                        "metric": f"channel_{load.group('channel')}",
+                        "value": load.group("load"),
+                        "unit": "%",
+                        "source": "support_wlan_channel_info",
+                        "confidence": "medium",
+                    }
+                )
+                continue
+
+        if "STATION_LIST" in section:
+            if re.match(r"^\s+mac\s+=", line):
+                current_station_mac = parse_mac(line) or current_station_mac
+                continue
+            counter_match = SUPPORT_KEY_VALUE_RE.match(line.strip())
+            if current_station_mac and counter_match:
+                key = counter_match.group("key").strip()
+                if key in {"cnt_connect_success", "cnt_connect_fail", "cnt_disconnect_forced", "time_mean_connect"}:
+                    status_rows.append(
+                        {
+                            "observed_at": observed_at,
+                            "area": "wlan_station_counters",
+                            "metric": key,
+                            "value": counter_match.group("value").strip(),
+                            "unit": "seconds" if key == "time_mean_connect" else "count",
+                            "source": "support_station_list",
+                            "confidence": "medium",
+                            "mac": current_station_mac,
+                        }
+                    )
+    return scan_hints, status_rows
+
+
+def first_quoted_value(value: str) -> str | None:
+    match = re.search(r"'([^']+)'", value)
+    return match.group(1) if match else None
+
+
+def parse_device_log(raw_log: str, source: str = "device_log") -> list[FritzLogEntry]:
     entries: list[FritzLogEntry] = []
     for raw_line in raw_log.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         match = LOG_TS_RE.match(line)
-        if match is None:
-            entries.append(FritzLogEntry(timestamp=None, message=line, raw=line))
-            continue
-        entries.append(
-            FritzLogEntry(
-                timestamp=parse_fritz_timestamp(match.group("date"), match.group("time")),
-                message=match.group("message").strip(),
-                raw=line,
+        if match is not None:
+            entries.append(
+                FritzLogEntry(
+                    timestamp=parse_fritz_timestamp(match.group("date"), match.group("time")),
+                    message=match.group("message").strip(),
+                    raw=line,
+                    source=source,
+                )
             )
-        )
+            continue
+        support_match = SUPPORT_TS_RE.match(line)
+        if support_match is not None:
+            timestamp = parse_support_timestamp(support_match.group("date"), support_match.group("time"))
+            entries.append(
+                FritzLogEntry(
+                    timestamp=timestamp,
+                    message=support_match.group("message").strip(),
+                    raw=line,
+                    source=source,
+                )
+            )
+            continue
+        entries.append(FritzLogEntry(timestamp=None, message=line, raw=line, source=source))
     return entries
 
 
+def parse_support_timestamp(date: str, time_value: str) -> datetime | None:
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(f"{date} {time_value}", fmt).astimezone()
+        except ValueError:
+            continue
+    return None
+
+
 def parse_wifi_event(entry: FritzLogEntry, hosts_by_mac: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    steering_event = parse_steering_history_event(entry)
+    if steering_event:
+        return steering_event
+    support_event = parse_support_ap_wifi_event(entry)
+    if support_event:
+        return support_event
+
     message = entry.message.casefold()
+    if (
+        "last_connected" in message
+        or "query.lua" in message
+        or re.search(r"^unix\s+\d+\s+\[.*\]\s+stream\s+connected", message)
+    ):
+        return None
     if not any(keyword in message for keyword in WIFI_EVENT_KEYWORDS):
         return None
 
-    event_type = "connected" if any(keyword in message for keyword in CONNECTED_KEYWORDS) else None
-    if event_type is None and any(keyword in message for keyword in DISCONNECTED_KEYWORDS):
+    event_type = None
+    if any(keyword in message for keyword in DISCONNECTED_KEYWORDS):
         event_type = "disconnected"
+    elif "authenticated" in message:
+        event_type = "authenticated"
+    elif any(keyword in message for keyword in CONNECTED_KEYWORDS):
+        event_type = "connected"
     if event_type is None:
         return None
 
     mac = parse_mac(entry.message)
     host = hosts_by_mac.get(mac or "", {})
-    hostname = parse_hostname(entry.message, mac) or host.get("NewHostName")
+    hostname = host.get("NewHostName") or parse_hostname(entry.message, mac)
+    if hostname and "ieee 802.11" in str(hostname).casefold():
+        hostname = None
     ip = parse_ip(entry.message) or host.get("NewIPAddress")
 
     return {
@@ -589,21 +990,155 @@ def parse_wifi_event(entry: FritzLogEntry, hosts_by_mac: dict[str, dict[str, Any
         "ip": ip or None,
         "interface": host.get("NewInterfaceType"),
         "active_now": truthy(host.get("NewActive")) if host else None,
+        "source": entry.source,
         "message": entry.message,
     }
 
 
+def parse_support_ap_wifi_event(entry: FritzLogEntry) -> dict[str, Any] | None:
+    ap_sta = AP_STA_EVENT_RE.search(entry.message)
+    if ap_sta:
+        raw_event = ap_sta.group("event").upper()
+        event_map = {
+            "AP-STA-CONNECTED": "ap_sta_connected",
+            "AP-STA-DISCONNECTED": "ap_sta_disconnected",
+            "EAPOL-4WAY-HS-COMPLETED": "eapol_4way_completed",
+        }
+        return {
+            "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+            "event": event_map[raw_event],
+            "hostname": None,
+            "mac": parse_mac(ap_sta.group("mac")),
+            "ip": None,
+            "interface": ap_sta.group("iface"),
+            "active_now": None,
+            "source": "support_data_hostapd",
+            "confidence": "support_ap_sta_event",
+            "message": entry.message,
+        }
+
+    handshake = WPA_HANDSHAKE_RE.search(entry.message)
+    if handshake:
+        kind = handshake.group("kind").casefold()
+        return {
+            "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+            "event": f"wpa_{kind}_handshake",
+            "hostname": None,
+            "mac": parse_mac(handshake.group("mac")),
+            "ip": None,
+            "interface": handshake.group("iface"),
+            "active_now": None,
+            "cipher": handshake.group("cipher"),
+            "source": "support_data_hostapd",
+            "confidence": "support_wpa_handshake",
+            "message": entry.message,
+        }
+
+    radius = RADIUS_ACCOUNTING_RE.search(entry.message)
+    if radius:
+        return {
+            "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+            "event": "radius_accounting_start",
+            "hostname": None,
+            "mac": parse_mac(radius.group("mac")),
+            "ip": None,
+            "interface": radius.group("iface"),
+            "active_now": None,
+            "session": radius.group("session"),
+            "source": "support_data_hostapd",
+            "confidence": "support_radius_accounting",
+            "message": entry.message,
+        }
+
+    association_request = ASSOCIATION_REQUEST_RE.search(entry.message)
+    if association_request:
+        return {
+            "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+            "event": "association_request_observed",
+            "hostname": None,
+            "mac": parse_mac(association_request.group("mac") or association_request.group("mac2")),
+            "ip": None,
+            "interface": None,
+            "active_now": None,
+            "source": "support_data_hostapd",
+            "confidence": "support_association_request",
+            "message": entry.message,
+        }
+    return None
+
+
+def parse_steering_history_event(entry: FritzLogEntry) -> dict[str, Any] | None:
+    match = STEERING_HISTORY_RE.search(entry.message)
+    if not match:
+        return None
+    start = parse_iso_local_timestamp(match.group("start"))
+    end = parse_iso_local_timestamp(match.group("end"))
+    moved = parse_iso_local_timestamp(match.group("moved")) if match.group("moved") else None
+    target_raw = (match.group("target") or "").strip()
+    target_bssid = parse_mac(target_raw)
+    result = re.sub(r"\s+", " ", match.group("result") or "").strip()
+    return {
+        "timestamp": start.isoformat() if start else None,
+        "event": "steering_observation",
+        "hostname": None,
+        "mac": parse_mac(match.group("sta")),
+        "ip": None,
+        "interface": "WLAN",
+        "active_now": None,
+        "source_bssid": parse_mac(match.group("source_bssid")),
+        "target_bssid": target_bssid,
+        "source_rssi": f"{match.group('source_rssi')} dBm",
+        "mode": match.group("mode"),
+        "result": result,
+        "ended_at": end.isoformat() if end else None,
+        "moved_at": moved.isoformat() if moved else None,
+        "source": entry.source or "support_data_steering",
+        "message": entry.message,
+    }
+
+
+def parse_iso_local_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").astimezone()
+    except ValueError:
+        return None
+
+
+def parse_compact_support_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y%m%d-%H%M%S").astimezone()
+    except ValueError:
+        return None
+
+
+def clean_dash(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return None if stripped in {"", "---", "----"} else stripped
+
+
 def entry_to_dict(entry: FritzLogEntry) -> dict[str, Any]:
+    fallback_category = classify_log_entry(entry.message)
+    parsed = parse_fritzbox_log_message(entry.message, fallback_category)
     return {
         "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
         "message": entry.message,
-        "category": classify_log_entry(entry.message),
-        "mac": parse_mac(entry.message),
-        "ip": parse_ip(entry.message),
+        "category": parsed["category"],
+        "mac": parsed["mac"] or parse_mac(entry.message),
+        "ip": parsed["ip"] or parse_ip(entry.message),
+        "source": entry.source,
     }
 
 
 def classify_log_entry(message: str) -> str:
+    parsed = parse_fritzbox_log_message(message, "")
+    if parsed.get("fields", {}).get("parser_rule_id") != "router.fallback":
+        return str(parsed["category"])
     lower = message.casefold()
     if any(keyword in lower for keyword in WIFI_EVENT_KEYWORDS):
         return "wifi"
@@ -655,14 +1190,16 @@ def build_host_seen_index(
             if event_matches_host(event, host_mac, host_ip, host_name):
                 timestamp = str(event["timestamp"])
                 timestamps.append(timestamp)
-                if event.get("event") == "connected":
+                if event.get("event") in {"connected", "station_history_interval", "ap_sta_connected"}:
                     connected_timestamps.append(timestamp)
                     activity_candidates.append(
                         (
                             timestamp,
-                            "exact_wifi_connection",
+                            "exact_wifi_connection"
+                            if event.get("event") == "connected"
+                            else f"support_{event.get('event')}",
                             "high",
-                            "Retained WLAN connection log entry matched this host.",
+                            "Retained WLAN/AP-side connection evidence matched this host.",
                         )
                     )
                 else:
@@ -1061,9 +1598,26 @@ def data_lua_findings(content: str | None, observed_at: str) -> list[dict[str, A
 
 def home_net_findings(data: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    devices = data.get("devices") or (data.get("topology") or {}).get("devices") or []
+    nested_net = (data.get("data") or {}).get("net") if isinstance(data.get("data"), dict) else {}
+    devices = data.get("devices") or (data.get("topology") or {}).get("devices") or nested_net.get("devices") or []
     if isinstance(devices, dict):
         devices = list(devices.values())
+    if nested_net:
+        findings.append(
+            finding(
+                "homenet_summary",
+                "webui_homenet_topology",
+                "homeNet.net",
+                {
+                    "active_count": nested_net.get("active_count"),
+                    "count": nested_net.get("count"),
+                },
+                observed_at,
+                "data_lua_pages_json",
+                nested_net,
+                "Home network summary parsed from internal data.lua page.",
+            )
+        )
     for device in devices if isinstance(devices, list) else []:
         if not isinstance(device, dict):
             continue
@@ -1080,9 +1634,11 @@ def home_net_findings(data: dict[str, Any], observed_at: str) -> list[dict[str, 
                     "name": name,
                     "mac": device.get("mac"),
                     "active": state.get("active"),
-                    "online": device.get("online"),
+                    "online": state.get("online") if "online" in state else device.get("online"),
+                    "realtime": state.get("realtime"),
                     "guest": device.get("guest"),
                     "blocked": device.get("blocked") or device.get("internetBlocked"),
+                    "type": device.get("type"),
                     "kind": connection.get("kind"),
                     "speed": connection.get("speed"),
                     "parent": device.get("parent") or device.get("parentuid"),

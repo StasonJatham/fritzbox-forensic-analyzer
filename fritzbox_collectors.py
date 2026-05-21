@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 import re
+from urllib.parse import urlencode, urljoin, urlparse
 import urllib.request
 from typing import Any
 
@@ -155,6 +158,9 @@ DATA_LUA_PAGES = (
     "diagnosisFunction",
 )
 MAX_WEBUI_ARTIFACT_BYTES = 2_000_000
+DEFAULT_WEBUI_TIMEOUT = 8
+DEFAULT_WEBUI_RETRY_TIMEOUT = 20
+DEFAULT_WEBUI_WORKERS = 1
 WEBUI_READONLY_ENDPOINTS = (
     ("juis_boxinfo_xml", "/juis_boxinfo.xml", {}),
     ("login_sid_v2", "/login_sid.lua", {"version": "2"}),
@@ -162,17 +168,89 @@ WEBUI_READONLY_ENDPOINTS = (
     ("inetstat_monitor_lua", "/internet/inetstat_monitor.lua", {}),
     ("inetstat_counter_lua", "/internet/inetstat_counter.lua", {}),
 )
+LANDEVICE_RICH_FIELDS = [
+    "UID",
+    "ip",
+    "iplist",
+    "mac",
+    "maclist",
+    "name",
+    "friendly_name",
+    "neighbour_name",
+    "vendorname",
+    "modelname",
+    "manu_name",
+    "parentuid",
+    "parentsource",
+    "source",
+    "flags",
+    "modification_flags",
+    "interface",
+    "wlan_station_type",
+    "wlan_UIDs",
+    "plc_UIDs",
+    "ethernetport",
+    "active",
+    "online",
+    "speed",
+    "dhcp",
+    "static_dhcp",
+    "deleteable",
+    "wakeup",
+    "auto_wakeup",
+    "firstused",
+    "lastused",
+    "blocked",
+    "allow_pcp_and_upnp",
+    "igd_fw_cnt_pcp",
+    "igd_fw_cnt_upnp",
+    "myfritz_enabled",
+    "url",
+]
+LANDEVICE_FALLBACK_FIELDS = [
+    "UID",
+    "ip",
+    "mac",
+    "name",
+    "friendly_name",
+    "active",
+    "online",
+    "interface",
+    "firstused",
+    "lastused",
+]
+QUERY_LUA_QUERIES = {
+    "landevice_all": "landevice:settings/landevice/list(UID,ip,iplist,mac,maclist,name,friendly_name,neighbour_name,vendorname,modelname,parentuid,parentsource,source,flags,modification_flags,interface,wlan_station_type,wlan_UIDs,plc_UIDs,ethernetport,active,online,guest,speed,dhcp,static_dhcp,deleteable,wakeup,auto_wakeup,firstused,lastused,blocked,allow_pcp_and_upnp,igd_fw_cnt_pcp,igd_fw_cnt_upnp,myfritz_enabled,url)",
+    "landevice_topology": "landevice:settings/landevice/list(UID,name,friendly_name,parentuid,parentsource,source,interface,wlan_UIDs,plc_UIDs,ethernetport,active,online,guest,speed,lastused)",
+    "hostfilter_profiles": "filter:settings/profile/list(id,name,type,netappsid,blocked,autoupdate,disabled)",
+    "hostfilter_rules": "filter:settings/rule/list(id,name,enabled,profile,device,uid,mac,ip,blocked)",
+    "wlan_stations": "wlan:settings/station/list(mac,ip,name,UID,active,guest,ap,ssid,rssi,speed,flags)",
+    "wlan_radios": "wlan:settings/radio/list(uid,enabled,ssid,channel,autochannel,standard,mac,guest)",
+    "wlan_known_devices": "wlan:settings/known/list(mac,name,active,guest,ssid,last_connected,rssi,speed)",
+    "wlan_guest": "wlan:settings/guest(enabled,ssid,encrypted,timeout,remaining)",
+    "port_sharing": "forwardrules:settings/rule/list(description,enabled,protocol,port,end_port,fwip,fwport,sourceip)",
+    "net_routes": "route:settings/route/list(ip,mask,gateway,metric,active)",
+    "net_dns": "dns:settings/server/list(name,ip,source,active)",
+    "net_dhcp": "dhcp:settings/lease/list(hostname,mac,ip,expires,active)",
+    "vpn_users": "vpn:settings/connection/list(name,enabled,type,remote_ip,local_ip,last_connected)",
+    "wireguard": "wireguard:settings/peer/list(name,enabled,remote_endpoint,allowed_ips,last_handshake)",
+    "user_rights": "user:settings/user/list(name,enabled,box_admin,ftp_access,vpn_access,frominternet)",
+    "myfritz_services": "myfritz:settings/service/list(name,enabled,port,protocol,device)",
+    "usb_devices": "usb:settings/device/list(name,type,connected,manufacturer,product)",
+    "dect_devices": "dect:settings/handset/list(name,intern,manufacturer,model,connected)",
+}
 
 
 def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | None = None) -> dict[str, Any]:
     exports: dict[str, Any] = {}
     manifest = AcquisitionManifest()
     path_specs = [
-        ("device_log_xml", "DeviceInfo:1", "X_AVM-DE_GetDeviceLogPath", "NewDeviceLogPath"),
-        ("mesh_list", "Hosts:1", "X_AVM-DE_GetMeshListPath", "NewX_AVM-DE_MeshListPath"),
-        ("host_list_xml", "Hosts:1", "X_AVM-DE_GetHostListPath", "NewX_AVM-DE_HostListPath"),
+        ("device_log_xml", "DeviceInfo:1", "X_AVM-DE_GetDeviceLogPath", "NewDeviceLogPath", None),
+        ("device_log_xml_wlan", "DeviceInfo:1", "X_AVM-DE_GetDeviceLogPath", "NewDeviceLogPath", {"filter": "wlan"}),
+        ("mesh_list", "Hosts:1", "X_AVM-DE_GetMeshListPath", "NewX_AVM-DE_MeshListPath", None),
+        ("host_list_xml", "Hosts:1", "X_AVM-DE_GetHostListPath", "NewX_AVM-DE_HostListPath", None),
     ]
-    for key, service, action, field in path_specs:
+    for key, service, action, field, query_params in path_specs:
         try:
             path = fc.call_action(service, action).get(field)
         except Exception as exc:
@@ -181,7 +259,8 @@ def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | N
         if not path:
             manifest.add(key, "tr064_export_path", ok=False, service=service, action=action, error="empty path")
             continue
-        content = fetch_avm_path(address, port, str(path), fc=fc)
+        path = append_query_params(str(path), query_params)
+        content = fetch_avm_path(address, port, path, fc=fc)
         if content is not None:
             exports[key] = content
         manifest.add(key, "tr064_export_path", ok=content is not None, service=service, action=action, path=str(path))
@@ -394,6 +473,8 @@ def fetch_support_lua_page(fc: Any) -> str | None:
     if getattr(response, "status_code", None) != 200:
         return None
     text = getattr(response, "text", "") or getattr(response, "content", b"").decode("utf-8", errors="replace")
+    if is_login_html_response(text):
+        return None
     if not text or "support" not in text.casefold():
         return None
     return text
@@ -411,13 +492,19 @@ def is_support_data_response(text: str) -> bool:
 
 def fetch_data_lua_pages(fc: Any) -> dict[str, Any]:
     pages: dict[str, Any] = {}
+    sid = get_webui_sid(getattr(fc, "http_interface", None))
+    jobs = {}
     for page in DATA_LUA_PAGES:
-        try:
-            response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/data.lua", {"page": page})
-        except Exception as exc:
-            pages[page] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        params = {"page": page}
+        if sid:
+            params["sid"] = sid
+        jobs[page] = ("data.lua", params)
+    for page, result in fetch_webui_text_jobs(fc, jobs).items():
+        raw = result.get("raw") or ""
+        error = result.get("error")
+        if error:
+            pages[page] = {"ok": False, "error": error}
             continue
-        raw = getattr(response, "text", "")
         if not raw:
             pages[page] = {"ok": False, "error": "empty response"}
             continue
@@ -429,64 +516,15 @@ def fetch_data_lua_pages(fc: Any) -> dict[str, Any]:
 
 
 def fetch_landevice_query(fc: Any) -> str | None:
-    rich_fields = [
-        "UID",
-        "ip",
-        "iplist",
-        "mac",
-        "maclist",
-        "name",
-        "friendly_name",
-        "neighbour_name",
-        "vendorname",
-        "modelname",
-        "manu_name",
-        "parentuid",
-        "parentsource",
-        "source",
-        "flags",
-        "modification_flags",
-        "interface",
-        "wlan_station_type",
-        "wlan_UIDs",
-        "plc_UIDs",
-        "ethernetport",
-        "active",
-        "online",
-        "speed",
-        "dhcp",
-        "static_dhcp",
-        "deleteable",
-        "wakeup",
-        "auto_wakeup",
-        "firstused",
-        "lastused",
-        "blocked",
-        "allow_pcp_and_upnp",
-        "igd_fw_cnt_pcp",
-        "igd_fw_cnt_upnp",
-        "myfritz_enabled",
-        "url",
-    ]
-    fallback_fields = [
-        "UID",
-        "ip",
-        "mac",
-        "name",
-        "friendly_name",
-        "active",
-        "online",
-        "interface",
-        "firstused",
-        "lastused",
-    ]
-    for fields in (rich_fields, fallback_fields):
+    sid = get_webui_sid(getattr(fc, "http_interface", None))
+    for fields in (LANDEVICE_RICH_FIELDS, LANDEVICE_FALLBACK_FIELDS):
         query = f"landevice:settings/landevice/list({','.join(fields)})"
-        try:
-            response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/query.lua", {"mq_landevices": query})
-        except Exception:
+        params = {"mq_landevices": query}
+        if sid:
+            params["sid"] = sid
+        text, _error = fetch_webui_text_with_retry(fc, "query.lua", params)
+        if _error:
             continue
-        text = getattr(response, "text", "")
         if text and "landevice" in text:
             return text
     return None
@@ -498,34 +536,21 @@ def fetch_query_lua_artifacts(fc: Any) -> dict[str, Any]:
     These are intentionally raw-first. FRITZ!OS firmware decides which query
     paths exist; failures are retained so source coverage explains gaps.
     """
-    queries = {
-        "landevice_all": "landevice:settings/landevice/list(UID,ip,iplist,mac,maclist,name,friendly_name,neighbour_name,vendorname,modelname,parentuid,parentsource,source,flags,modification_flags,interface,wlan_station_type,wlan_UIDs,plc_UIDs,ethernetport,active,online,guest,speed,dhcp,static_dhcp,deleteable,wakeup,auto_wakeup,firstused,lastused,blocked,allow_pcp_and_upnp,igd_fw_cnt_pcp,igd_fw_cnt_upnp,myfritz_enabled,url)",
-        "landevice_topology": "landevice:settings/landevice/list(UID,name,friendly_name,parentuid,parentsource,source,interface,wlan_UIDs,plc_UIDs,ethernetport,active,online,guest,speed,lastused)",
-        "hostfilter_profiles": "filter:settings/profile/list(id,name,type,netappsid,blocked,autoupdate,disabled)",
-        "hostfilter_rules": "filter:settings/rule/list(id,name,enabled,profile,device,uid,mac,ip,blocked)",
-        "wlan_stations": "wlan:settings/station/list(mac,ip,name,UID,active,guest,ap,ssid,rssi,speed,flags)",
-        "wlan_radios": "wlan:settings/radio/list(uid,enabled,ssid,channel,autochannel,standard,mac,guest)",
-        "wlan_known_devices": "wlan:settings/known/list(mac,name,active,guest,ssid,last_connected,rssi,speed)",
-        "wlan_guest": "wlan:settings/guest(enabled,ssid,encrypted,timeout,remaining)",
-        "port_sharing": "forwardrules:settings/rule/list(description,enabled,protocol,port,end_port,fwip,fwport,sourceip)",
-        "net_routes": "route:settings/route/list(ip,mask,gateway,metric,active)",
-        "net_dns": "dns:settings/server/list(name,ip,source,active)",
-        "net_dhcp": "dhcp:settings/lease/list(hostname,mac,ip,expires,active)",
-        "vpn_users": "vpn:settings/connection/list(name,enabled,type,remote_ip,local_ip,last_connected)",
-        "wireguard": "wireguard:settings/peer/list(name,enabled,remote_endpoint,allowed_ips,last_handshake)",
-        "user_rights": "user:settings/user/list(name,enabled,box_admin,ftp_access,vpn_access,frominternet)",
-        "myfritz_services": "myfritz:settings/service/list(name,enabled,port,protocol,device)",
-        "usb_devices": "usb:settings/device/list(name,type,connected,manufacturer,product)",
-        "dect_devices": "dect:settings/handset/list(name,intern,manufacturer,model,connected)",
-    }
     artifacts: dict[str, Any] = {}
-    for name, query in queries.items():
-        try:
-            response = fc.http_interface.call_url(f"{fc.http_interface.router_url}/query.lua", {name: query})
-        except Exception as exc:
-            artifacts[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "query": query}
+    sid = get_webui_sid(getattr(fc, "http_interface", None))
+    jobs = {}
+    for name, query in QUERY_LUA_QUERIES.items():
+        params = {name: query}
+        if sid:
+            params["sid"] = sid
+        jobs[name] = ("query.lua", params)
+    for name, result in fetch_webui_text_jobs(fc, jobs).items():
+        query = QUERY_LUA_QUERIES[name]
+        text = result.get("raw") or ""
+        error = result.get("error")
+        if error:
+            artifacts[name] = {"ok": False, "error": error, "query": query}
             continue
-        text = getattr(response, "text", "")
         if not text:
             artifacts[name] = {"ok": False, "error": "empty response", "query": query}
             continue
@@ -534,6 +559,72 @@ def fetch_query_lua_artifacts(fc: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             artifacts[name] = {"ok": True, "raw": text, "query": query}
     return artifacts
+
+
+def fetch_webui_text_jobs(fc: Any, jobs: dict[str, tuple[str, dict[str, Any]]]) -> dict[str, dict[str, str | None]]:
+    worker_count = max(1, int(os.getenv("FRITZBOX_WEBUI_WORKERS", str(DEFAULT_WEBUI_WORKERS)) or DEFAULT_WEBUI_WORKERS))
+    results: dict[str, dict[str, str | None]] = {}
+    with ThreadPoolExecutor(max_workers=min(worker_count, max(1, len(jobs)))) as executor:
+        futures = {
+            executor.submit(fetch_webui_text_with_retry, fc, path, params): name
+            for name, (path, params) in jobs.items()
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                raw, error = future.result()
+            except Exception as exc:
+                raw, error = "", f"{type(exc).__name__}: {exc}"
+            results[name] = {"raw": raw, "error": error}
+    return results
+
+
+def fetch_webui_text_with_retry(fc: Any, path: str, params: dict[str, Any]) -> tuple[str, str | None]:
+    raw, error = fetch_webui_text(fc, path, params)
+    if raw or not retryable_webui_error(error):
+        return raw, error
+    retry_timeout = int(
+        os.getenv("FRITZBOX_WEBUI_RETRY_TIMEOUT", str(DEFAULT_WEBUI_RETRY_TIMEOUT)) or DEFAULT_WEBUI_RETRY_TIMEOUT
+    )
+    raw, retry_error = fetch_webui_text(fc, path, params, timeout=retry_timeout)
+    if raw or retry_error is None:
+        return raw, None
+    return "", f"{error}; retry: {retry_error}"
+
+
+def retryable_webui_error(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.casefold()
+    return any(token in lowered for token in ("timeout", "timed out", "read timed out", "connection aborted"))
+
+
+def fetch_webui_text(fc: Any, path: str, params: dict[str, Any], timeout: int | None = None) -> tuple[str, str | None]:
+    http = getattr(fc, "http_interface", None)
+    if http is None:
+        return "", "missing HTTP interface"
+    session = getattr(getattr(http, "fc", None), "session", None)
+    if session is None:
+        return "", "missing HTTP session"
+    request_timeout = timeout or int(os.getenv("FRITZBOX_WEBUI_TIMEOUT", str(DEFAULT_WEBUI_TIMEOUT)) or DEFAULT_WEBUI_TIMEOUT)
+    url = f"{str(getattr(http, 'router_url', '')).rstrip('/')}/{path.lstrip('/')}"
+    try:
+        response = session.get(url, params=params, timeout=request_timeout)
+    except TypeError:
+        try:
+            response = session.get(url, params=params)
+        except Exception as exc:
+            return "", f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        return "", f"{type(exc).__name__}: {exc}"
+    try:
+        if getattr(response, "status_code", 200) != 200:
+            return "", f"HTTP {getattr(response, 'status_code', 'unknown')}"
+        return getattr(response, "text", ""), None
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
 
 def fetch_webui_readonly_artifacts(fc: Any) -> dict[str, Any]:
@@ -638,6 +729,16 @@ def is_html_response(raw: str, content_type: str | None) -> bool:
     return "<html" in sample or "<!doctype html" in sample
 
 
+def is_login_html_response(raw: str) -> bool:
+    sample = raw[:20_000].casefold()
+    return (
+        "html2-login.js" in sample
+        or "box-login.js" in sample
+        or '"sid":"0000000000000000"' in sample
+        or "login.init(data)" in sample
+    )
+
+
 def redacted_params(params: dict[str, Any]) -> dict[str, Any]:
     return {key: "<redacted>" if key.lower() == "sid" else value for key, value in params.items()}
 
@@ -723,7 +824,9 @@ def tr064_service_inventory(fc: Any) -> list[dict[str, Any]]:
     return inventory
 
 
-def collect_dynamic_readonly_actions(fc: Any, max_actions: int = 220) -> dict[str, Any]:
+def collect_dynamic_readonly_actions(fc: Any, max_actions: int | None = None) -> dict[str, Any]:
+    if max_actions is None:
+        max_actions = int(os.getenv("FRITZBOX_DYNAMIC_TR064_MAX_ACTIONS", "220") or "220")
     results: dict[str, Any] = {}
     called = 0
     for service_name, service in sorted((getattr(fc, "services", {}) or {}).items()):
@@ -910,6 +1013,8 @@ def fetch_avm_path(address: str, port: int, path: str, fc: Any | None = None) ->
         content = fetch_authenticated_path(fc, path)
         if content is not None:
             return content
+    if urlparse(path).scheme or urlparse(path).netloc:
+        return None
     for base in (f"http://{address}:{port}", f"http://{address}"):
         try:
             with urllib.request.urlopen(base + path, timeout=5) as response:
@@ -919,6 +1024,13 @@ def fetch_avm_path(address: str, port: int, path: str, fc: Any | None = None) ->
     return None
 
 
+def append_query_params(path: str, params: dict[str, Any] | None = None) -> str:
+    if not params:
+        return path
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}{urlencode(params)}"
+
+
 def fetch_authenticated_path(fc: Any, path: str) -> str | None:
     http = getattr(fc, "http_interface", None)
     if http is None:
@@ -926,7 +1038,9 @@ def fetch_authenticated_path(fc: Any, path: str) -> str | None:
     session = getattr(getattr(http, "fc", None), "session", None)
     if session is None:
         return None
-    url = path if path.startswith(("http://", "https://")) else f"{http.router_url}{path}"
+    url = safe_router_url(str(http.router_url), path)
+    if url is None:
+        return None
     try:
         with session.get(url, timeout=15) as response:
             if getattr(response, "status_code", None) != 200:
@@ -942,3 +1056,15 @@ def fetch_authenticated_path(fc: Any, path: str) -> str | None:
             return None
     except Exception:
         return None
+
+
+def safe_router_url(router_url: str, path: str) -> str | None:
+    base = str(router_url).rstrip("/") + "/"
+    candidate = urljoin(base, path)
+    parsed_base = urlparse(base)
+    parsed_candidate = urlparse(candidate)
+    if parsed_candidate.scheme not in {"http", "https"}:
+        return None
+    if parsed_candidate.netloc != parsed_base.netloc:
+        return None
+    return candidate

@@ -6,12 +6,15 @@ from fritzbox_log_store import (
     evidence_for_record,
     get_settings,
     ingest_dataset,
+    investigation_snapshot,
     init_db,
     latest_snapshot,
     list_runs,
     query_records,
     query_timeline,
+    reparse_support_wlan_environment,
     save_settings,
+    siem_search_facets,
 )
 
 
@@ -63,6 +66,456 @@ def test_query_records_uses_backend_fts_and_pagination(tmp_path: Path) -> None:
     assert wifi["rows"][0]["hostname"] == "iPhone"
     assert log["total"] == 1
     assert log["rows"][0]["ip"] == "192.0.2.23"
+
+
+def test_ui_queries_preserve_parsed_artifact_sources(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {
+                "device_log_xml_wlan": "<DeviceLog />",
+                "wlan_device_list_xml_2": "<List />",
+            },
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "wifi",
+                    "ip": "192.0.2.51",
+                    "mac": "AA:BB:CC:DD:EE:51",
+                    "source": "device_log_xml",
+                    "message": "WLAN-Gerät angemeldet: phone",
+                },
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "wifi",
+                    "ip": "192.0.2.51",
+                    "mac": "AA:BB:CC:DD:EE:51",
+                    "source": "device_log_xml_wlan",
+                    "message": "WLAN-Gerät angemeldet: phone",
+                },
+            ],
+            "wlan_associations": [
+                {
+                    "observed_at": "2026-05-20T12:01:00+02:00",
+                    "radio_index": "2",
+                    "association_index": "1",
+                    "mac": "AA:BB:CC:DD:EE:51",
+                    "ip": "192.0.2.51",
+                    "hostname": "phone",
+                    "source": "wlan_device_list_xml_2",
+                }
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    log_rows = query_records(db, "phone", "log", limit=10, offset=0)
+    timeline = query_timeline(db, "phone", limit=10)
+    wlan_rows = query_records(db, "phone", "wlan_associations", limit=10, offset=0)
+
+    assert log_rows["total"] == 2
+    assert {row["source"] for row in log_rows["rows"]} == {"device_log_xml", "device_log_xml_wlan"}
+    assert {row["source"] for row in timeline["rows"]} >= {"device_log_xml", "device_log_xml_wlan"}
+    assert wlan_rows["rows"][0]["source"] == "wlan_device_list_xml_2"
+
+
+def test_ingest_reclassifies_imported_event_log_rows_with_shared_parser(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "system",
+                    "message": "soap:check_async_auth failed with -1 from 192.168.178.23:54587",
+                }
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    rows = query_records(db, "check_async_auth", "log", limit=10, offset=0, category="auth")
+
+    assert rows["total"] == 1
+    assert rows["rows"][0]["category"] == "auth"
+    assert rows["rows"][0]["ip"] == "192.168.178.23"
+
+
+def test_siem_events_and_correlations_normalize_parsed_evidence(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml_wlan": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "wifi",
+                    "ip": "192.0.2.51",
+                    "mac": "AA:BB:CC:DD:EE:51",
+                    "source": "device_log_xml_wlan",
+                    "message": "WLAN-Anmeldung ist fehlgeschlagen: phone, 192.0.2.51, AA:BB:CC:DD:EE:51",
+                }
+            ],
+            "available_wifi_connections": [
+                {
+                    "derived_connected_at": "2026-05-20T12:01:00+02:00",
+                    "derived_time_type": "wlan_association_snapshot",
+                    "derived_time_confidence": "high",
+                    "exact_connection_time_available": False,
+                    "event": "associated_snapshot",
+                    "hostname": "phone",
+                    "mac": "AA:BB:CC:DD:EE:51",
+                    "ip": "192.0.2.51",
+                    "source": "wlan_device_list_xml_2",
+                    "confidence": "high",
+                    "message": "WLAN association snapshot phone",
+                }
+            ],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    events = query_records(db, "phone", "events", limit=10, offset=0)
+    correlations = query_records(db, "phone", "correlations", limit=10, offset=0)
+
+    assert events["total"] >= 2
+    failed = next(row for row in events["rows"] if row["event_kind"] == "wifi.connection_failed")
+    assert failed["event_category"] == "wifi"
+    assert failed["outcome"] == "failure"
+    assert failed["source"] == "device_log_xml_wlan"
+    assert '"wifi"' in failed["tags_json"]
+    assert '"raw_message"' in failed["fields_json"]
+    assert correlations["total"] >= 1
+    assert correlations["rows"][0]["event_count"] >= 2
+    assert query_records(db, "wifi.connection_failed", "all", limit=10, offset=0)["total"] >= 1
+
+
+def test_siem_correlations_do_not_promote_diagnostic_fragments_to_hosts(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"support_data_txt": "wan:0 0 secs, refcnt 4"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "system",
+                    "ip": "192.0.2.51",
+                    "mac": "AA:BB:CC:DD:EE:51",
+                    "source": "support_data_txt",
+                    "message": "AA:BB:CC:DD:EE:51 wan:0 0 secs, refcnt 4",
+                },
+                {
+                    "timestamp": "2026-05-20T12:01:00+02:00",
+                    "category": "system",
+                    "ip": "0.0.0.0",
+                    "mac": "00:00:00:00:00:00",
+                    "source": "support_data_txt",
+                    "message": "00:00:00:00:00:00 ignored placeholder",
+                },
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    conn = init_db(db)
+    try:
+        keys = {row["entity_key"] for row in conn.execute("SELECT entity_key FROM siem_correlations")}
+    finally:
+        conn.close()
+
+    assert "host:0 0 secs" not in keys
+    assert "ip:0.0.0.0" not in keys
+    assert "mac:00:00:00:00:00:00" not in keys
+    assert "mac:aa:bb:cc:dd:ee:51" in keys
+    assert "ip:192.0.2.51" in keys
+
+
+def test_siem_correlation_rules_link_evidence_events(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": f"2026-05-20T12:0{minute}:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.23",
+                    "mac": None,
+                    "source": "device_log_xml",
+                    "message": f"Anmeldung fehlgeschlagen von 192.0.2.23 Versuch {minute}",
+                }
+                for minute in range(3)
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    rule_hits = query_records(db, "auth.failed_login_burst", "correlations", limit=10, offset=0)
+
+    assert rule_hits["total"] == 1
+    hit = rule_hits["rows"][0]
+    assert hit["rule_id"] == "auth.failed_login_burst"
+    assert hit["correlation_type"] == "rule_match"
+    assert hit["event_count"] == 3
+    assert hit["window_start"] == "2026-05-20T12:00:00+02:00"
+    assert hit["window_end"] == "2026-05-20T12:02:00+02:00"
+    evidence = evidence_for_record(db, "correlations", hit["id"])
+    assert len(evidence["record"]["linked_events"]) == 3
+    assert {event["event_kind"] for event in evidence["record"]["linked_events"]} == {"auth.login_failure"}
+
+
+def test_siem_wifi_session_fragments_pair_hostapd_markers(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"support_data_txt": "hostapd log"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "wifi",
+                    "source": "support_data_txt",
+                    "message": "ath0: AP-STA-CONNECTED aa:bb:cc:dd:ee:99",
+                },
+                {
+                    "timestamp": "2026-05-20T12:45:00+02:00",
+                    "category": "wifi",
+                    "source": "support_data_txt",
+                    "message": "ath0: AP-STA-DISCONNECTED aa:bb:cc:dd:ee:99",
+                },
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    rule_hits = query_records(db, "wifi.session_fragment", "correlations", limit=10, offset=0)
+
+    assert rule_hits["total"] == 1
+    hit = rule_hits["rows"][0]
+    assert hit["entity_key"] == "mac:aa:bb:cc:dd:ee:99"
+    assert hit["first_seen"] == "2026-05-20T12:00:00+02:00"
+    assert hit["last_seen"] == "2026-05-20T12:45:00+02:00"
+    fields = json.loads(hit["fields_json"])
+    assert fields["duration_seconds"] == 2700
+
+
+def test_siem_timeline_and_facets_use_normalized_events(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"support_data_txt": "ath0: AP-STA-CONNECTED aa:bb:cc:dd:ee:45"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "wifi",
+                    "source": "support_data_txt",
+                    "message": "ath0: AP-STA-CONNECTED aa:bb:cc:dd:ee:45",
+                }
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    timeline = query_timeline(db, "AP-STA-CONNECTED", category="wifi", limit=10, offset=0)
+    facets = siem_search_facets(db, "aa:bb:cc:dd:ee:45", category="wifi")
+
+    assert timeline["total"] == 1
+    assert timeline["rows"][0]["record_type"] == "siem_events"
+    assert timeline["rows"][0]["event_class"] == "wifi"
+    assert any(item["value"] == "wifi.ap_sta_connected" for item in facets["facets"]["kind"])
+    assert any(item["value"] == "wifi.ap_sta_connected" for item in facets["facets"]["parser_rule"])
+
+
+def test_siem_burst_rules_use_canonical_key_and_emit_separate_windows(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    event_log = []
+    for hour in ("12", "13"):
+        for minute in range(3):
+            event_log.append(
+                {
+                    "timestamp": f"2026-05-20T{hour}:0{minute}:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.23",
+                    "mac": "AA:BB:CC:DD:EE:23",
+                    "source": "device_log_xml",
+                    "message": f"Anmeldung fehlgeschlagen von 192.0.2.23 Versuch {hour}:{minute}",
+                }
+            )
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": event_log,
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    rule_hits = query_records(db, "auth.failed_login_burst", "correlations", limit=10, offset=0)
+    ip_pivot = query_records(db, "192.0.2.23", "correlations", limit=10, offset=0)
+
+    assert rule_hits["total"] == 2
+    assert {row["entity_key"] for row in rule_hits["rows"]} == {"mac:aa:bb:cc:dd:ee:23"}
+    assert {row["event_count"] for row in rule_hits["rows"]} == {3}
+    assert ip_pivot["total"] >= 2
+
+
+def test_siem_burst_windows_sort_by_absolute_time(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.24",
+                    "source": "device_log_xml",
+                    "message": "Anmeldung fehlgeschlagen von 192.0.2.24 Versuch 1",
+                },
+                {
+                    "timestamp": "2026-05-20T10:01:00+00:00",
+                    "category": "auth",
+                    "ip": "192.0.2.24",
+                    "source": "device_log_xml",
+                    "message": "Anmeldung fehlgeschlagen von 192.0.2.24 Versuch 2",
+                },
+                {
+                    "timestamp": "2026-05-20T12:02:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.24",
+                    "source": "device_log_xml",
+                    "message": "Anmeldung fehlgeschlagen von 192.0.2.24 Versuch 3",
+                },
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    rule_hits = query_records(db, "auth.failed_login_burst", "correlations", limit=10, offset=0)
+
+    assert rule_hits["total"] == 1
+    assert rule_hits["rows"][0]["window_start"] == "2026-05-20T12:00:00+02:00"
+    assert rule_hits["rows"][0]["window_end"] == "2026-05-20T12:02:00+02:00"
+
+
+def test_disabled_wan_mapping_does_not_create_exposure_correlation(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+            "wan_port_mappings": [
+                {
+                    "protocol": "TCP",
+                    "external_port": "443",
+                    "internal_client": "192.0.2.10",
+                    "internal_port": "443",
+                    "enabled": "0",
+                    "source": "test_fixture",
+                }
+            ],
+        },
+        db,
+    )
+
+    assert query_records(db, "security.exposure_indicator", "correlations", limit=10, offset=0)["total"] == 0
+    assert query_records(db, "443", "wan_port_mappings", limit=10, offset=0)["total"] == 1
+
+
+def test_correlation_time_filter_uses_window_overlap(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": f"2026-05-20T12:0{minute}:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.25",
+                    "source": "device_log_xml",
+                    "message": f"Anmeldung fehlgeschlagen von 192.0.2.25 Versuch {minute}",
+                }
+                for minute in range(3)
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    overlaps = query_records(
+        db,
+        "auth.failed_login_burst",
+        "correlations",
+        limit=10,
+        offset=0,
+        start="2026-05-20T12:01:00+02:00",
+        end="2026-05-20T12:01:30+02:00",
+    )
+
+    assert overlaps["total"] == 1
 
 
 def test_all_evidence_search_returns_ranked_parsed_rows_and_filters(tmp_path: Path) -> None:
@@ -119,6 +572,125 @@ def test_all_evidence_search_returns_ranked_parsed_rows_and_filters(tmp_path: Pa
     assert inferred["total"] == 1
     assert inferred["rows"][0]["record_type"] == "wifi_connections"
     assert inferred["rows"][0]["record_entity"].startswith("needle-login-phone")
+
+
+def test_investigation_snapshot_combines_window_evidence_and_discovery_hints(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {
+                "device_log_xml": "<DeviceLog />",
+                "support_data_txt": "allow_pcp_and_upnp igd_fw_cnt_upnp dhcp multicast",
+            },
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T10:30:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.23",
+                    "mac": None,
+                    "message": "Anmeldung falsches Kennwort",
+                }
+            ],
+            "available_wifi_connections": [
+                {
+                    "derived_connected_at": "2026-05-20T10:35:00+02:00",
+                    "derived_time_type": "connection_event",
+                    "derived_time_confidence": "high",
+                    "exact_connection_time_available": True,
+                    "event": "connected",
+                    "hostname": "Phone",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.24",
+                    "source": "device_log",
+                    "confidence": "high",
+                    "message": "Phone connected",
+                }
+            ],
+            "known_hosts": [
+                {
+                    "hostname": "Phone",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.24",
+                    "last_connected": "2026-05-20T10:35:00+02:00",
+                    "last_activity": "2026-05-20T10:35:00+02:00",
+                    "last_activity_source": "fritzbox_landevice_lastused",
+                    "last_activity_confidence": "medium",
+                }
+            ],
+        },
+        db,
+    )
+
+    snapshot = investigation_snapshot(db, "2026-05-20T10:00:00+02:00", "2026-05-20T11:00:00+02:00")
+
+    assert snapshot["counts"]["exact_events"] == 1
+    assert snapshot["counts"]["auth_events"] == 1
+    assert snapshot["counts"]["wifi_points"] == 1
+    assert snapshot["counts"]["presence_points"] == 1
+    assert snapshot["counts"]["discovery_hints_total"] >= 1
+    assert snapshot["verdict"]["level"] == "high"
+
+
+def test_investigation_snapshot_uses_presence_overlap_for_device_candidates(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [
+                {
+                    "hostname": "restaurant-phone",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.24",
+                    "interface": "WLAN",
+                    "first_seen": "2026-05-16T00:15:00+02:00",
+                    "last_connected": "2026-05-16T12:15:00+02:00",
+                    "last_activity": "2026-05-16T12:15:00+02:00",
+                    "last_activity_source": "fritzbox_landevice_lastused",
+                    "last_activity_confidence": "medium",
+                },
+                {
+                    "hostname": "office-printer",
+                    "mac": "AA:BB:CC:DD:EE:00",
+                    "ip": "192.0.2.25",
+                    "interface": "LAN",
+                    "first_seen": "2026-05-15T00:15:00+02:00",
+                    "last_connected": "2026-05-15T12:15:00+02:00",
+                    "last_activity": "2026-05-15T12:15:00+02:00",
+                    "last_activity_source": "fritzbox_landevice_lastused",
+                    "last_activity_confidence": "medium",
+                },
+            ],
+        },
+        db,
+    )
+
+    snapshot = investigation_snapshot(
+        db,
+        "2026-05-16T02:00:00+02:00",
+        "2026-05-16T11:30:00+02:00",
+        interface="wifi",
+    )
+    point_snapshot = investigation_snapshot(
+        db,
+        "2026-05-16T02:00:00+02:00",
+        "2026-05-16T11:30:00+02:00",
+        presence_mode="points",
+    )
+
+    assert snapshot["counts"]["device_candidates"] == 1
+    assert snapshot["devices"]["rows"][0]["hostname"] == "restaurant-phone"
+    assert snapshot["devices"]["rows"][0]["window_match"] == "interval_overlap"
+    assert point_snapshot["counts"]["device_candidates"] == 0
 
 
 def test_settings_store_preserves_password_when_blank(tmp_path: Path) -> None:
@@ -331,6 +903,43 @@ def test_active_host_rows_get_inferred_last_activity(tmp_path: Path) -> None:
     assert friday_hosts["rows"][0]["hostname"] == "returned-phone"
 
 
+def test_all_evidence_time_filter_excludes_untimestamped_records(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+            "tr064_snapshot": {
+                "actions": {
+                    "wlan_radio": {
+                        "ok": True,
+                        "service": "WLANConfiguration:1",
+                        "action": "GetInfo",
+                        "response": {"NewSSID": "Lab", "NewEnable": "1"},
+                    }
+                }
+            },
+        },
+        db,
+    )
+
+    result = query_records(
+        db,
+        "",
+        "all",
+        start="2026-05-16T02:00:00+02:00",
+        end="2026-05-16T11:30:00+02:00",
+    )
+
+    assert result["total"] == 0
+
+
 def test_analysis_snapshot_exposes_forensic_visualization_data(tmp_path: Path) -> None:
     db = tmp_path / "analysis.sqlite3"
     tr064 = {
@@ -463,7 +1072,7 @@ def test_latest_snapshot_and_evidence_filters(tmp_path: Path) -> None:
     assert "support_data_txt" not in snapshot["source_coverage"]["missing_raw_artifacts"]
     assert inferred["total"] == 1
     assert exact_timeline["total"] == 1
-    assert exact_timeline["rows"][0]["record_type"] == "event_log"
+    assert exact_timeline["rows"][0]["record_type"] == "siem_events"
 
 
 def test_support_findings_are_searchable_and_observed_per_run(tmp_path: Path) -> None:
@@ -604,6 +1213,7 @@ def test_ingest_additional_forensic_evidence_tables_and_queries(tmp_path: Path) 
     assert snapshot["counts"]["wlan_radios"] == 1
     assert snapshot["counts"]["wlan_associations"] == 1
     assert snapshot["counts"]["device_risk_summaries"] == 1
+    assert snapshot["counts"]["security_advisories"] >= 1
     assert host_filter["rows"][0]["name"] == "Standard"
     assert mesh["rows"][0]["peer"] == "Repeater"
     assert wan["rows"][0]["external_port"] == "8443"
@@ -611,6 +1221,84 @@ def test_ingest_additional_forensic_evidence_tables_and_queries(tmp_path: Path) 
     assert association["rows"][0]["mac"] == "AA:BB:CC:DD:EE:FF"
     assert risk["rows"][0]["risk_level"] == "high"
     assert evidence["record"]["description"] == "camera https"
+
+
+def test_security_advisories_are_derived_from_router_settings(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {
+                "support_data_txt": "remote access from internet enabled via MyFRITZ",
+                "webui_readonly_artifacts_json": """
+                {
+                  "endpoints": {
+                    "juis_boxinfo_xml": {
+                      "ok": true,
+                      "raw": "<e:BoxInfo><q:Flag>2nd_factor_disabled</q:Flag><q:Flag>remote_login_service</q:Flag></e:BoxInfo>"
+                    }
+                  }
+                }
+                """,
+            },
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T11:00:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.50",
+                    "message": "Anmeldung fehlgeschlagen falsches Kennwort",
+                },
+                {
+                    "timestamp": "2026-05-20T11:01:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.50",
+                    "message": "Anmeldung fehlgeschlagen falsches Kennwort",
+                },
+                {
+                    "timestamp": "2026-05-20T11:02:00+02:00",
+                    "category": "auth",
+                    "ip": "192.0.2.50",
+                    "message": "Anmeldung fehlgeschlagen falsches Kennwort",
+                },
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [
+                {
+                    "hostname": "camera",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "ip": "192.0.2.44",
+                    "allow_pcp_and_upnp": "1",
+                    "upnp_count": "2",
+                }
+            ],
+            "wan_port_mappings": [
+                {
+                    "protocol": "TCP",
+                    "external_port": "443",
+                    "internal_client": "192.0.2.44",
+                    "internal_port": "443",
+                    "description": "camera https",
+                    "enabled": "1",
+                }
+            ],
+        },
+        db,
+    )
+
+    advisories = query_records(db, "", "security_advisories")
+    wan = query_records(db, "WAN port", "security")
+    analysis = analysis_snapshot(db)
+
+    assert advisories["total"] >= 5
+    assert advisories["rows"][0]["severity"] in {"critical", "high"}
+    assert wan["rows"][0]["advisory_id"] == "wan_port_mapping_enabled"
+    assert analysis["security_advisories"]["total"] >= 5
+    assert analysis["security_advisories"]["high_or_critical"] >= 1
+    assert query_records(db, "second factor", "security_advisories")["total"] == 1
+    assert query_records(db, "remote login service", "security_advisories")["total"] == 1
 
 
 def test_additional_evidence_extracts_from_raw_artifacts(tmp_path: Path) -> None:
@@ -792,3 +1480,121 @@ def test_advertisement_hints_are_extracted_and_searchable(tmp_path: Path) -> Non
     assert upnp["total"] >= 2
     assert snapshot["advertisement_hints"]["total"] >= 3
     assert any(row["label"] == "SSDP" for row in snapshot["advertisement_hints"]["by_protocol"])
+
+
+def test_investigation_probe_telemetry_filters_kernel_probe_false_positive(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {
+                "support_data_txt": "0x80890570 q6v5_wcss_probe+0x18c/0x5e8 phys=0x0cb50000 ioremap"
+            },
+            "support_findings": [
+                {
+                    "finding_type": "key_value",
+                    "source": "support_data_txt",
+                    "raw_text": "0x80890570 q6v5_wcss_probe+0x18c/0x5e8 phys=0x0cb50000 ioremap",
+                    "observed_at": "2026-05-20T12:00:00+02:00",
+                }
+            ],
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T10:10:00+02:00",
+                    "category": "wifi",
+                    "message": "[7407881.173308][  T926] wlan: ol_ath_wifi_ssr: Waiting for probe lock",
+                },
+                {
+                    "timestamp": "2026-05-20T10:20:00+02:00",
+                    "category": "wlan",
+                    "message": "802.11 Probe Request from AA:BB:CC:DD:EE:FF near radio 1",
+                }
+            ],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    snapshot = investigation_snapshot(db, "2026-05-20T10:00:00+02:00", "2026-05-20T11:00:00+02:00")
+
+    assert snapshot["probe_telemetry"]["total"] == 1
+    assert snapshot["probe_telemetry"]["false_positive_count"] == 1
+    assert snapshot["probe_telemetry"]["rows"][0]["mac"] == "aa:bb:cc:dd:ee:ff"
+    assert snapshot["discovery_devices"]["rows"][0]["kind"] == "nearby_probe"
+
+
+def test_investigation_reports_probe_telemetry_absence(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {
+                "support_data_txt": "dhcp multicast ssdp 239.255.255.250 from 192.0.2.44 aa:bb:cc:dd:ee:ff"
+            },
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    snapshot = investigation_snapshot(db)
+
+    assert snapshot["probe_telemetry"]["available"] is False
+    assert snapshot["probe_telemetry"]["total"] == 0
+    assert "No 802.11 probe-request" in snapshot["probe_telemetry"]["note"]
+    assert snapshot["counts"]["discovery_hints_total"] >= 1
+
+
+def test_reparse_support_wlan_environment_promotes_stored_raw_artifact(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    support = """
+##### BEGIN SECTION WLAN_SCAN_RESULTS WLAN scan results
+Scan results for radio '101':
+Scan time: 20.05.2026 22:15:54/[7407912.562]
+Scan table:
+[BSSID|CHANNEL_INFO|SSID|RSSI|WLAN MODE|CAPS]
+[ 0]: 'AA:BB:CC:DD:EE:01' 2437/2437/ 20/0000/  6-  8 'CafeNet' (len=7) -72 dBm [ 11N ] [ WPA2_PSK ]
+##### END SECTION WLAN_SCAN_RESULTS
+
+##### BEGIN SECTION SCAN_EVENTS History of scan requests and finished events
+[00] t=20.05.2026 12:00:01/[7365674.807]: SCAN_REQUEST  , radio '101' "ACS-6h", "", HAL returned SUCCESS
+##### END SECTION SCAN_EVENTS
+
+##### BEGIN SECTION ENV_INTERFERENCE_HISTORY History of radar and interference events
+[00] t=20.05.2026 12:01:02/[10146.150]: INTERFERENCE        , radio '101', primary freq 2437 MHz, active, channel change.
+##### END SECTION ENV_INTERFERENCE_HISTORY
+
+##### BEGIN SECTION WLAN_CHANNEL_INFO WLAN channel load
+2437 MHz ( 6) | 34 %
+##### END SECTION WLAN_CHANNEL_INFO
+"""
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {"support_data_txt": support},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    assert query_records(db, "CafeNet", "advertisement_hints")["total"] == 0
+
+    result = reparse_support_wlan_environment(db)
+
+    assert result["parsed"]["advertisement_hints"] == 1
+    assert result["parsed"]["network_status_snapshots"] == 3
+    assert query_records(db, "CafeNet", "advertisement_hints")["rows"][0]["mac"] == "aa:bb:cc:dd:ee:01"
+    assert query_records(db, "wlan_scan_event", "network_status")["total"] == 1

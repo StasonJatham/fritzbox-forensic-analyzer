@@ -8,10 +8,16 @@ from pathlib import Path
 import sqlite3
 import re
 import subprocess
+import threading
 from typing import Any
+
+from fritzbox_siem import refresh_siem_views
+from fritzbox_siem_parser import parse_fritzbox_log_message
 
 
 DEFAULT_DB = Path(os.getenv("FRITZBOX_ANALYSIS_DB", "fritzbox-analysis.sqlite3"))
+SCHEMA_LOCK = threading.RLock()
+SCHEMA_READY: set[Path] = set()
 MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 ADVERTISEMENT_PROTOCOL_PATTERNS = {
@@ -25,8 +31,27 @@ ADVERTISEMENT_PROTOCOL_PATTERNS = {
     "ARP/Neighbor": re.compile(r"\b(arp|neighbou?r|ndp|neighbor solicitation|neighbor advertisement)\b", re.I),
     "DHCP": re.compile(r"\b(dhcp|bootp|67/udp|68/udp|udp.?67|udp.?68)\b", re.I),
 }
+PROBE_REQUEST_PATTERNS = [
+    re.compile(r"\bprobe[-_\s]?request\b", re.I),
+    re.compile(r"\b(probereq|prbreq|prb_req)\b", re.I),
+    re.compile(r"\b802\.11\b.{0,120}\bprobe\b", re.I | re.S),
+    re.compile(r"\bprobe\b.{0,120}\b802\.11\b", re.I | re.S),
+    re.compile(r"\b(wlan|wi-?fi|wireless)\b.{0,120}\bprobe\b", re.I | re.S),
+    re.compile(r"\b(mgmt|management frame)\b.{0,120}\bprobe\b", re.I | re.S),
+    re.compile(r"\b(sondierungsanfrage|suchanfrage)\b", re.I),
+]
+PROBE_FALSE_POSITIVE_PATTERNS = [
+    re.compile(r"\bq6v5_wcss_probe\b", re.I),
+    re.compile(r"\b[a-z0-9_]+_probe\b", re.I),
+    re.compile(r"\bprobe\+0x[0-9a-f]+\b", re.I),
+    re.compile(r"\bdriver probe\b", re.I),
+    re.compile(r"\bprobe failed\b", re.I),
+    re.compile(r"\bprobing\b", re.I),
+    re.compile(r"\bprobe lock\b", re.I),
+]
 EXPECTED_RAW_ARTIFACTS = [
     "device_log_xml",
+    "device_log_xml_wlan",
     "mesh_list",
     "host_list_xml",
     "wlan_device_list_xml",
@@ -54,14 +79,29 @@ WIFI_DEDUPE_SQL = """
 """
 
 
-def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(
-        """
-        PRAGMA journal_mode = WAL;
+def restrict_db_permissions(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        return
 
-        CREATE TABLE IF NOT EXISTS export_runs (
+
+def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
+    path = Path(path)
+    schema_key = path.resolve()
+    existed_before_connect = path.exists()
+    conn = sqlite3.connect(path, timeout=30.0)
+    if not existed_before_connect:
+        restrict_db_permissions(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    with SCHEMA_LOCK:
+        if not existed_before_connect or schema_key not in SCHEMA_READY:
+            conn.executescript(
+                """
+                PRAGMA journal_mode = WAL;
+
+                CREATE TABLE IF NOT EXISTS export_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             generated_at TEXT NOT NULL,
             router_address TEXT,
@@ -85,7 +125,7 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             sha256 TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE(name, sha256),
+            UNIQUE(run_id, name, sha256),
             FOREIGN KEY(run_id) REFERENCES export_runs(id)
         );
 
@@ -96,11 +136,12 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             category TEXT,
             mac TEXT,
             ip TEXT,
+            source TEXT,
             message TEXT NOT NULL,
             evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
             evidence_note TEXT,
             searchable TEXT NOT NULL,
-            UNIQUE(timestamp, message),
+            UNIQUE(timestamp, message, source),
             FOREIGN KEY(run_id) REFERENCES export_runs(id)
         );
 
@@ -363,6 +404,93 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             FOREIGN KEY(run_id) REFERENCES export_runs(id)
         );
 
+        CREATE TABLE IF NOT EXISTS security_advisories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            record_key TEXT NOT NULL,
+            advisory_id TEXT,
+            severity TEXT,
+            category TEXT,
+            title TEXT,
+            subject TEXT,
+            status TEXT,
+            recommendation TEXT,
+            source TEXT,
+            confidence TEXT,
+            evidence_json TEXT,
+            evidence_level TEXT NOT NULL DEFAULT 'inferred',
+            evidence_note TEXT,
+            raw_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, record_key),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS siem_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            event_time TEXT,
+            event_category TEXT NOT NULL,
+            event_kind TEXT NOT NULL,
+            action TEXT,
+            outcome TEXT,
+            severity TEXT,
+            entity TEXT,
+            hostname TEXT,
+            mac TEXT,
+            ip TEXT,
+            interface TEXT,
+            protocol TEXT,
+            source TEXT,
+            confidence TEXT,
+            evidence_level TEXT,
+            evidence_note TEXT,
+            record_type TEXT NOT NULL,
+            record_id INTEGER NOT NULL,
+            message TEXT,
+            tags_json TEXT NOT NULL,
+            fields_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS siem_correlations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            correlation_type TEXT NOT NULL DEFAULT 'entity_rollup',
+            rule_id TEXT,
+            rule_version TEXT,
+            confidence TEXT,
+            window_start TEXT,
+            window_end TEXT,
+            entity_key TEXT NOT NULL,
+            entity_label TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            event_count INTEGER NOT NULL,
+            categories_json TEXT NOT NULL,
+            tags_json TEXT NOT NULL,
+            severity TEXT,
+            summary TEXT,
+            fields_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, rule_id, entity_key, window_start, window_end),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS siem_correlation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            correlation_id INTEGER NOT NULL,
+            event_id INTEGER NOT NULL,
+            role TEXT,
+            reason TEXT,
+            weight INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(run_id) REFERENCES export_runs(id),
+            FOREIGN KEY(correlation_id) REFERENCES siem_correlations(id),
+            FOREIGN KEY(event_id) REFERENCES siem_events(id)
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
             record_type,
             record_id UNINDEXED,
@@ -390,13 +518,15 @@ def init_db(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             content_json TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES export_runs(id)
         );
-        """
-    )
-    ensure_schema(conn)
+                """
+            )
+            ensure_schema(conn)
+            SCHEMA_READY.add(schema_key)
     return conn
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    migrate_raw_artifacts_unique_constraint(conn)
     ensure_columns(
         conn,
         "export_runs",
@@ -413,11 +543,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         },
     )
     ensure_columns(
-        conn, "event_log", {"evidence_level": "TEXT NOT NULL DEFAULT 'parsed_from_raw'", "evidence_note": "TEXT"}
+        conn,
+        "event_log",
+        {
+            "source": "TEXT",
+            "evidence_level": "TEXT NOT NULL DEFAULT 'parsed_from_raw'",
+            "evidence_note": "TEXT",
+        },
     )
+    migrate_event_log_source_unique_constraint(conn)
     ensure_columns(
         conn, "wifi_connections", {"evidence_level": "TEXT NOT NULL DEFAULT 'inferred'", "evidence_note": "TEXT"}
     )
+    migrate_siem_correlations_unique_constraint(conn)
     ensure_columns(
         conn,
         "hosts",
@@ -459,6 +597,34 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "last_activity_note": "TEXT",
         },
     )
+    ensure_columns(
+        conn,
+        "siem_correlations",
+        {
+            "correlation_type": "TEXT NOT NULL DEFAULT 'entity_rollup'",
+            "rule_id": "TEXT",
+            "rule_version": "TEXT",
+            "confidence": "TEXT",
+            "window_start": "TEXT",
+            "window_end": "TEXT",
+        },
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS siem_correlation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            correlation_id INTEGER NOT NULL,
+            event_id INTEGER NOT NULL,
+            role TEXT,
+            reason TEXT,
+            weight INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(run_id) REFERENCES export_runs(id),
+            FOREIGN KEY(correlation_id) REFERENCES siem_correlations(id),
+            FOREIGN KEY(event_id) REFERENCES siem_events(id)
+        )
+        """
+    )
     conn.execute(
         """
         UPDATE event_log
@@ -466,6 +632,140 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         WHERE evidence_note IS NULL
         """
     )
+    ensure_indexes(conn)
+
+
+def migrate_raw_artifacts_unique_constraint(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'raw_artifacts'"
+    ).fetchone()
+    if not row or "UNIQUE(name, sha256)" not in str(row["sql"] or ""):
+        return
+    conn.executescript(
+        """
+        ALTER TABLE raw_artifacts RENAME TO raw_artifacts_legacy_unique;
+        CREATE TABLE raw_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(run_id, name, sha256),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+        INSERT OR IGNORE INTO raw_artifacts(id, run_id, name, sha256, content, created_at)
+        SELECT id, run_id, name, sha256, content, created_at
+        FROM raw_artifacts_legacy_unique;
+        DROP TABLE raw_artifacts_legacy_unique;
+        """
+    )
+
+
+def migrate_event_log_source_unique_constraint(conn: sqlite3.Connection) -> None:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'event_log'").fetchone()
+    table_sql = str(row["sql"] or "") if row else ""
+    if "UNIQUE(timestamp, message)" not in table_sql or "UNIQUE(timestamp, message, source)" in table_sql:
+        return
+    conn.executescript(
+        """
+        ALTER TABLE event_log RENAME TO event_log_legacy_unique;
+        CREATE TABLE event_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            timestamp TEXT,
+            category TEXT,
+            mac TEXT,
+            ip TEXT,
+            source TEXT,
+            message TEXT NOT NULL,
+            evidence_level TEXT NOT NULL DEFAULT 'parsed_from_raw',
+            evidence_note TEXT,
+            searchable TEXT NOT NULL,
+            UNIQUE(timestamp, message, source),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+        INSERT OR IGNORE INTO event_log(
+            id, run_id, timestamp, category, mac, ip, source, message,
+            evidence_level, evidence_note, searchable
+        )
+        SELECT id, run_id, timestamp, category, mac, ip, COALESCE(source, 'device_log'), message,
+               COALESCE(evidence_level, 'parsed_from_raw'), evidence_note, searchable
+        FROM event_log_legacy_unique;
+        DROP TABLE event_log_legacy_unique;
+        """
+    )
+
+
+def migrate_siem_correlations_unique_constraint(conn: sqlite3.Connection) -> None:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'siem_correlations'").fetchone()
+    table_sql = str(row["sql"] or "") if row else ""
+    if "UNIQUE(run_id, entity_key)" not in table_sql:
+        return
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS siem_correlation_events;
+        ALTER TABLE siem_correlations RENAME TO siem_correlations_legacy_unique;
+        CREATE TABLE siem_correlations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            correlation_type TEXT NOT NULL DEFAULT 'entity_rollup',
+            rule_id TEXT,
+            rule_version TEXT,
+            confidence TEXT,
+            window_start TEXT,
+            window_end TEXT,
+            entity_key TEXT NOT NULL,
+            entity_label TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            event_count INTEGER NOT NULL,
+            categories_json TEXT NOT NULL,
+            tags_json TEXT NOT NULL,
+            severity TEXT,
+            summary TEXT,
+            fields_json TEXT NOT NULL,
+            searchable TEXT NOT NULL,
+            UNIQUE(run_id, rule_id, entity_key, window_start, window_end),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+        INSERT OR IGNORE INTO siem_correlations(
+            id, run_id, correlation_type, rule_id, rule_version, confidence,
+            window_start, window_end, entity_key, entity_label, first_seen, last_seen,
+            event_count, categories_json, tags_json, severity, summary, fields_json, searchable
+        )
+        SELECT
+            id, run_id, 'entity_rollup', 'entity.timeline_rollup', '1', 'medium',
+            first_seen, last_seen, entity_key, entity_label, first_seen, last_seen,
+            event_count, categories_json, tags_json, severity, summary, fields_json, searchable
+        FROM siem_correlations_legacy_unique;
+        DROP TABLE siem_correlations_legacy_unique;
+        """
+    )
+
+
+def ensure_indexes(conn: sqlite3.Connection) -> None:
+    indexes = (
+        "CREATE INDEX IF NOT EXISTS idx_record_observations_run_type_table "
+        "ON record_observations(run_id, record_type, record_table_id)",
+        "CREATE INDEX IF NOT EXISTS idx_record_observations_type_table "
+        "ON record_observations(record_type, record_table_id)",
+        "CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_wifi_connections_time ON wifi_connections(derived_connected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_activity ON hosts(last_activity, last_connected, last_seen, first_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_advertisement_hints_time ON advertisement_hints(observed_at)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_events_run_time ON siem_events(run_id, event_time)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_events_kind ON siem_events(event_category, event_kind, severity)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_events_entity ON siem_events(mac, ip, hostname)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_correlations_run_seen ON siem_correlations(run_id, last_seen)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_correlations_entity ON siem_correlations(entity_key)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_correlations_rule ON siem_correlations(rule_id, correlation_type)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_correlation_events_correlation "
+        "ON siem_correlation_events(correlation_id)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_correlation_events_event ON siem_correlation_events(event_id)",
+    )
+    for sql in indexes:
+        conn.execute(sql)
     conn.execute(
         """
         UPDATE wifi_connections
@@ -484,7 +784,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         WHERE evidence_note IS NULL
         """
     )
-    repair_observation_table_ids(conn)
+    missing_observation_ids = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM record_observations WHERE record_table_id IS NULL AND record_type != 'raw_artifact'"
+        ).fetchone()[0]
+    )
+    if missing_observation_ids:
+        repair_observation_table_ids(conn)
     conn.commit()
 
 
@@ -508,6 +814,7 @@ def repair_observation_table_ids(conn: sqlite3.Connection) -> None:
         "wlan_association": lambda conn, row: lookup_keyed_record_id(conn, "wlan_associations", row),
         "advertisement_hint": lambda conn, row: lookup_keyed_record_id(conn, "advertisement_hints", row),
         "device_risk_summary": lambda conn, row: lookup_keyed_record_id(conn, "device_risk_summaries", row),
+        "security_advisory": lambda conn, row: lookup_keyed_record_id(conn, "security_advisories", row),
     }
     rows = conn.execute(
         """
@@ -574,7 +881,7 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                 """,
                 (run_id, name, digest, content, generated_at),
             )
-            row_id = cursor.lastrowid if cursor.rowcount else lookup_raw_artifact_id(conn, name, digest)
+            row_id = cursor.lastrowid if cursor.rowcount else lookup_raw_artifact_id(conn, run_id, name, digest)
             if row_id and cursor.rowcount:
                 add_fts(conn, "raw_artifacts", int(row_id), f"{name} {digest} {content}")
             add_observation(
@@ -637,14 +944,15 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
             )
 
         for event in dataset.get("event_log") or []:
+            event = normalize_event_log_row(event)
             searchable = searchable_text(event)
             evidence_level, evidence_note = event_evidence(event)
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO event_log(
-                    run_id, timestamp, category, mac, ip, message, evidence_level, evidence_note, searchable
+                    run_id, timestamp, category, mac, ip, source, message, evidence_level, evidence_note, searchable
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -652,6 +960,7 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                     event.get("category"),
                     event.get("mac"),
                     event.get("ip"),
+                    event.get("source") or "device_log",
                     event.get("message") or "",
                     evidence_level,
                     evidence_note,
@@ -673,7 +982,7 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                 event_time=event.get("timestamp"),
                 evidence_level=evidence_level,
                 evidence_note=evidence_note,
-                source="device_log_xml",
+                source=event.get("source") or "device_log",
                 content=event,
             )
 
@@ -849,7 +1158,13 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
                 record_key=host_key(host),
                 record_table_id=int(row_id) if row_id else None,
                 observed_at=acquired_at,
-                event_time=host.get("last_seen") or host.get("first_seen"),
+                event_time=(
+                    (generated_at if host.get("active_now") else None)
+                    or host.get("last_activity")
+                    or host.get("last_connected")
+                    or host.get("last_seen")
+                    or host.get("first_seen")
+                ),
                 evidence_level=evidence_level,
                 evidence_note=evidence_note,
                 source="Hosts:GetGenericHostEntry",
@@ -857,6 +1172,9 @@ def ingest_dataset(dataset: dict[str, Any], path: Path = DEFAULT_DB) -> int:
             )
 
         ingest_additional_evidence(conn, dataset, run_id, acquired_at, generated_at)
+        siem_counts = refresh_siem_views(conn, run_id)
+        summary = {**summary, **siem_counts}
+        conn.execute("UPDATE export_runs SET summary_json = ? WHERE id = ?", [json.dumps(summary, sort_keys=True), run_id])
     conn.close()
     return run_id
 
@@ -1024,7 +1342,7 @@ ADDITIONAL_EVIDENCE_TABLES: dict[str, dict[str, Any]] = {
         "note": "WLAN radio state parsed from FRITZ!Box WLAN evidence.",
     },
     "wlan_associations": {
-        "dataset_keys": ("wlan_associations", "wlan_association_details"),
+        "dataset_keys": ("wlan_associations", "wlan_association_details", "mesh_wifi_devices"),
         "record_type": "wlan_association",
         "fts_type": "wlan_associations",
         "columns": (
@@ -1083,7 +1401,7 @@ ADDITIONAL_EVIDENCE_TABLES: dict[str, dict[str, Any]] = {
             "source",
             "confidence",
         ),
-        "record_key_fields": ("observed_at", "area", "metric", "source"),
+        "record_key_fields": ("observed_at", "area", "metric", "value", "source"),
         "sort": "COALESCE(t.observed_at, '')",
         "time_column": "observed_at",
         "note": "Network/WAN/DSL/LAN counter snapshot parsed from FRITZ!Box TR-064 evidence.",
@@ -1108,6 +1426,27 @@ ADDITIONAL_EVIDENCE_TABLES: dict[str, dict[str, Any]] = {
         "time_column": "",
         "note": "Device risk summary derived from parsed FRITZ!Box host and exposure evidence.",
     },
+    "security_advisories": {
+        "dataset_keys": ("security_advisories", "security_audit_findings"),
+        "record_type": "security_advisory",
+        "fts_type": "security_advisories",
+        "columns": (
+            "advisory_id",
+            "severity",
+            "category",
+            "title",
+            "subject",
+            "status",
+            "recommendation",
+            "source",
+            "confidence",
+            "evidence_json",
+        ),
+        "record_key_fields": ("advisory_id", "subject", "source"),
+        "sort": "CASE t.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END",
+        "time_column": "",
+        "note": "Security advisory derived from parsed FRITZ!Box settings and retained evidence; verify in raw artifacts before remediation.",
+    },
 }
 ADDITIONAL_RECORD_TYPE_ALIASES: dict[str, str] = {
     "host_filter": "host_filter_profiles",
@@ -1115,6 +1454,7 @@ ADDITIONAL_RECORD_TYPE_ALIASES: dict[str, str] = {
     "host_filter_profiles": "host_filter_profiles",
     "mesh": "mesh_topology_links",
     "mesh_links": "mesh_topology_links",
+    "mesh_topology": "mesh_topology_links",
     "mesh_topology_links": "mesh_topology_links",
     "wan": "wan_port_mappings",
     "wan_exposure": "wan_port_mappings",
@@ -1139,6 +1479,11 @@ ADDITIONAL_RECORD_TYPE_ALIASES: dict[str, str] = {
     "device_risks": "device_risk_summaries",
     "device_risk": "device_risk_summaries",
     "device_risk_summaries": "device_risk_summaries",
+    "security": "security_advisories",
+    "security_advisory": "security_advisories",
+    "security_advisories": "security_advisories",
+    "security_audit": "security_advisories",
+    "security_audit_findings": "security_advisories",
 }
 
 
@@ -1202,6 +1547,76 @@ def ingest_additional_evidence(
             )
 
 
+def reparse_support_wlan_environment(path: Path = DEFAULT_DB, run_id: int | str = "latest") -> dict[str, Any]:
+    """Promote newly supported WLAN support-data sections from stored raw artifacts."""
+    from fritzbox_parsers import parse_support_wlan_environment
+
+    conn = init_db(path)
+    with conn:
+        run = resolve_reparse_run(conn, run_id)
+        support_rows = conn.execute(
+            """
+            SELECT content_json
+            FROM record_observations
+            WHERE run_id = ? AND record_type = 'raw_artifact' AND source = 'support_data_txt'
+            ORDER BY id DESC
+            """,
+            [run["id"]],
+        ).fetchall()
+        before = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id = ?", [run["id"]]).fetchone()[0])
+            for table in ("advertisement_hints", "network_status_snapshots")
+        }
+        hints: list[dict[str, Any]] = []
+        snapshots: list[dict[str, Any]] = []
+        for row in support_rows:
+            try:
+                content = json.loads(row["content_json"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            artifact_content = content.get("content")
+            if not isinstance(artifact_content, str) or not artifact_content:
+                continue
+            parsed_hints, parsed_snapshots = parse_support_wlan_environment(artifact_content, run["generated_at"])
+            hints.extend(parsed_hints)
+            snapshots.extend(parsed_snapshots)
+        if hints or snapshots:
+            ingest_additional_evidence(
+                conn,
+                {
+                    "generated_at": run["generated_at"],
+                    "advertisement_hints": hints,
+                    "network_status_snapshots": snapshots,
+                },
+                int(run["id"]),
+                str(run["acquired_at"] or run["generated_at"]),
+                str(run["generated_at"]),
+            )
+        after = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id = ?", [run["id"]]).fetchone()[0])
+            for table in ("advertisement_hints", "network_status_snapshots")
+        }
+    conn.close()
+    return {
+        "run_id": int(run["id"]),
+        "generated_at": run["generated_at"],
+        "raw_support_artifacts": len(support_rows),
+        "parsed": {"advertisement_hints": len(hints), "network_status_snapshots": len(snapshots)},
+        "inserted": {table: after[table] - before[table] for table in before},
+        "totals": after,
+    }
+
+
+def resolve_reparse_run(conn: sqlite3.Connection, run_id: int | str) -> sqlite3.Row:
+    if str(run_id).casefold() == "latest":
+        row = conn.execute("SELECT * FROM export_runs ORDER BY id DESC LIMIT 1").fetchone()
+    else:
+        row = conn.execute("SELECT * FROM export_runs WHERE id = ?", [int(run_id)]).fetchone()
+    if row is None:
+        raise ValueError(f"Export run not found: {run_id}")
+    return row
+
+
 def extract_additional_evidence(dataset: dict[str, Any], generated_at: str) -> dict[str, list[dict[str, Any]]]:
     rows: dict[str, list[dict[str, Any]]] = {table: [] for table in ADDITIONAL_EVIDENCE_TABLES}
     for table, spec in ADDITIONAL_EVIDENCE_TABLES.items():
@@ -1232,12 +1647,15 @@ def extract_additional_evidence(dataset: dict[str, Any], generated_at: str) -> d
 
     mesh_raw = raw_exports.get("mesh_list")
     rows["mesh_topology_links"].extend(extract_mesh_links(mesh_raw))
+    rows["wan_port_mappings"].extend(extract_query_lua_port_mappings(raw_exports.get("query_lua_artifacts_json")))
     rows["advertisement_hints"].extend(
         build_advertisement_hints(dataset, raw_exports, rows["wan_port_mappings"], generated_at)
     )
 
     if not rows["device_risk_summaries"]:
         rows["device_risk_summaries"].extend(build_device_risk_summaries(dataset))
+    if not rows["security_advisories"]:
+        rows["security_advisories"].extend(build_security_advisories(dataset, raw_exports, rows))
     return rows
 
 
@@ -1273,14 +1691,16 @@ def normalize_additional_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("total_associations", first_value(row, "total_associations", "associations"))
         normalized.setdefault("source", "WLANConfiguration:GetInfo")
     elif table == "wlan_associations":
-        normalized.setdefault("observed_at", first_value(row, "observed_at", "timestamp"))
+        normalized.setdefault("observed_at", first_value(row, "observed_at", "timestamp", "last_observed"))
         normalized.setdefault(
             "association_index", first_value(row, "association_index", "index", "NewAssociatedDeviceIndex")
         )
+        normalized.setdefault("association_index", first_value(row, "association_index") or f"mesh:{row.get('mac') or ''}")
         normalized.setdefault("mac", first_value(row, "mac", "NewAssociatedDeviceMACAddress"))
-        normalized.setdefault("ip", first_value(row, "ip", "NewAssociatedDeviceIPAddress"))
+        normalized.setdefault("ip", first_value(row, "ip", "NewAssociatedDeviceIPAddress") or ", ".join(row.get("ip_addresses") or []))
         normalized.setdefault("hostname", first_value(row, "hostname", "NewAssociatedDeviceName"))
         normalized.setdefault("auth_state", first_value(row, "auth_state", "NewAssociatedDeviceAuthState"))
+        normalized.setdefault("channel", first_value(row, "channel", "current_channel"))
         normalized.setdefault("source", "WLANConfiguration:GetGenericAssociatedDeviceInfo")
     elif table == "advertisement_hints":
         normalized.setdefault("observed_at", first_value(row, "observed_at", "timestamp"))
@@ -1306,12 +1726,33 @@ def normalize_additional_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("device_key", device_key)
         normalized.setdefault("reasons_json", first_value(row, "reasons_json", "reasons"))
         normalized.setdefault("source", "derived_device_risk")
+    elif table == "security_advisories":
+        normalized.setdefault("advisory_id", first_value(row, "advisory_id", "id", "rule_id"))
+        normalized.setdefault("severity", first_value(row, "severity", "risk_level", "level"))
+        normalized.setdefault("category", first_value(row, "category", "area"))
+        normalized.setdefault("title", first_value(row, "title", "summary"))
+        normalized.setdefault("subject", first_value(row, "subject", "device", "host", "service"))
+        normalized.setdefault("status", first_value(row, "status") or "review")
+        normalized.setdefault("recommendation", first_value(row, "recommendation", "remediation"))
+        normalized.setdefault("source", first_value(row, "source") or "derived_security_advisory")
+        normalized.setdefault("confidence", first_value(row, "confidence") or "medium")
+        normalized.setdefault("evidence_json", first_value(row, "evidence_json", "evidence"))
+        normalized.setdefault("evidence_level", "inferred")
+        normalized.setdefault(
+            "evidence_note",
+            "Security advisory derived from parsed FRITZ!Box settings and retained evidence; verify raw artifacts before remediation.",
+        )
     return normalized
 
 
 def extract_host_filter_profiles(tr064: dict[str, Any]) -> list[dict[str, Any]]:
     response = ((tr064.get("actions") or {}).get("host_filter_profiles") or {}).get("response") or {}
-    profiles = response.get("NewProfileList") or response.get("profiles") or response.get("Profiles")
+    profiles = (
+        response.get("NewProfileList")
+        or response.get("NewFilterProfileList")
+        or response.get("profiles")
+        or response.get("Profiles")
+    )
     if isinstance(profiles, list):
         return [
             {**profile, "source": "X_AVM-DE_HostFilter:GetFilterProfiles"}
@@ -1334,6 +1775,41 @@ def extract_wan_port_mappings(tr064: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(response, dict):
                 rows.append({**response, "source": key})
     return rows
+
+
+def extract_query_lua_port_mappings(content: str | None) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    try:
+        artifacts = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    port_sharing = artifacts.get("port_sharing") or {}
+    data = port_sharing.get("data") if isinstance(port_sharing, dict) else {}
+    rows = data.get("port_sharing") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    mappings: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        mappings.append(
+            {
+                "protocol": row.get("protocol"),
+                "external_port": row.get("port"),
+                "internal_client": row.get("fwip"),
+                "internal_port": row.get("fwport"),
+                "description": row.get("description"),
+                "enabled": row.get("enabled") if row.get("enabled") not in (None, "") else "unknown",
+                "remote_host": row.get("sourceip"),
+                "lease_duration": None,
+                "source": "query_lua_port_sharing",
+                "record_index": index,
+                "raw": row,
+                "evidence_note": "Port-sharing rule parsed from internal FRITZ!Box query.lua response.",
+            }
+        )
+    return mappings
 
 
 def extract_wlan_radios(tr064: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1734,6 +2210,363 @@ def build_device_risk_summaries(dataset: dict[str, Any]) -> list[dict[str, Any]]
     return rows
 
 
+def build_security_advisories(
+    dataset: dict[str, Any],
+    raw_exports: dict[str, Any],
+    extracted: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    generated_at = str(dataset.get("generated_at") or datetime.now().astimezone().isoformat())
+    known_hosts = [host for host in dataset.get("known_hosts") or [] if isinstance(host, dict)]
+    event_log = [event for event in dataset.get("event_log") or [] if isinstance(event, dict)]
+    wan_mappings = [row for row in extracted.get("wan_port_mappings", []) if isinstance(row, dict)]
+    wlan_radios = [row for row in extracted.get("wlan_radios", []) if isinstance(row, dict)]
+    network_status = [row for row in extracted.get("network_status_snapshots", []) if isinstance(row, dict)]
+    raw_text = "\n".join(f"{name}\n{artifact_text(content)}" for name, content in raw_exports.items())
+
+    for mapping in wan_mappings:
+        if not truthy_value(first_value(mapping, "enabled", "NewEnabled")):
+            continue
+        external = first_value(mapping, "external_port", "NewExternalPort")
+        internal_client = first_value(mapping, "internal_client", "NewInternalClient")
+        internal_port = first_value(mapping, "internal_port", "NewInternalPort")
+        protocol = first_value(mapping, "protocol", "NewProtocol")
+        description = first_value(mapping, "description", "NewPortMappingDescription")
+        severity = "critical" if str(external or "") in {"80", "443", "22", "3389", "5900", "8080", "8443"} else "high"
+        rows.append(
+            security_advisory_row(
+                advisory_id="wan_port_mapping_enabled",
+                severity=severity,
+                category="WAN exposure",
+                title="Enabled WAN port mapping exposes an internal service",
+                subject=" ".join(
+                    part
+                    for part in [
+                        str(protocol or "").upper(),
+                        str(external or "?"),
+                        "to",
+                        str(internal_client or "unknown"),
+                        str(internal_port or ""),
+                    ]
+                    if part
+                ),
+                recommendation=(
+                    "Remove the port sharing rule unless it is explicitly required. Prefer VPN access, restrict the exposed "
+                    "service, and confirm the internal device is patched."
+                ),
+                source=first_value(mapping, "source") or "wan_port_mappings",
+                confidence="high",
+                evidence={
+                    "external_port": external,
+                    "internal_client": internal_client,
+                    "internal_port": internal_port,
+                    "protocol": protocol,
+                    "description": description,
+                },
+            )
+        )
+
+    for host in known_hosts:
+        hostname = first_value(host, "hostname", "friendly_name", "name")
+        mac = first_value(host, "mac", "mac_address")
+        ip = first_value(host, "ip", "ipv4")
+        subject = " / ".join(str(value) for value in (hostname, ip, mac) if value)
+        if truthy_value(host.get("allow_pcp_and_upnp")):
+            rows.append(
+                security_advisory_row(
+                    advisory_id="host_upnp_pcp_allowed",
+                    severity="medium",
+                    category="Automatic port sharing",
+                    title="Device is allowed to create UPnP/PCP port mappings",
+                    subject=subject or "Unknown host",
+                    recommendation=(
+                        "Disable autonomous port sharing for this device unless there is a documented need. Review existing "
+                        "port mappings and application requirements."
+                    ),
+                    source="host_table",
+                    confidence="medium",
+                    evidence={
+                        "hostname": hostname,
+                        "mac": mac,
+                        "ip": ip,
+                        "allow_pcp_and_upnp": host.get("allow_pcp_and_upnp"),
+                        "pcp_count": host.get("pcp_count"),
+                        "upnp_count": host.get("upnp_count"),
+                    },
+                )
+            )
+        if int_string(host.get("upnp_count")) or int_string(host.get("pcp_count")):
+            rows.append(
+                security_advisory_row(
+                    advisory_id="host_upnp_pcp_activity",
+                    severity="medium",
+                    category="Automatic port sharing",
+                    title="Device has UPnP/PCP mapping counters",
+                    subject=subject or "Unknown host",
+                    recommendation="Inspect active WAN mappings and disable UPnP/PCP for devices that do not need inbound access.",
+                    source="host_table",
+                    confidence="medium",
+                    evidence={
+                        "hostname": hostname,
+                        "mac": mac,
+                        "ip": ip,
+                        "pcp_count": host.get("pcp_count"),
+                        "upnp_count": host.get("upnp_count"),
+                    },
+                )
+            )
+        if truthy_value(host.get("myfritz_enabled")):
+            rows.append(
+                security_advisory_row(
+                    advisory_id="host_myfritz_enabled",
+                    severity="medium",
+                    category="Remote access",
+                    title="MyFRITZ is enabled for a host",
+                    subject=subject or "Unknown host",
+                    recommendation="Confirm the MyFRITZ exposure is intentional and protected with strong credentials and MFA where available.",
+                    source="host_table",
+                    confidence="medium",
+                    evidence={
+                        "hostname": hostname,
+                        "mac": mac,
+                        "ip": ip,
+                        "myfritz_enabled": host.get("myfritz_enabled"),
+                    },
+                )
+            )
+
+    for radio in wlan_radios:
+        if not truthy_value(first_value(radio, "enabled", "NewEnable")):
+            continue
+        ssid = first_value(radio, "ssid", "NewSSID")
+        security = first_value(radio, "security", "NewBeaconType", "beacon_type", "encryption")
+        lower_security = str(security or "").casefold()
+        if security and any(token in lower_security for token in ("none", "open", "wep")):
+            rows.append(
+                security_advisory_row(
+                    advisory_id="wlan_insecure_encryption",
+                    severity="critical" if "none" in lower_security or "open" in lower_security else "high",
+                    category="Wireless security",
+                    title="WLAN radio appears to use weak or no encryption",
+                    subject=str(ssid or f"radio {radio.get('radio_index') or '?'}"),
+                    recommendation="Use WPA2/WPA3 with a strong passphrase. Disable open or WEP networks.",
+                    source=first_value(radio, "source") or "wlan_radios",
+                    confidence="medium",
+                    evidence={"ssid": ssid, "security": security, "radio_index": radio.get("radio_index")},
+                )
+            )
+        if ssid and any(token in str(ssid).casefold() for token in ("guest", "gast")):
+            rows.append(
+                security_advisory_row(
+                    advisory_id="guest_wlan_enabled",
+                    severity="low",
+                    category="Wireless security",
+                    title="Guest WLAN appears enabled",
+                    subject=str(ssid),
+                    recommendation="Verify guest isolation, captive access expectations, and that guest clients cannot reach internal systems.",
+                    source=first_value(radio, "source") or "wlan_radios",
+                    confidence="low",
+                    evidence={"ssid": ssid, "radio_index": radio.get("radio_index"), "enabled": radio.get("enabled")},
+                )
+            )
+
+    for row in network_status:
+        metric = str(first_value(row, "metric") or "")
+        value = first_value(row, "value")
+        if metric.endswith("NewUpgradeAvailable") and truthy_value(value):
+            rows.append(
+                security_advisory_row(
+                    advisory_id="firmware_update_available",
+                    severity="medium",
+                    category="Firmware",
+                    title="FRITZ!Box reports an available firmware update",
+                    subject="Router firmware",
+                    recommendation="Review and apply the firmware update after preserving evidence required for the case.",
+                    source=first_value(row, "source") or "network_status_snapshots",
+                    confidence="high",
+                    evidence={"metric": metric, "value": value},
+                )
+            )
+        if "AutoUpdate" in metric and str(value).casefold() in {"0", "off", "disabled", "false"}:
+            rows.append(
+                security_advisory_row(
+                    advisory_id="auto_update_disabled",
+                    severity="low",
+                    category="Firmware",
+                    title="Automatic firmware update appears disabled",
+                    subject="Router firmware",
+                    recommendation="Confirm patch-management policy and enable automatic updates where operationally acceptable.",
+                    source=first_value(row, "source") or "network_status_snapshots",
+                    confidence="medium",
+                    evidence={"metric": metric, "value": value},
+                )
+            )
+
+    failed_auth = [
+        event
+        for event in event_log
+        if re.search(
+            r"(failed|fehlgeschlagen|falsches|wrong|incorrect|kennwort)", str(event.get("message") or ""), re.I
+        )
+    ]
+    if len(failed_auth) >= 3:
+        rows.append(
+            security_advisory_row(
+                advisory_id="repeated_failed_login",
+                severity="high" if len(failed_auth) >= 10 else "medium",
+                category="Authentication",
+                title="Repeated failed FRITZ!Box login attempts retained in logs",
+                subject=f"{len(failed_auth)} retained failed-login events",
+                recommendation="Review source IPs, change admin credentials if unexpected, and restrict remote/admin access paths.",
+                source="device_log_xml",
+                confidence="high",
+                evidence={
+                    "count": len(failed_auth),
+                    "source_ips": sorted({str(event.get("ip")) for event in failed_auth if event.get("ip")}),
+                    "first": min(
+                        (str(event.get("timestamp")) for event in failed_auth if event.get("timestamp")), default=None
+                    ),
+                    "last": max(
+                        (str(event.get("timestamp")) for event in failed_auth if event.get("timestamp")), default=None
+                    ),
+                },
+            )
+        )
+
+    remote_patterns = {
+        "remote_admin_enabled": r"(remote access|internet access to.*fritz|zugriff aus dem internet|fernzugriff|https-port)",
+        "vpn_enabled": r"\b(wireguard|vpn|ipsec)\b",
+        "exposed_router_service": r"(myfritz|fritz!nas|ftp server|webdav|portfreigabe|port sharing)",
+    }
+    for advisory_id, pattern in remote_patterns.items():
+        match = re.search(pattern, raw_text, re.I)
+        if not match:
+            continue
+        severity = "high" if advisory_id in {"remote_admin_enabled", "exposed_router_service"} else "low"
+        title = {
+            "remote_admin_enabled": "Raw settings mention possible remote router administration",
+            "vpn_enabled": "VPN-related router setting or state retained",
+            "exposed_router_service": "Raw settings mention externally reachable router/service exposure",
+        }[advisory_id]
+        recommendation = {
+            "remote_admin_enabled": "Verify whether router administration from the internet is enabled. Disable it unless strictly required.",
+            "vpn_enabled": "Confirm VPN users/keys are expected and revoke unused access.",
+            "exposed_router_service": "Review internet-facing router services and disable unused exposure.",
+        }[advisory_id]
+        rows.append(
+            security_advisory_row(
+                advisory_id=advisory_id,
+                severity=severity,
+                category="Remote access",
+                title=title,
+                subject=match.group(0),
+                recommendation=recommendation,
+                source="raw_artifacts",
+                confidence="low",
+                evidence={"matched_text": artifact_snippet(raw_text, match.start(), 240)},
+            )
+        )
+
+    if re.search(r"<q:Flag>\s*remote_login_service\s*</q:Flag>|remote_login_service", raw_text, re.I):
+        rows.append(
+            security_advisory_row(
+                advisory_id="juis_remote_login_service_flag",
+                severity="high",
+                category="Remote access",
+                title="Router metadata reports remote login service flag",
+                subject="remote_login_service",
+                recommendation=(
+                    "Verify whether FRITZ!Box login from the internet or provider/remote-login service paths are enabled. "
+                    "Disable unused remote access and prefer WireGuard/VPN-only administration."
+                ),
+                source="juis_boxinfo_xml",
+                confidence="medium",
+                evidence={"flag": "remote_login_service"},
+            )
+        )
+
+    if re.search(r"<q:Flag>\s*2nd_factor_disabled\s*</q:Flag>|2nd_factor_disabled", raw_text, re.I):
+        rows.append(
+            security_advisory_row(
+                advisory_id="juis_second_factor_disabled_flag",
+                severity="medium",
+                category="Authentication",
+                title="Router metadata reports second factor disabled",
+                subject="2nd_factor_disabled",
+                recommendation=(
+                    "Review FRITZ!Box login protection settings. For remote administration or MyFRITZ/VPN management, "
+                    "enable the strongest available confirmation and use unique admin credentials."
+                ),
+                source="juis_boxinfo_xml",
+                confidence="medium",
+                evidence={"flag": "2nd_factor_disabled"},
+            )
+        )
+
+    if re.search(r"<q:Flag>\s*mesh_master_no_trusted\s*</q:Flag>|mesh_master_no_trusted", raw_text, re.I):
+        rows.append(
+            security_advisory_row(
+                advisory_id="juis_mesh_master_no_trusted_flag",
+                severity="low",
+                category="Mesh security",
+                title="Router metadata reports mesh trust flag",
+                subject="mesh_master_no_trusted",
+                recommendation=(
+                    "Verify mesh topology and trusted repeater/AP state in the FRITZ!Box UI. Unexpected mesh peers should "
+                    "be removed before analysis continues."
+                ),
+                source="juis_boxinfo_xml",
+                confidence="low",
+                evidence={"flag": "mesh_master_no_trusted"},
+            )
+        )
+
+    if "support_data_txt" in raw_exports or "config_export_file" in raw_exports:
+        present = [name for name in ("support_data_txt", "config_export_file") if name in raw_exports]
+        rows.append(
+            security_advisory_row(
+                advisory_id="sensitive_artifacts_retained",
+                severity="low",
+                category="Evidence handling",
+                title="Sensitive support/config artifacts are retained in the local case database",
+                subject=", ".join(present),
+                recommendation="Protect the local database and exported forensic packages. Avoid sharing support/config artifacts without redaction.",
+                source="raw_artifacts",
+                confidence="high",
+                evidence={"artifacts": present, "observed_at": generated_at},
+            )
+        )
+
+    return dedupe_security_advisories(rows)
+
+
+def security_advisory_row(**values: Any) -> dict[str, Any]:
+    evidence = values.get("evidence") or {}
+    return {
+        **values,
+        "status": values.get("status") or "review",
+        "evidence_json": evidence,
+        "evidence_level": "inferred",
+        "evidence_note": (
+            "Security advisory derived from parsed FRITZ!Box settings and retained evidence; "
+            "verify raw artifacts before remediation."
+        ),
+    }
+
+
+def dedupe_security_advisories(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    for row in rows:
+        key = "|".join(str(row.get(field) or "") for field in ("advisory_id", "subject", "source"))
+        current = deduped.get(key)
+        if not current or severity_order.get(str(row.get("severity")), 0) > severity_order.get(
+            str(current.get("severity")), 0
+        ):
+            deduped[key] = row
+    return list(deduped.values())
+
+
 def first_value(row: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         value = row.get(key)
@@ -1763,6 +2596,25 @@ def truthy_value(value: Any) -> bool:
     return str(value or "").strip().casefold() in {"1", "true", "yes", "on", "enabled"}
 
 
+def normalize_event_log_row(event: dict[str, Any]) -> dict[str, Any]:
+    """Apply the shared SIEM parser before storing retained/imported log rows."""
+
+    message = str(event.get("message") or "")
+    parsed = parse_fritzbox_log_message(message, str(event.get("category") or ""))
+    parser_rule_id = parsed.get("fields", {}).get("parser_rule_id")
+    category = event.get("category")
+    if parser_rule_id and parser_rule_id != "router.fallback":
+        category = parsed.get("category") or category
+    return {
+        **event,
+        "category": category or parsed.get("category") or "router",
+        "mac": parsed.get("mac") or event.get("mac"),
+        "ip": parsed.get("ip") or event.get("ip"),
+        "parser_rule_id": parser_rule_id,
+        "parser_fields": parsed.get("fields") or {},
+    }
+
+
 def event_evidence(event: dict[str, Any]) -> tuple[str, str]:
     return (
         "parsed_from_raw",
@@ -1781,6 +2633,16 @@ def wifi_evidence(row: dict[str, Any]) -> tuple[str, str]:
             "inferred",
             "Known/current WLAN device observation from mesh data. This is not an exact WiFi association time.",
         )
+    if row.get("derived_time_type") == "80211_steering_history":
+        return (
+            "parsed_from_raw",
+            "Historic 802.11 steering/roaming observation parsed from FRITZ!Box support data. This proves AP-side observation, not full session duration.",
+        )
+    if str(row.get("derived_time_type") or "").startswith("80211_"):
+        return (
+            "parsed_from_raw",
+            "Historic 802.11/AP-side evidence parsed from FRITZ!Box support data. Interpret event type and confidence before treating it as a full connection session.",
+        )
     return (
         "inferred",
         "Derived WiFi-related row. Treat as contextual unless backed by a retained exact connection log entry.",
@@ -1797,7 +2659,11 @@ def host_evidence(host: dict[str, Any]) -> tuple[str, str]:
 def event_key(event: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
-            {"timestamp": event.get("timestamp"), "message": event.get("message")},
+            {
+                "timestamp": event.get("timestamp"),
+                "message": event.get("message"),
+                "source": event.get("source") or "device_log",
+            },
             sort_keys=True,
             default=str,
         ).encode("utf-8")
@@ -1849,8 +2715,13 @@ def support_finding_key(finding: dict[str, Any]) -> str:
 
 def lookup_event_id(conn: sqlite3.Connection, event: dict[str, Any]) -> int | None:
     row = conn.execute(
-        "SELECT id FROM event_log WHERE timestamp IS ? AND message = ?",
-        (event.get("timestamp"), event.get("message") or ""),
+        """
+        SELECT id FROM event_log
+        WHERE timestamp IS ?
+          AND message = ?
+          AND COALESCE(source, '') = COALESCE(?, '')
+        """,
+        (event.get("timestamp"), event.get("message") or "", event.get("source") or "device_log"),
     ).fetchone()
     return int(row["id"]) if row else None
 
@@ -1903,10 +2774,10 @@ def lookup_support_finding_id(conn: sqlite3.Connection, finding: dict[str, Any])
     return int(row["id"]) if row else None
 
 
-def lookup_raw_artifact_id(conn: sqlite3.Connection, name: str, sha256: str) -> int | None:
+def lookup_raw_artifact_id(conn: sqlite3.Connection, run_id: int, name: str, sha256: str) -> int | None:
     row = conn.execute(
-        "SELECT id FROM raw_artifacts WHERE name = ? AND sha256 = ? ORDER BY id DESC LIMIT 1",
-        (name, sha256),
+        "SELECT id FROM raw_artifacts WHERE run_id = ? AND name = ? AND sha256 = ? ORDER BY id DESC LIMIT 1",
+        (run_id, name, sha256),
     ).fetchone()
     return int(row["id"]) if row else None
 
@@ -1942,6 +2813,36 @@ def searchable_text(row: dict[str, Any]) -> str:
 
 def _all_evidence_sources() -> list[dict[str, str]]:
     sources = [
+        {
+            "table": "siem_events",
+            "fts_type": "siem_events",
+            "record_label": "SIEM Event",
+            "observation_type": "siem_event",
+            "time_expr": "COALESCE(t.event_time, '')",
+            "title_expr": "COALESCE(NULLIF(t.message, ''), t.event_kind, '')",
+            "entity_expr": "TRIM(COALESCE(t.entity, '') || ' ' || COALESCE(t.hostname, '') || ' ' || COALESCE(t.mac, '') || ' ' || COALESCE(t.ip, ''))",
+            "class_expr": "COALESCE(t.event_category, '')",
+            "evidence_expr": "'normalized'",
+            "evidence_note_expr": "'Normalized SIEM event derived from retained FRITZ!Box evidence rows.'",
+            "match_expr": "COALESCE(t.searchable, records_fts.content, '')",
+            "extra_filter": "1=1",
+            "rank_penalty": "5.0",
+        },
+        {
+            "table": "siem_correlations",
+            "fts_type": "siem_correlations",
+            "record_label": "Correlation",
+            "observation_type": "siem_correlation",
+            "time_expr": "COALESCE(t.last_seen, t.first_seen, '')",
+            "title_expr": "COALESCE(NULLIF(t.summary, ''), t.entity_label, t.entity_key, '')",
+            "entity_expr": "COALESCE(t.entity_label, t.entity_key, '')",
+            "class_expr": "'correlation'",
+            "evidence_expr": "'correlated'",
+            "evidence_note_expr": "'Correlation derived from normalized FRITZ!Box evidence rows.'",
+            "match_expr": "COALESCE(t.searchable, records_fts.content, '')",
+            "extra_filter": "1=1",
+            "rank_penalty": "6.0",
+        },
         {
             "table": "event_log",
             "fts_type": "event_log",
@@ -2074,11 +2975,16 @@ def _all_evidence_records(
     scoped_run_id: int | None,
     start: str,
     end: str,
+    kind: str,
+    severity: str,
+    source_filter: str,
+    parser_rule: str,
 ) -> tuple[list[dict[str, Any]], int]:
     select_parts: list[str] = []
     params: list[Any] = []
     for source in _all_evidence_sources():
-        rank_expr = "bm25(records_fts)" if fts_query else "0.0"
+        rank_penalty = source.get("rank_penalty", "0.0")
+        rank_expr = f"(bm25(records_fts) + {rank_penalty})" if fts_query else "0.0"
         evidence_expr = source["evidence_expr"]
         time_expr = source["time_expr"]
         where = [
@@ -2090,12 +2996,23 @@ def _all_evidence_records(
         if fts_query:
             where.append("records_fts.content MATCH ?")
             source_params.append(fts_query)
-        run_sql, run_params = _run_observation_sql(source["observation_type"], scoped_run_id)
-        if run_sql:
-            where.append(run_sql)
-            source_params.extend(run_params)
+        if source["table"] in {"siem_events", "siem_correlations"}:
+            if scoped_run_id is not None:
+                where.append("t.run_id = ?")
+                source_params.append(scoped_run_id)
+        else:
+            run_sql, run_params = _run_observation_sql(source["observation_type"], scoped_run_id)
+            if run_sql:
+                where.append(run_sql)
+                source_params.extend(run_params)
         if category != "all":
-            if source["table"] == "event_log":
+            if source["table"] == "siem_events":
+                where.append("COALESCE(NULLIF(t.event_category, ''), 'unknown') = ?")
+                source_params.append(category)
+            elif source["table"] == "siem_correlations":
+                where.append("t.categories_json LIKE ?")
+                source_params.append(f"%{category}%")
+            elif source["table"] == "event_log":
                 where.append("t.category = ?")
                 source_params.append(category)
             elif source["table"] == "wifi_connections":
@@ -2116,8 +3033,43 @@ def _all_evidence_records(
         if evidence_level != "all":
             where.append(f"COALESCE({evidence_expr}, '') = ?")
             source_params.append(evidence_level)
+        if kind != "all":
+            if source["table"] == "siem_events":
+                where.append("COALESCE(NULLIF(t.event_kind, ''), 'unknown') = ?")
+                source_params.append(kind)
+            elif source["table"] == "siem_correlations":
+                where.append("(t.rule_id = ? OR t.correlation_type = ?)")
+                source_params.extend([kind, kind])
+            else:
+                where.append("1=0")
+        if severity != "all":
+            if source["table"] in {"siem_events", "siem_correlations"}:
+                where.append("COALESCE(NULLIF(t.severity, ''), 'unknown') = ?")
+                source_params.append(severity)
+            else:
+                where.append("1=0")
+        if source_filter != "all":
+            if source["table"] == "siem_events":
+                where.append("COALESCE(NULLIF(t.source, ''), 'unknown') = ?")
+                source_params.append(source_filter)
+            else:
+                where.append("1=0")
+        if parser_rule != "all":
+            if source["table"] == "siem_events":
+                where.append("COALESCE(NULLIF(json_extract(t.fields_json, '$.parser_rule_id'), ''), 'unparsed') = ?")
+                source_params.append(parser_rule)
+            else:
+                where.append("1=0")
         if time_type != "all":
-            if source["table"] == "event_log":
+            if source["table"] == "siem_events":
+                if time_type == "exact":
+                    where.append("COALESCE(t.confidence, '') IN ('high', 'exact')")
+                elif time_type == "derived":
+                    where.append("COALESCE(t.confidence, '') NOT IN ('high', 'exact')")
+                else:
+                    where.append("(COALESCE(t.event_kind, '') = ? OR COALESCE(t.source, '') = ?)")
+                    source_params.extend([time_type, time_type])
+            elif source["table"] == "event_log":
                 where.append("1=1" if time_type == "exact" else "1=0")
             elif source["table"] == "wifi_connections":
                 if time_type == "exact":
@@ -2137,6 +3089,8 @@ def _all_evidence_records(
                     source_params.append(time_type)
             else:
                 where.append("1=0")
+        if (start or end) and time_expr == "''":
+            where.append("1=0")
         if start and time_expr != "''":
             where.append(f"COALESCE({time_expr}, '') >= ?")
             source_params.append(start)
@@ -2215,12 +3169,54 @@ def query_records(
     run_id: str | int = "latest",
     start: str = "",
     end: str = "",
+    kind: str = "all",
+    severity: str = "all",
+    source: str = "all",
+    parser_rule: str = "all",
 ) -> dict[str, Any]:
     conn = init_db(path)
     scoped_run_id = resolve_run_id(conn, run_id)
     fts_query = make_fts_query(query)
     direction = "ASC" if sort_dir.lower() == "asc" else "DESC"
-    if record_type == "wifi":
+    if record_type in {"events", "siem", "siem_events", "normalized_events"}:
+        table = "siem_events"
+        sort_map = {
+            "event_time": "COALESCE(t.event_time, '')",
+            "timestamp": "COALESCE(t.event_time, '')",
+            "event_category": "COALESCE(t.event_category, '')",
+            "category": "COALESCE(t.event_category, '')",
+            "event_kind": "COALESCE(t.event_kind, '')",
+            "kind": "COALESCE(t.event_kind, '')",
+            "severity": (
+                "CASE t.severity WHEN 'critical' THEN 5 WHEN 'high' THEN 4 "
+                "WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
+            ),
+            "entity": "COALESCE(t.entity, '')",
+            "hostname": "COALESCE(t.hostname, '')",
+            "mac": "COALESCE(t.mac, '')",
+            "ip": "COALESCE(t.ip, '')",
+            "source": "COALESCE(t.source, '')",
+        }
+        order = f"{sort_map.get(sort_by, sort_map['event_time'])} {direction}"
+        fts_type = "siem_events"
+        dedupe = "1=1"
+    elif record_type in {"correlations", "siem_correlations"}:
+        table = "siem_correlations"
+        sort_map = {
+            "entity": "COALESCE(t.entity_label, '')",
+            "entity_label": "COALESCE(t.entity_label, '')",
+            "first_seen": "COALESCE(t.first_seen, '')",
+            "last_seen": "COALESCE(t.last_seen, '')",
+            "event_count": "t.event_count",
+            "severity": (
+                "CASE t.severity WHEN 'critical' THEN 5 WHEN 'high' THEN 4 "
+                "WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
+            ),
+        }
+        order = f"{sort_map.get(sort_by, sort_map['last_seen'])} {direction}"
+        fts_type = "siem_correlations"
+        dedupe = "1=1"
+    elif record_type == "wifi":
         table = "wifi_connections"
         sort_map = {
             "derived_connected_at": "COALESCE(t.derived_connected_at, '')",
@@ -2260,6 +3256,7 @@ def query_records(
             "category": "COALESCE(t.category, '')",
             "mac": "COALESCE(t.mac, '')",
             "ip": "COALESCE(t.ip, '')",
+            "source": "COALESCE(t.source, '')",
             "message": "COALESCE(t.message, '')",
         }
         order = f"{sort_map.get(sort_by, sort_map['timestamp'])} {direction}"
@@ -2283,6 +3280,11 @@ def query_records(
         spec = ADDITIONAL_EVIDENCE_TABLES[table]
         sort_map = {column: f"COALESCE(t.{column}, '')" for column in spec["columns"]}
         sort_map["record_key"] = "COALESCE(t.record_key, '')"
+        if table == "security_advisories":
+            sort_map["severity"] = (
+                "CASE t.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 "
+                "WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END"
+            )
         order = f"{sort_map.get(sort_by, spec['sort'])} {direction}"
         fts_type = spec["fts_type"]
         dedupe = "1=1"
@@ -2311,22 +3313,57 @@ def query_records(
             "support_findings": "support_finding",
             "raw_artifacts": "raw_artifact",
             **{table_name: spec["record_type"] for table_name, spec in ADDITIONAL_EVIDENCE_TABLES.items()},
-        }[table]
+        }.get(table)
         if fts_query:
             join = " JOIN records_fts f ON f.record_id = t.id AND f.record_type = ?"
             params.append(fts_type)
             where.append("f.content MATCH ?")
             params.append(fts_query)
-        run_sql, run_params = _run_observation_sql(observation_type, scoped_run_id)
-        if run_sql:
-            where.append(run_sql)
-            params.extend(run_params)
-        if table == "event_log" and category != "all":
+        if table in {"siem_events", "siem_correlations"}:
+            if scoped_run_id is not None:
+                where.append("t.run_id = ?")
+                params.append(scoped_run_id)
+        elif observation_type:
+            run_sql, run_params = _run_observation_sql(observation_type, scoped_run_id)
+            if run_sql:
+                where.append(run_sql)
+                params.extend(run_params)
+        if table == "siem_events" and category != "all":
+            where.append("COALESCE(NULLIF(t.event_category, ''), 'unknown') = ?")
+            params.append(category)
+        elif table == "siem_correlations" and category != "all":
+            where.append("t.categories_json LIKE ?")
+            params.append(f"%{category}%")
+        elif table == "event_log" and category != "all":
             where.append("t.category = ?")
             params.append(category)
+        if table == "siem_events":
+            if kind != "all":
+                where.append("COALESCE(NULLIF(t.event_kind, ''), 'unknown') = ?")
+                params.append(kind)
+            if severity != "all":
+                where.append("COALESCE(NULLIF(t.severity, ''), 'unknown') = ?")
+                params.append(severity)
+            if source != "all":
+                where.append("COALESCE(NULLIF(t.source, ''), 'unknown') = ?")
+                params.append(source)
+            if parser_rule != "all":
+                where.append("COALESCE(NULLIF(json_extract(t.fields_json, '$.parser_rule_id'), ''), 'unparsed') = ?")
+                params.append(parser_rule)
+        elif table == "siem_correlations":
+            if kind != "all":
+                where.append("(t.rule_id = ? OR t.correlation_type = ?)")
+                params.extend([kind, kind])
+            if severity != "all":
+                where.append("t.severity = ?")
+                params.append(severity)
         time_column = ""
         if table == "event_log":
             time_column = "timestamp"
+        elif table == "siem_events":
+            time_column = "event_time"
+        elif table == "siem_correlations":
+            time_column = ""
         elif table == "wifi_connections":
             time_column = "derived_connected_at"
         elif table == "support_findings":
@@ -2341,7 +3378,7 @@ def query_records(
                 "t.last_connected",
                 "t.first_seen",
                 """CASE WHEN t.active_now = 1 THEN (
-                    SELECT MAX(observed_at)
+                    SELECT MAX(COALESCE(event_time, observed_at))
                     FROM record_observations
                     WHERE record_type = 'host' AND record_table_id = t.id
                     {active_run_filter}
@@ -2349,7 +3386,16 @@ def query_records(
             ]
         elif table in ADDITIONAL_EVIDENCE_TABLES:
             time_column = str(ADDITIONAL_EVIDENCE_TABLES[table]["time_column"])
-        if table == "hosts" and (start or end):
+        if table == "siem_correlations" and (start or end):
+            window_start = "COALESCE(t.window_start, t.first_seen, t.last_seen, '')"
+            window_end = "COALESCE(t.window_end, t.last_seen, t.first_seen, '')"
+            if start:
+                where.append(f"{window_end} >= ?")
+                params.append(start)
+            if end:
+                where.append(f"{window_start} <= ?")
+                params.append(end)
+        elif table == "hosts" and (start or end):
             range_clauses = []
             for column in host_time_columns:
                 column_checks = []
@@ -2370,6 +3416,8 @@ def query_records(
                 params.append(end)
         if table == "raw_artifacts":
             pass
+        elif table == "siem_correlations":
+            pass
         elif evidence_level != "all":
             where.append("COALESCE(t.evidence_level, '') = ?")
             params.append(evidence_level)
@@ -2378,6 +3426,14 @@ def query_records(
         elif time_type != "all":
             if table == "event_log":
                 where.append("1=1" if time_type == "exact" else "1=0")
+            elif table == "siem_events":
+                if time_type == "exact":
+                    where.append("COALESCE(t.confidence, '') IN ('high', 'exact')")
+                elif time_type == "derived":
+                    where.append("COALESCE(t.confidence, '') NOT IN ('high', 'exact')")
+                else:
+                    where.append("(COALESCE(t.event_kind, '') = ? OR COALESCE(t.source, '') = ?)")
+                    params.extend([time_type, time_type])
             elif table == "wifi_connections":
                 if time_type == "exact":
                     where.append("t.exact_connection_time_available = 1")
@@ -2408,6 +3464,10 @@ def query_records(
             scoped_run_id,
             start,
             end,
+            kind,
+            severity,
+            source,
+            parser_rule,
         )
     conn.close()
     return {"rows": rows, "total": total, "limit": limit, "offset": offset}
@@ -2424,10 +3484,38 @@ def query_timeline(
     evidence_level: str = "all",
     time_type: str = "all",
     run_id: str | int = "latest",
+    kind: str = "all",
+    severity: str = "all",
+    source: str = "all",
+    parser_rule: str = "all",
 ) -> dict[str, Any]:
     conn = init_db(path)
     scoped_run_id = resolve_run_id(conn, run_id)
     fts_query = make_fts_query(query)
+    siem_count_sql = "SELECT COUNT(*) FROM siem_events"
+    siem_count_params: list[Any] = []
+    if scoped_run_id is not None:
+        siem_count_sql += " WHERE run_id = ?"
+        siem_count_params.append(scoped_run_id)
+    if int(conn.execute(siem_count_sql, siem_count_params).fetchone()[0]):
+        result = _query_siem_timeline(
+            conn,
+            fts_query,
+            category,
+            start,
+            end,
+            limit,
+            offset,
+            evidence_level,
+            time_type,
+            scoped_run_id,
+            kind,
+            severity,
+            source,
+            parser_rule,
+        )
+        conn.close()
+        return result
     rows: list[dict[str, Any]] = []
     event_where, event_params = _timeline_filters(
         "event_log", fts_query, category, start, end, evidence_level, time_type, scoped_run_id
@@ -2442,13 +3530,14 @@ def query_timeline(
     sql = f"""
         SELECT * FROM (
             SELECT 'event_log' AS record_type, t.id AS record_id, t.timestamp AS event_time,
-                   t.category AS event_class, t.ip, t.mac, NULL AS hostname, t.message,
+                   t.category AS event_class, t.ip, t.mac, NULL AS hostname, t.message, t.source,
                    'exact' AS time_type, 'high' AS confidence, t.evidence_level, t.evidence_note, 1 AS exact_time
             FROM event_log t{event_where}
             UNION ALL
             SELECT 'wifi_connections' AS record_type, t.id AS record_id, t.derived_connected_at AS event_time,
                    'wifi' AS event_class, t.ip, t.mac, t.hostname,
                    COALESCE(t.message, t.event, 'Known WLAN device') AS message,
+                   t.source,
                    COALESCE(t.derived_time_type, 'derived') AS time_type,
                    COALESCE(t.derived_time_confidence, t.evidence, 'low') AS confidence,
                    t.evidence_level, t.evidence_note,
@@ -2461,6 +3550,176 @@ def query_timeline(
     rows = [dict(row) for row in conn.execute(sql, [*event_params, *wifi_params, limit, offset])]
     conn.close()
     return {"rows": rows, "total": event_total + wifi_total, "limit": limit, "offset": offset}
+
+
+def _query_siem_timeline(
+    conn: sqlite3.Connection,
+    fts_query: str,
+    category: str,
+    start: str,
+    end: str,
+    limit: int,
+    offset: int,
+    evidence_level: str,
+    time_type: str,
+    run_id: int | None,
+    kind: str,
+    severity: str,
+    source: str,
+    parser_rule: str,
+) -> dict[str, Any]:
+    where, params, join = _siem_event_search_sql(
+        fts_query,
+        category,
+        start,
+        end,
+        evidence_level,
+        time_type,
+        run_id,
+        kind,
+        severity,
+        source,
+        parser_rule,
+    )
+    where.append("COALESCE(t.event_time, '') != ''")
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+    total = int(conn.execute(f"SELECT COUNT(*) FROM siem_events t{join}{where_sql}", params).fetchone()[0])
+    sql = f"""
+        SELECT
+            'siem_events' AS record_type,
+            t.id AS record_id,
+            t.event_time,
+            t.event_category AS event_class,
+            t.ip,
+            t.mac,
+            t.hostname,
+            t.message,
+            t.source,
+            CASE WHEN COALESCE(t.confidence, '') IN ('high', 'exact') THEN 'exact' ELSE 'derived' END AS time_type,
+            t.confidence,
+            t.evidence_level,
+            t.evidence_note,
+            CASE WHEN COALESCE(t.confidence, '') IN ('high', 'exact') THEN 1 ELSE 0 END AS exact_time
+        FROM siem_events t{join}{where_sql}
+        ORDER BY COALESCE(t.event_time, '') DESC, t.id DESC
+        LIMIT ? OFFSET ?
+    """
+    rows = [dict(row) for row in conn.execute(sql, [*params, limit, offset])]
+    return {"rows": rows, "total": total, "limit": limit, "offset": offset}
+
+
+def _siem_event_search_sql(
+    fts_query: str,
+    category: str,
+    start: str,
+    end: str,
+    evidence_level: str,
+    time_type: str,
+    run_id: int | None,
+    kind: str,
+    severity: str,
+    source: str,
+    parser_rule: str,
+) -> tuple[list[str], list[Any], str]:
+    params: list[Any] = []
+    where: list[str] = []
+    join = ""
+    if fts_query:
+        join = " JOIN records_fts f ON f.record_id = t.id AND f.record_type = ?"
+        params.append("siem_events")
+        where.append("f.content MATCH ?")
+        params.append(fts_query)
+    if run_id is not None:
+        where.append("t.run_id = ?")
+        params.append(run_id)
+    if category != "all":
+        where.append("COALESCE(NULLIF(t.event_category, ''), 'unknown') = ?")
+        params.append(category)
+    if kind != "all":
+        where.append("COALESCE(NULLIF(t.event_kind, ''), 'unknown') = ?")
+        params.append(kind)
+    if severity != "all":
+        where.append("COALESCE(NULLIF(t.severity, ''), 'unknown') = ?")
+        params.append(severity)
+    if source != "all":
+        where.append("COALESCE(NULLIF(t.source, ''), 'unknown') = ?")
+        params.append(source)
+    if parser_rule != "all":
+        where.append("COALESCE(NULLIF(json_extract(t.fields_json, '$.parser_rule_id'), ''), 'unparsed') = ?")
+        params.append(parser_rule)
+    if evidence_level != "all":
+        where.append("COALESCE(t.evidence_level, '') = ?")
+        params.append(evidence_level)
+    if time_type != "all":
+        if time_type == "exact":
+            where.append("COALESCE(t.confidence, '') IN ('high', 'exact')")
+        elif time_type == "derived":
+            where.append("COALESCE(t.confidence, '') NOT IN ('high', 'exact')")
+        else:
+            where.append("(COALESCE(t.event_kind, '') = ? OR COALESCE(t.source, '') = ?)")
+            params.extend([time_type, time_type])
+    if start:
+        where.append("COALESCE(t.event_time, '') >= ?")
+        params.append(start)
+    if end:
+        where.append("COALESCE(t.event_time, '') <= ?")
+        params.append(end)
+    return where, params, join
+
+
+def siem_search_facets(
+    path: Path = DEFAULT_DB,
+    query: str = "",
+    category: str = "all",
+    start: str = "",
+    end: str = "",
+    evidence_level: str = "all",
+    time_type: str = "all",
+    run_id: str | int = "latest",
+    kind: str = "all",
+    severity: str = "all",
+    source: str = "all",
+    parser_rule: str = "all",
+    limit: int = 12,
+) -> dict[str, Any]:
+    conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
+    where, params, join = _siem_event_search_sql(
+        make_fts_query(query),
+        category,
+        start,
+        end,
+        evidence_level,
+        time_type,
+        scoped_run_id,
+        kind,
+        severity,
+        source,
+        parser_rule,
+    )
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+    total = int(conn.execute(f"SELECT COUNT(*) FROM siem_events t{join}{where_sql}", params).fetchone()[0])
+
+    facet_specs = {
+        "category": "COALESCE(NULLIF(t.event_category, ''), 'unknown')",
+        "kind": "COALESCE(NULLIF(t.event_kind, ''), 'unknown')",
+        "severity": "COALESCE(NULLIF(t.severity, ''), 'unknown')",
+        "source": "COALESCE(NULLIF(t.source, ''), 'unknown')",
+        "parser_rule": "COALESCE(NULLIF(json_extract(t.fields_json, '$.parser_rule_id'), ''), 'unparsed')",
+        "entity": "COALESCE(NULLIF(t.entity, ''), 'unknown')",
+    }
+    facets: dict[str, list[dict[str, Any]]] = {}
+    for name, expression in facet_specs.items():
+        sql = f"""
+            SELECT {expression} AS value, COUNT(*) AS count
+            FROM siem_events t{join}{where_sql}
+            GROUP BY value
+            ORDER BY count DESC, value COLLATE NOCASE ASC
+            LIMIT ?
+        """
+        facets[name] = [dict(row) for row in conn.execute(sql, [*params, limit])]
+    conn.close()
+    return {"total": total, "facets": facets}
 
 
 def _timeline_filters(
@@ -2531,7 +3790,12 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
         selected_run = latest_run
         retained = dict(
             conn.execute(
-                "SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event, COUNT(*) AS event_count FROM event_log"
+                """
+                SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event,
+                       COUNT(*) AS event_count,
+                       SUM(CASE WHEN timestamp IS NOT NULL AND timestamp != '' THEN 1 ELSE 0 END) AS timestamped_event_count
+                FROM event_log
+                """
             ).fetchone()
         )
         counts = {
@@ -2569,9 +3833,11 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
         retained = dict(
             conn.execute(
                 """
-                SELECT MIN(event_time) AS oldest_event, MAX(event_time) AS newest_event, COUNT(*) AS event_count
+                SELECT MIN(event_time) AS oldest_event, MAX(event_time) AS newest_event,
+                       COUNT(*) AS event_count,
+                       SUM(CASE WHEN event_time IS NOT NULL AND event_time != '' THEN 1 ELSE 0 END) AS timestamped_event_count
                 FROM record_observations
-                WHERE run_id = ? AND record_type = 'event_log' AND event_time IS NOT NULL
+                WHERE run_id = ? AND record_type = 'event_log'
                 """,
                 [scoped_run_id],
             ).fetchone()
@@ -2714,6 +3980,8 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
         )
     if "device_log_xml" not in present:
         warnings.append("Retained device log XML was not collected; timeline completeness is reduced.")
+    if "device_log_xml_wlan" not in present:
+        warnings.append("WLAN-filtered retained device log XML was not collected; WLAN event coverage is reduced.")
     if "host_list_xml" not in present:
         warnings.append("Host list XML was not collected; device attribution is reduced.")
     if "tr064_snapshot_json" not in present:
@@ -2745,6 +4013,7 @@ def acquisition_source_coverage(conn: sqlite3.Connection, run_id: int | None) ->
             "area": "Retained logs",
             "artifacts": [
                 "device_log_xml",
+                "device_log_xml_wlan",
                 "data_lua_pages_json",
                 "webui_readonly_artifacts_json",
                 "support_lua_page_html",
@@ -2963,7 +4232,12 @@ def analysis_snapshot(
     if scoped_run_id is None:
         retained = dict(
             conn.execute(
-                "SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event, COUNT(*) AS event_count FROM event_log"
+                """
+                SELECT MIN(timestamp) AS oldest_event, MAX(timestamp) AS newest_event,
+                       COUNT(*) AS event_count,
+                       SUM(CASE WHEN timestamp IS NOT NULL AND timestamp != '' THEN 1 ELSE 0 END) AS timestamped_event_count
+                FROM event_log
+                """
             ).fetchone()
         )
         run = conn.execute(
@@ -2973,9 +4247,11 @@ def analysis_snapshot(
         retained = dict(
             conn.execute(
                 """
-                SELECT MIN(event_time) AS oldest_event, MAX(event_time) AS newest_event, COUNT(*) AS event_count
+                SELECT MIN(event_time) AS oldest_event, MAX(event_time) AS newest_event,
+                       COUNT(*) AS event_count,
+                       SUM(CASE WHEN event_time IS NOT NULL AND event_time != '' THEN 1 ELSE 0 END) AS timestamped_event_count
                 FROM record_observations
-                WHERE run_id = ? AND record_type = 'event_log' AND event_time IS NOT NULL
+                WHERE run_id = ? AND record_type = 'event_log'
                 """,
                 [scoped_run_id],
             ).fetchone()
@@ -2992,6 +4268,7 @@ def analysis_snapshot(
     host_risk = host_risk_summary(conn, host_filter, host_params, tr064.get("wan", {}).get("port_mappings") or [])
     last_used = last_used_histogram(conn, host_filter, host_params)
     advertisement_hints = advertisement_hint_summary(conn, scoped_run_id, start, end)
+    security_advisories = security_advisory_summary(conn, scoped_run_id)
     conn.close()
     return {
         "category_counts": category_counts,
@@ -3005,12 +4282,384 @@ def analysis_snapshot(
         "mesh_summary": mesh,
         "tr064_summary": tr064,
         "host_risk_summary": host_risk,
+        "security_advisories": security_advisories,
         "last_used_histogram": last_used,
         "advertisement_hints": advertisement_hints,
         "retained": retained,
         "latest_run": dict(run) if run else None,
         "gaps": gaps,
     }
+
+
+def investigation_snapshot(
+    path: Path = DEFAULT_DB,
+    start: str = "",
+    end: str = "",
+    run_id: str | int = "latest",
+    query: str = "",
+    interface: str = "all",
+    presence_mode: str = "overlap",
+    confidence: str = "all",
+) -> dict[str, Any]:
+    conn = init_db(path)
+    scoped_run_id = resolve_run_id(conn, run_id)
+    auth_terms = ["anmeldung", "login", "kennwort", "password", "app", "fehlgeschlagen", "failed", "falsches"]
+    normalized_interface = interface if interface in {"all", "wifi", "lan", "guest", "active"} else "all"
+    normalized_mode = presence_mode if presence_mode in {"overlap", "points", "active"} else "overlap"
+    normalized_confidence = confidence if confidence in {"all", "high", "medium", "low", "exact"} else "all"
+
+    event_filter, event_params = _time_range_sql("t.timestamp", start, end)
+    event_run_sql, event_run_params = _run_observation_sql("event_log", scoped_run_id)
+    event_filter, event_params = _combine_filter(event_filter, event_params, event_run_sql, event_run_params)
+    exact_events = int(conn.execute(f"SELECT COUNT(*) FROM event_log t{event_filter}", event_params).fetchone()[0])
+
+    auth_clause = " OR ".join("lower(t.message) LIKE ?" for _ in auth_terms)
+    auth_params = [*event_params, *[f"%{term}%" for term in auth_terms]]
+    auth_events = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM event_log t{event_filter}{' AND' if event_filter else ' WHERE'} ({auth_clause})",
+            auth_params,
+        ).fetchone()[0]
+    )
+    auth_samples = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT t.id, t.timestamp, t.category, t.ip, t.mac, t.message, t.evidence_level, t.evidence_note
+            FROM event_log t{event_filter}{" AND" if event_filter else " WHERE"} ({auth_clause})
+            ORDER BY COALESCE(t.timestamp, '') DESC, t.id DESC
+            LIMIT 8
+            """,
+            auth_params,
+        )
+    ]
+
+    wifi_filter, wifi_params = _time_range_sql("t.derived_connected_at", start, end)
+    wifi_run_sql, wifi_run_params = _run_observation_sql("wifi_connection", scoped_run_id)
+    wifi_filter, wifi_params = _combine_filter(wifi_filter, wifi_params, wifi_run_sql, wifi_run_params)
+    wifi_dedupe = "1=1" if scoped_run_id is not None else "t." + WIFI_DEDUPE_SQL.strip()
+    wifi_filter, wifi_params = _combine_filter(wifi_filter, wifi_params, wifi_dedupe, [])
+    wifi_points = int(conn.execute(f"SELECT COUNT(*) FROM wifi_connections t{wifi_filter}", wifi_params).fetchone()[0])
+    wifi_exact = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM wifi_connections t{wifi_filter} AND t.exact_connection_time_available = 1",
+            wifi_params,
+        ).fetchone()[0]
+    )
+    wifi_samples = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT t.id, t.derived_connected_at, t.derived_time_type, t.derived_time_confidence,
+                   t.exact_connection_time_available, t.event,
+                   t.hostname, t.mac, t.ip, t.source, t.evidence_level, t.evidence_note, t.message
+            FROM wifi_connections t{wifi_filter}
+            ORDER BY COALESCE(t.derived_connected_at, '') DESC, t.id DESC
+            LIMIT 250
+            """,
+            wifi_params,
+        )
+    ]
+    enrich_device_metadata(conn, wifi_samples, scoped_run_id)
+
+    host_run_sql, host_run_params = _run_observation_sql("host", scoped_run_id)
+    host_filter, host_params = _combine_filter(" WHERE 1=1", [], host_run_sql, host_run_params)
+    host_point_columns = ["t.last_activity", "t.last_seen", "t.last_connected", "t.first_seen"]
+    presence_start_expr = (
+        "COALESCE(NULLIF(t.first_seen, ''), NULLIF(t.last_connected, ''), "
+        "NULLIF(t.last_seen, ''), NULLIF(t.last_activity, ''))"
+    )
+    presence_end_expr = (
+        "COALESCE(NULLIF(t.last_activity, ''), NULLIF(t.last_connected, ''), "
+        "NULLIF(t.last_seen, ''), NULLIF(t.first_seen, ''))"
+    )
+    host_interface_expr = (
+        "COALESCE(NULLIF(t.interface, ''), "
+        "CASE WHEN COALESCE(t.wlan_uids, '') != '' THEN 'WLAN' "
+        "WHEN COALESCE(t.ethernet_port, '') != '' THEN 'Ethernet' END)"
+    )
+    host_filter, host_params = _combine_filter(
+        host_filter,
+        host_params,
+        f"({presence_start_expr} != '' OR {presence_end_expr} != '' OR t.active_now = 1 OR t.online = 1)",
+        [],
+    )
+    if query:
+        searchable = (
+            "LOWER(COALESCE(t.searchable, '') || ' ' || COALESCE(t.hostname, '') || ' ' || "
+            "COALESCE(t.mac, '') || ' ' || COALESCE(t.ip, '') || ' ' || COALESCE(t.friendly_name, ''))"
+        )
+        host_filter, host_params = _combine_filter(
+            host_filter, host_params, f"{searchable} LIKE ?", [f"%{query.lower()}%"]
+        )
+    if normalized_interface == "wifi":
+        host_filter, host_params = _combine_filter(
+            host_filter,
+            host_params,
+            "(LOWER(COALESCE(t.interface, '')) LIKE '%wlan%' OR COALESCE(t.wlan_uids, '') != '')",
+            [],
+        )
+    elif normalized_interface == "lan":
+        host_filter, host_params = _combine_filter(
+            host_filter,
+            host_params,
+            "(LOWER(COALESCE(t.interface, '')) LIKE '%lan%' OR COALESCE(t.ethernet_port, '') != '')",
+            [],
+        )
+    elif normalized_interface == "guest":
+        host_filter, host_params = _combine_filter(
+            host_filter,
+            host_params,
+            "(LOWER(COALESCE(t.guest, '')) IN ('1', 'true', 'yes', 'ja') OR LOWER(COALESCE(t.interface_detail, '')) LIKE '%guest%')",
+            [],
+        )
+    elif normalized_interface == "active":
+        host_filter, host_params = _combine_filter(host_filter, host_params, "(t.active_now = 1 OR t.online = 1)", [])
+    if normalized_confidence == "exact":
+        host_filter, host_params = _combine_filter(
+            host_filter, host_params, "COALESCE(t.last_activity_source, '') = 'exact_wifi_connection'", []
+        )
+    elif normalized_confidence != "all":
+        host_filter, host_params = _combine_filter(
+            host_filter, host_params, "COALESCE(t.last_activity_confidence, '') = ?", [normalized_confidence]
+        )
+    if start or end:
+        if normalized_mode == "active":
+            host_filter, host_params = _combine_filter(
+                host_filter, host_params, "(t.active_now = 1 OR t.online = 1)", []
+            )
+        elif normalized_mode == "points":
+            range_clauses: list[str] = []
+            range_params: list[Any] = []
+            for column in host_point_columns:
+                checks: list[str] = []
+                if start:
+                    checks.append(f"COALESCE({column}, '') >= ?")
+                    range_params.append(start)
+                if end:
+                    checks.append(f"COALESCE({column}, '') <= ?")
+                    range_params.append(end)
+                range_clauses.append("(" + " AND ".join(checks) + ")")
+            host_filter, host_params = _combine_filter(
+                host_filter, host_params, "(" + " OR ".join(range_clauses) + ")", range_params
+            )
+        else:
+            overlap_checks: list[str] = []
+            overlap_params: list[Any] = []
+            if end:
+                overlap_checks.append(f"COALESCE({presence_start_expr}, '') <= ?")
+                overlap_params.append(end)
+            if start:
+                overlap_checks.append(f"COALESCE({presence_end_expr}, '') >= ?")
+                overlap_params.append(start)
+            if overlap_checks:
+                host_filter, host_params = _combine_filter(
+                    host_filter, host_params, "(" + " AND ".join(overlap_checks) + ")", overlap_params
+                )
+    presence_points = int(conn.execute(f"SELECT COUNT(*) FROM hosts t{host_filter}", host_params).fetchone()[0])
+    presence_samples = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT t.id, t.hostname, t.friendly_name, t.neighbour_name, t.vendor, t.model, t.wlan_station_type,
+                   t.interface_detail, t.mac, t.ip, {host_interface_expr} AS interface, t.active_now, t.online,
+                   t.first_seen, t.last_connected, t.last_activity, t.last_activity_source,
+                   t.last_activity_confidence, t.evidence_level, t.evidence_note,
+                   {presence_start_expr} AS presence_start,
+                   {presence_end_expr} AS presence_end,
+                   CASE
+                       WHEN t.active_now = 1 OR t.online = 1 THEN 'active_snapshot'
+                       WHEN COALESCE(t.last_activity_source, '') = 'exact_wifi_connection' THEN 'exact_connection'
+                       WHEN {presence_start_expr} != '' AND {presence_end_expr} != '' THEN 'interval_overlap'
+                       ELSE 'presence_point'
+                   END AS window_match
+            FROM hosts t{host_filter}
+            ORDER BY COALESCE(t.last_activity, t.last_connected, t.last_seen, t.first_seen, '') DESC, t.id DESC
+            LIMIT 50
+            """,
+            host_params,
+        )
+    ]
+    for row in presence_samples:
+        row["device_type"] = infer_device_type(row)
+        row["device_label"] = device_display_name(row)
+    presence_by_interface = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF({host_interface_expr}, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM hosts t{host_filter}
+            GROUP BY label
+            ORDER BY count DESC, label COLLATE NOCASE ASC
+            """,
+            host_params,
+        )
+    ]
+    presence_by_confidence = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(t.last_activity_confidence, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM hosts t{host_filter}
+            GROUP BY label
+            ORDER BY count DESC, label COLLATE NOCASE ASC
+            """,
+            host_params,
+        )
+    ]
+
+    timeline = query_timeline(path, "", "all", start, end, 8, 0, "all", "all", run_id)
+    discovery_in_range = advertisement_hint_summary(conn, scoped_run_id, start, end)
+    discovery_total = advertisement_hint_summary(conn, scoped_run_id, "", "")
+    probe_telemetry = probe_request_telemetry_summary(conn, scoped_run_id, start, end, query)
+    discovery_devices = investigation_discovery_rows(conn, scoped_run_id, start, end, query, probe_telemetry)
+    retained = analysis_snapshot(path, "", "", run_id).get("retained", {})
+    source_coverage = acquisition_source_coverage(conn, scoped_run_id)
+    observed_total = (
+        exact_events
+        + wifi_points
+        + presence_points
+        + int(discovery_in_range.get("total") or 0)
+        + int(probe_telemetry.get("total") or 0)
+    )
+    if not start and not end:
+        verdict = "Set a start and end time to audit a specific interval."
+        verdict_level = "medium"
+    elif observed_total == 0:
+        verdict = (
+            "No retained evidence was observed in this time window. This is not proof that no device was connected."
+        )
+        verdict_level = "low"
+    elif exact_events or wifi_exact or auth_events:
+        verdict = (
+            "Exact retained evidence exists in this time window. Review exact logs first, then correlate device state."
+        )
+        verdict_level = "high"
+    else:
+        verdict = (
+            "Only derived or state evidence was observed in this time window. Treat it as best-effort presence context."
+        )
+        verdict_level = "medium"
+    conn.close()
+    return {
+        "range": {"start": start, "end": end},
+        "run_id": scoped_run_id,
+        "verdict": {"level": verdict_level, "message": verdict},
+        "counts": {
+            "exact_events": exact_events,
+            "auth_events": auth_events,
+            "wifi_points": wifi_points,
+            "exact_wifi_points": wifi_exact,
+            "presence_points": presence_points,
+            "device_candidates": presence_points,
+            "probe_requests": int(probe_telemetry.get("total") or 0),
+            "discovery_hints_in_range": int(discovery_in_range.get("total") or 0),
+            "discovery_hints_total": int(discovery_total.get("total") or 0),
+        },
+        "filters": {
+            "query": query,
+            "interface": normalized_interface,
+            "presence_mode": normalized_mode,
+            "confidence": normalized_confidence,
+        },
+        "devices": {
+            "rows": presence_samples,
+            "by_interface": presence_by_interface,
+            "by_confidence": presence_by_confidence,
+            "note": (
+                "Device candidates use best-effort interval overlap by default: first_seen must be before "
+                "the window end and last_connected/last_activity must be after the window start."
+            ),
+        },
+        "discovery_devices": discovery_devices,
+        "probe_telemetry": probe_telemetry,
+        "samples": {
+            "timeline": timeline.get("rows", []),
+            "auth": auth_samples,
+            "wifi": wifi_samples,
+            "presence": presence_samples,
+            "discovery": discovery_total.get("recent", []),
+        },
+        "discovery": {
+            "in_range": discovery_in_range,
+            "all_retained": discovery_total,
+            "note": "Discovery/advertisement rows are hints from FRITZ!Box state and raw artifacts. They are not packet captures and often use acquisition time, not the original packet time.",
+        },
+        "retained": retained,
+        "source_coverage": source_coverage,
+        "limitations": [
+            "No row in a window means no retained/exported evidence was observed, not that no activity happened.",
+            "FRITZ!Box lastused/last_connected values are device state points, not complete sessions.",
+            "Nearby unassociated-device detection requires retained 802.11 probe-request telemetry; current FRITZ!Box exports often do not preserve it.",
+            "Advertisement, broadcast, DHCP, UPnP, PCP, mDNS, SSDP, ARP, and multicast rows are best-effort hints unless backed by exact retained logs.",
+            "Packet-level discovery attempts require packet capture or separate network telemetry.",
+        ],
+    }
+
+
+def security_advisory_summary(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
+    run_sql, run_params = _run_observation_sql("security_advisory", run_id)
+    where = f"WHERE {run_sql}" if run_sql else ""
+    params = run_params
+    total = int(conn.execute(f"SELECT COUNT(*) FROM security_advisories t {where}", params).fetchone()[0])
+    by_severity = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(t.severity, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM security_advisories t
+            {where}
+            GROUP BY label
+            ORDER BY CASE label WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                     count DESC
+            """,
+            params,
+        )
+    ]
+    by_category = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(t.category, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM security_advisories t
+            {where}
+            GROUP BY label
+            ORDER BY count DESC, label
+            LIMIT 8
+            """,
+            params,
+        )
+    ]
+    top = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT id, advisory_id, severity, category, title, subject, recommendation, confidence
+            FROM security_advisories t
+            {where}
+            ORDER BY CASE t.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                     t.id DESC
+            LIMIT 8
+            """,
+            params,
+        )
+    ]
+    return {
+        "available": total > 0,
+        "total": total,
+        "high_or_critical": sum(int(row["count"]) for row in by_severity if row.get("label") in {"critical", "high"}),
+        "wan_exposure": _security_category_count(by_category, "WAN exposure")
+        + _security_category_count(by_category, "Remote access"),
+        "upnp_pcp": _security_category_count(by_category, "Automatic port sharing"),
+        "wireless": _security_category_count(by_category, "Wireless security"),
+        "by_severity": by_severity,
+        "by_category": by_category,
+        "top": top,
+    }
+
+
+def _security_category_count(rows: list[dict[str, Any]], label: str) -> int:
+    return sum(int(row.get("count") or 0) for row in rows if row.get("label") == label)
 
 
 def _host_count(conn: sqlite3.Connection, host_filter: str, host_params: list[Any], predicate: str) -> int:
@@ -3212,7 +4861,7 @@ def advertisement_hint_summary(
         dict(row)
         for row in conn.execute(
             f"""
-            SELECT observed_at, hint_type, protocol, hostname, mac, ip, direction, confidence, summary, source
+            SELECT id, observed_at, hint_type, protocol, hostname, mac, ip, direction, confidence, summary, source
             FROM advertisement_hints t
             {where_sql}
             ORDER BY COALESCE(t.observed_at, '') DESC, t.id DESC
@@ -3227,6 +4876,467 @@ def advertisement_hint_summary(
         "by_protocol": by_protocol,
         "by_confidence": by_confidence,
         "recent": recent,
+    }
+
+
+def probe_request_telemetry_summary(
+    conn: sqlite3.Connection,
+    run_id: int | None,
+    start: str = "",
+    end: str = "",
+    query: str = "",
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    false_positive_count = 0
+    generic_probe_mentions = 0
+    query_value = query.casefold().strip()
+
+    def add_row(row: dict[str, Any]) -> None:
+        searchable = " ".join(str(value or "") for value in row.values()).casefold()
+        if query_value and query_value not in searchable:
+            return
+        rows.append(row)
+
+    event_where, event_params = _time_range_sql("t.timestamp", start, end)
+    run_sql, run_params = _run_observation_sql("event_log", run_id)
+    event_where, event_params = _combine_filter(event_where, event_params, run_sql, run_params)
+    event_where, event_params = _combine_filter(
+        event_where,
+        event_params,
+        "(LOWER(t.message) LIKE '%probe%' OR LOWER(t.message) LIKE '%802.11%' OR LOWER(t.message) LIKE '%suchanfrage%')",
+        [],
+    )
+    for row in conn.execute(
+        f"""
+        SELECT t.id, t.timestamp, t.message, t.mac, t.ip, t.source, t.evidence_level, t.evidence_note
+        FROM event_log t{event_where}
+        ORDER BY COALESCE(t.timestamp, '') DESC, t.id DESC
+        LIMIT 200
+        """,
+        event_params,
+    ):
+        message = row["message"] or ""
+        match, false_positive = classify_probe_request_text(message)
+        false_positive_count += int(false_positive)
+        generic_probe_mentions += int(not match and "probe" in message.casefold())
+        if not match:
+            continue
+        mac = row["mac"] or first_regex(MAC_RE, message)
+        ip = row["ip"] or first_regex(IPV4_RE, message)
+        add_row(
+            {
+                "id": row["id"],
+                "record_type": "event_log",
+                "kind": "nearby_probe",
+                "title": mac or ip or "802.11 probe request",
+                "time": row["timestamp"],
+                "mac": mac,
+                "ip": ip,
+                "source": row["source"] or "event_log",
+                "confidence": "high",
+                "evidence_level": row["evidence_level"] or "parsed_from_raw",
+                "evidence_note": row["evidence_note"]
+                or "Exact retained log row that appears to describe 802.11 probe-request telemetry.",
+                "summary": message,
+            }
+        )
+
+    support_where, support_params = _time_range_sql("t.observed_at", start, end)
+    run_sql, run_params = _run_observation_sql("support_finding", run_id)
+    support_where, support_params = _combine_filter(support_where, support_params, run_sql, run_params)
+    support_where, support_params = _combine_filter(
+        support_where,
+        support_params,
+        "(LOWER(t.searchable) LIKE '%probe%' OR LOWER(t.searchable) LIKE '%802.11%' OR LOWER(t.searchable) LIKE '%suchanfrage%')",
+        [],
+    )
+    for row in conn.execute(
+        f"""
+        SELECT t.id, t.observed_at, t.source, t.raw_text, t.searchable, t.evidence_level, t.evidence_note
+        FROM support_findings t{support_where}
+        ORDER BY COALESCE(t.observed_at, '') DESC, t.id DESC
+        LIMIT 200
+        """,
+        support_params,
+    ):
+        text = row["raw_text"] or row["searchable"] or ""
+        match, false_positive = classify_probe_request_text(text)
+        false_positive_count += int(false_positive)
+        generic_probe_mentions += int(not match and "probe" in text.casefold())
+        if not match:
+            continue
+        mac = first_regex(MAC_RE, text)
+        ip = first_regex(IPV4_RE, text)
+        add_row(
+            {
+                "id": row["id"],
+                "record_type": "support_findings",
+                "kind": "nearby_probe",
+                "title": mac or ip or "802.11 probe request",
+                "time": row["observed_at"],
+                "mac": mac,
+                "ip": ip,
+                "source": row["source"] or "support_data_txt",
+                "confidence": "medium" if row["observed_at"] else "low",
+                "evidence_level": row["evidence_level"] or "parsed_from_raw",
+                "evidence_note": row["evidence_note"]
+                or "Support-data row that appears to describe 802.11 probe-request telemetry.",
+                "summary": text,
+            }
+        )
+
+    if not start and not end:
+        raw_where: list[str] = []
+        raw_params: list[Any] = []
+        if run_id is not None:
+            raw_where.append(
+                """
+                r.sha256 IN (
+                    SELECT content_sha256 FROM record_observations
+                    WHERE run_id = ? AND record_type = 'raw_artifact'
+                )
+                """
+            )
+            raw_params.append(run_id)
+        raw_where.append(
+            "(LOWER(r.content) LIKE '%probe%' OR LOWER(r.content) LIKE '%802.11%' OR LOWER(r.content) LIKE '%suchanfrage%')"
+        )
+        raw_sql = f"WHERE {' AND '.join(raw_where)}"
+        for row in conn.execute(
+            f"""
+            SELECT r.id, r.name, r.created_at, r.content
+            FROM raw_artifacts r
+            {raw_sql}
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT 40
+            """,
+            raw_params,
+        ):
+            content = row["content"] or ""
+            for snippet in probe_request_snippets(content):
+                match, false_positive = classify_probe_request_text(snippet)
+                false_positive_count += int(false_positive)
+                generic_probe_mentions += int(not match and "probe" in snippet.casefold())
+                if not match:
+                    continue
+                mac = first_regex(MAC_RE, snippet)
+                ip = first_regex(IPV4_RE, snippet)
+                add_row(
+                    {
+                        "id": row["id"],
+                        "record_type": "raw_artifacts",
+                        "kind": "nearby_probe",
+                        "title": mac or ip or "802.11 probe request",
+                        "time": row["created_at"],
+                        "mac": mac,
+                        "ip": ip,
+                        "source": row["name"],
+                        "confidence": "low",
+                        "evidence_level": "parsed_from_raw",
+                        "evidence_note": (
+                            "Raw artifact contains probe-request wording but no separately retained event timestamp."
+                        ),
+                        "summary": snippet,
+                    }
+                )
+
+    rows.sort(key=lambda item: (item.get("time") or "", item.get("id") or 0), reverse=True)
+    note = (
+        "No 802.11 probe-request management-frame telemetry was retained by this FRITZ!Box export. "
+        "Network-layer DHCP, mDNS, SSDP, UPnP, ARP, and multicast hints are not proof that an unassociated "
+        "nearby phone was probing for WiFi."
+    )
+    if rows:
+        note = (
+            "802.11 probe-request rows were found in retained artifacts. Treat rows without exact timestamps as "
+            "artifact evidence, not precise proximity events."
+        )
+    return {
+        "available": bool(rows),
+        "total": len(rows),
+        "rows": rows[:50],
+        "false_positive_count": false_positive_count,
+        "generic_probe_mentions": generic_probe_mentions,
+        "note": note,
+    }
+
+
+def classify_probe_request_text(text: str) -> tuple[bool, bool]:
+    if not text:
+        return False, False
+    has_probe = "probe" in text.casefold()
+    if has_probe and any(pattern.search(text) for pattern in PROBE_FALSE_POSITIVE_PATTERNS):
+        return False, True
+    return any(pattern.search(text) for pattern in PROBE_REQUEST_PATTERNS), False
+
+
+def probe_request_snippets(content: str, limit: int = 20) -> list[str]:
+    snippets: list[str] = []
+    seen: set[str] = set()
+    for pattern in PROBE_REQUEST_PATTERNS + [re.compile(r"\bprobe\b", re.I)]:
+        for match in pattern.finditer(content):
+            snippet = artifact_snippet(content, match.start(), 420)
+            if snippet in seen:
+                continue
+            seen.add(snippet)
+            snippets.append(snippet)
+            if len(snippets) >= limit:
+                return snippets
+    return snippets
+
+
+def enrich_device_metadata(conn: sqlite3.Connection, rows: list[dict[str, Any]], run_id: int | None) -> None:
+    if not rows:
+        return
+    host_run_sql, host_run_params = _run_observation_sql("host", run_id)
+    where = f"WHERE 1=1{(' AND ' + host_run_sql) if host_run_sql else ''}"
+    hosts = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT hostname, friendly_name, neighbour_name, vendor, model, wlan_station_type,
+                   interface, interface_detail, mac, ip, ip_list, mac_list
+            FROM hosts t
+            {where}
+            ORDER BY t.run_id DESC, t.id DESC
+            """,
+            host_run_params,
+        )
+    ]
+    by_mac: dict[str, dict[str, Any]] = {}
+    by_ip: dict[str, dict[str, Any]] = {}
+    for host in hosts:
+        for value in (host.get("mac"), host.get("mac_list")):
+            for token in MAC_RE.findall(str(value or "")):
+                by_mac.setdefault(normalize_mac(token), host)
+        for value in (host.get("ip"), host.get("ip_list")):
+            for token in IPV4_RE.findall(str(value or "")):
+                by_ip.setdefault(token, host)
+
+    for row in rows:
+        mac = first_present(row, "mac", "source_mac", "node_mac", "peer_mac", "bssid")
+        ip = first_present(row, "ip", "source_ip")
+        host = by_mac.get(normalize_mac(mac)) if mac else None
+        if not host and ip:
+            host = by_ip.get(str(ip))
+        if not host:
+            continue
+        for key in (
+            "hostname",
+            "friendly_name",
+            "neighbour_name",
+            "vendor",
+            "model",
+            "wlan_station_type",
+            "interface_detail",
+        ):
+            row[key] = row.get(key) or host.get(key)
+        row["device_type"] = row.get("device_type") or infer_device_type(host)
+        row["device_label"] = row.get("device_label") or device_display_name(row)
+
+
+def first_present(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def normalize_mac(value: Any) -> str:
+    return re.sub(r"[^0-9a-f]", "", str(value or "").lower())
+
+
+def device_display_name(row: dict[str, Any]) -> str:
+    for key in ("friendly_name", "hostname", "neighbour_name", "title", "mac", "ip"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return ""
+
+
+def infer_device_type(row: dict[str, Any]) -> str:
+    haystack = " ".join(
+        str(row.get(key) or "")
+        for key in ("friendly_name", "hostname", "neighbour_name", "vendor", "model", "wlan_station_type")
+    ).lower()
+    rules = (
+        ("iPhone", ("iphone",)),
+        ("iPad", ("ipad",)),
+        ("Apple Watch", ("watch",)),
+        ("Mac", ("macbook", "mac ", "imac")),
+        ("Android", ("android", "pixel", "galaxy", "samsung", "xiaomi", "huawei", "oneplus")),
+        ("Router/AP", ("router", "dreamrouter", "fritz.box", "repeater", "access point")),
+        ("TV", ("tv", "chromecast", "fire tv", "appletv")),
+        ("IoT", ("thermostat", "camera", "speaker", "echo", "homepod", "sonos")),
+    )
+    for label, needles in rules:
+        if any(needle in haystack for needle in needles):
+            return label
+    for key in ("model", "vendor", "wlan_station_type"):
+        value = str(row.get(key) or "").strip()
+        if value and value.casefold() not in {"0", "false", "none", "null", "unknown"}:
+            return value
+    return ""
+
+
+def investigation_discovery_rows(
+    conn: sqlite3.Connection,
+    run_id: int | None,
+    start: str = "",
+    end: str = "",
+    query: str = "",
+    probe_telemetry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    query_like = f"%{query.lower()}%" if query else ""
+    if probe_telemetry is None:
+        probe_telemetry = probe_request_telemetry_summary(conn, run_id, start, end, query)
+    rows.extend(probe_telemetry.get("rows") or [])
+    enrich_device_metadata(conn, rows, run_id)
+
+    def add_time_filters(where: list[str], params: list[Any], column: str) -> None:
+        if start:
+            where.append(f"COALESCE({column}, '') >= ?")
+            params.append(start)
+        if end:
+            where.append(f"COALESCE({column}, '') <= ?")
+            params.append(end)
+
+    wlan_where: list[str] = []
+    wlan_params: list[Any] = []
+    run_sql, run_params = _run_observation_sql("wlan_association", run_id)
+    if run_sql:
+        wlan_where.append(run_sql)
+        wlan_params.extend(run_params)
+    add_time_filters(wlan_where, wlan_params, "t.observed_at")
+    if query:
+        wlan_where.append(
+            "LOWER(COALESCE(t.searchable, '') || ' ' || COALESCE(t.hostname, '') || ' ' || "
+            "COALESCE(t.mac, '') || ' ' || COALESCE(t.ip, '')) LIKE ?"
+        )
+        wlan_params.append(query_like)
+    wlan_sql = f"WHERE {' AND '.join(wlan_where)}" if wlan_where else ""
+    for row in conn.execute(
+        f"""
+        SELECT t.id, t.observed_at, t.hostname, t.mac, t.ip, t.radio_index,
+               t.auth_state, t.speed, t.signal_strength, t.channel, t.guest,
+               t.source, t.evidence_level, t.evidence_note
+        FROM wlan_associations t
+        {wlan_sql}
+        ORDER BY COALESCE(t.observed_at, '') DESC, t.id DESC
+        LIMIT 50
+        """,
+        wlan_params,
+    ):
+        item = dict(row)
+        enrich_device_metadata(conn, [item], run_id)
+        rows.append(
+            {
+                **item,
+                "record_type": "wlan_associations",
+                "kind": "connected_now",
+                "title": device_display_name(item) or "WLAN associated device",
+                "time": item.get("observed_at"),
+                "signal": item.get("signal_strength") or item.get("speed") or item.get("channel"),
+                "summary": "Currently associated WiFi client snapshot retained during acquisition.",
+            }
+        )
+
+    mesh_where: list[str] = []
+    mesh_params: list[Any] = []
+    run_sql, run_params = _run_observation_sql("mesh_topology_link", run_id)
+    if run_sql:
+        mesh_where.append(run_sql)
+        mesh_params.extend(run_params)
+    add_time_filters(mesh_where, mesh_params, "t.last_connected")
+    if query:
+        mesh_where.append(
+            "LOWER(COALESCE(t.searchable, '') || ' ' || COALESCE(t.node, '') || ' ' || "
+            "COALESCE(t.node_mac, '') || ' ' || COALESCE(t.peer, '') || ' ' || COALESCE(t.peer_mac, '')) LIKE ?"
+        )
+        mesh_params.append(query_like)
+    mesh_sql = f"WHERE {' AND '.join(mesh_where)}" if mesh_where else ""
+    for row in conn.execute(
+        f"""
+        SELECT t.id, t.last_connected, t.node, t.node_mac, t.peer, t.peer_mac,
+               t.interface, t.link_type, t.state, t.rx, t.tx, t.source,
+               t.evidence_level, t.evidence_note
+        FROM mesh_topology_links t
+        {mesh_sql}
+        ORDER BY COALESCE(t.last_connected, '') DESC, t.id DESC
+        LIMIT 50
+        """,
+        mesh_params,
+    ):
+        item = dict(row)
+        enrich_device_metadata(conn, [item], run_id)
+        rows.append(
+            {
+                **item,
+                "record_type": "mesh_topology_links",
+                "kind": "mesh_roaming_link",
+                "title": device_display_name(item) or item.get("node") or item.get("node_mac") or item.get("peer") or "Mesh/AP link",
+                "time": item.get("last_connected"),
+                "mac": item.get("node_mac") or item.get("peer_mac"),
+                "signal": " / ".join(part for part in [item.get("rx"), item.get("tx")] if part),
+                "summary": "Mesh/topology link evidence; useful for roaming or AP path context.",
+            }
+        )
+
+    hint_where: list[str] = []
+    hint_params: list[Any] = []
+    run_sql, run_params = _run_observation_sql("advertisement_hint", run_id)
+    if run_sql:
+        hint_where.append(run_sql)
+        hint_params.extend(run_params)
+    add_time_filters(hint_where, hint_params, "t.observed_at")
+    if query:
+        hint_where.append(
+            "LOWER(COALESCE(t.searchable, '') || ' ' || COALESCE(t.hostname, '') || ' ' || "
+            "COALESCE(t.mac, '') || ' ' || COALESCE(t.ip, '') || ' ' || COALESCE(t.protocol, '')) LIKE ?"
+        )
+        hint_params.append(query_like)
+    hint_sql = f"WHERE {' AND '.join(hint_where)}" if hint_where else ""
+    for row in conn.execute(
+        f"""
+        SELECT t.id, t.observed_at, t.hint_type, t.protocol, t.hostname, t.mac, t.ip,
+               t.direction, t.confidence, t.summary, t.source, t.evidence_level, t.evidence_note
+        FROM advertisement_hints t
+        {hint_sql}
+        ORDER BY COALESCE(t.observed_at, '') DESC, t.id DESC
+        LIMIT 50
+        """,
+        hint_params,
+    ):
+        item = dict(row)
+        enrich_device_metadata(conn, [item], run_id)
+        rows.append(
+            {
+                **item,
+                "record_type": "advertisement_hints",
+                "kind": "network_discovery_hint",
+                "title": device_display_name(item) or item.get("protocol") or "Broadcast hint",
+                "time": item.get("observed_at"),
+                "signal": item.get("protocol"),
+                "summary": item.get("summary") or "Broadcast/discovery keyword retained in FRITZ!Box artifacts.",
+            }
+        )
+
+    rows.sort(key=lambda row: (row.get("time") or "", row.get("id") or 0), reverse=True)
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("kind") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return {
+        "rows": rows[:80],
+        "total": len(rows),
+        "by_kind": [{"label": key, "count": value} for key, value in sorted(counts.items())],
+        "note": (
+            "This combines true retained 802.11 probe-request rows when present, current WLAN association "
+            "snapshots, mesh/AP link timestamps, and separate network-layer discovery hints. FRITZ!Box exports "
+            "are not packet captures."
+        ),
     }
 
 
@@ -3432,6 +5542,7 @@ def entity_pivot(
             "time_type": "exact",
             "evidence_level": row["evidence_level"],
             "evidence_note": row["evidence_note"],
+            "source": row["source"],
         }
         for row in logs
     ] + [
@@ -3448,6 +5559,7 @@ def entity_pivot(
             "time_type": row["derived_time_type"],
             "evidence_level": row["evidence_level"],
             "evidence_note": row["evidence_note"],
+            "source": row["source"],
         }
         for row in wifi
     ]
@@ -3466,6 +5578,12 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
         "hosts": "hosts",
         "support": "support_findings",
         "support_findings": "support_findings",
+        "events": "siem_events",
+        "siem": "siem_events",
+        "siem_events": "siem_events",
+        "normalized_events": "siem_events",
+        "correlations": "siem_correlations",
+        "siem_correlations": "siem_correlations",
         "raw": "raw_artifacts",
         "raw_artifacts": "raw_artifacts",
         **ADDITIONAL_RECORD_TYPE_ALIASES,
@@ -3492,6 +5610,26 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
                 }
             ],
         }
+    if table == "siem_correlations":
+        linked = [
+            dict(item)
+            for item in conn.execute(
+                """
+                SELECT
+                    l.role, l.reason, l.weight,
+                    e.id, e.event_time, e.event_category, e.event_kind, e.severity,
+                    e.entity, e.hostname, e.mac, e.ip, e.source, e.record_type,
+                    e.record_id, e.message
+                FROM siem_correlation_events l
+                JOIN siem_events e ON e.id = l.event_id
+                WHERE l.correlation_id = ?
+                ORDER BY COALESCE(e.event_time, ''), e.id
+                LIMIT 200
+                """,
+                [record_id],
+            )
+        ]
+        row["linked_events"] = linked
     needles = [
         row.get("message"),
         row.get("mac"),
@@ -3796,7 +5934,7 @@ def _host_observed_at(conn: sqlite3.Connection, host_id: int, run_id: int | None
         params.append(run_id)
     row = conn.execute(
         f"""
-        SELECT MAX(observed_at) AS observed_at
+        SELECT MAX(COALESCE(event_time, observed_at)) AS observed_at
         FROM record_observations
         WHERE record_type = 'host' AND record_table_id = ?{run_sql}
         """,

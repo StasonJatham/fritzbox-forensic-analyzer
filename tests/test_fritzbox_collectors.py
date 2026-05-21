@@ -11,6 +11,7 @@ from fritzbox_collectors import (
     fetch_webui_readonly_endpoint,
     is_read_only_action,
     is_support_data_response,
+    safe_router_url,
 )
 
 
@@ -98,6 +99,15 @@ def test_fetch_avm_path_prefers_authenticated_session() -> None:
     assert content == "<root>secret</root>"
     assert session.gets[0]["url"] == "http://192.0.2.1/secure/path.lua"
     assert session.gets[0]["timeout"] == 15
+
+
+def test_safe_router_url_rejects_external_router_provided_paths() -> None:
+    assert safe_router_url("http://192.0.2.1", "/secure/path.lua") == "http://192.0.2.1/secure/path.lua"
+    assert safe_router_url("http://192.0.2.1", "http://192.0.2.1/secure/path.lua") == (
+        "http://192.0.2.1/secure/path.lua"
+    )
+    assert safe_router_url("http://192.0.2.1", "http://example.com/steal") is None
+    assert safe_router_url("http://192.0.2.1", "//example.com/steal") is None
 
 
 def test_fetch_webui_readonly_artifacts_collects_structured_get_results() -> None:
