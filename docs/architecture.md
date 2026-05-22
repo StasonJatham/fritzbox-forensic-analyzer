@@ -95,7 +95,7 @@ flowchart LR
     exposure["wan_port_mappings / advisories"]
     normalizer["fritzbox_siem.py"]
     events["siem_events"]
-    deauth["wifi.deauth_burst alert rule"]
+    deauth["possible_deauth_attack alert rule"]
     correlations["siem_correlations"]
     links["siem_correlation_events"]
 

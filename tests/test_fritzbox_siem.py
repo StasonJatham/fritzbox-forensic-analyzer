@@ -136,6 +136,9 @@ def test_deauthentication_burst_creates_siem_alert(tmp_path: Path) -> None:
                     "event_time": "2026-05-20T12:01:00+02:00",
                     "event_kind": "deauthenticated",
                     "mac": station_mac,
+                    "client_mac": station_mac,
+                    "source_bssid": "34:e1:a9:4d:58:ee",
+                    "channel": "6",
                     "interface": "ath0",
                     "reason_code": "3",
                     "source": "support_data_hostapd",
@@ -145,6 +148,9 @@ def test_deauthentication_burst_creates_siem_alert(tmp_path: Path) -> None:
                     "event_time": "2026-05-20T12:04:00+02:00",
                     "event_kind": "disassociated",
                     "mac": station_mac,
+                    "client_mac": station_mac,
+                    "source_bssid": "34:e1:a9:4d:58:ee",
+                    "channel": "6",
                     "interface": "ath0",
                     "reason_code": "8",
                     "source": "support_data_hostapd",
@@ -167,16 +173,37 @@ def test_deauthentication_burst_creates_siem_alert(tmp_path: Path) -> None:
     conn = init_db(db)
     try:
         events = fetch_events(conn)
+        deauth = conn.execute("""
+            SELECT event_time, mac, fields_json
+            FROM siem_events
+            WHERE event_kind = 'wifi.deauth_seen'
+            """).fetchone()
+        disassoc = conn.execute("""
+            SELECT fields_json
+            FROM siem_events
+            WHERE event_kind = 'wifi.disassoc_seen'
+            """).fetchone()
         alert = conn.execute("""
             SELECT correlation_type, event_count, severity, summary, fields_json
             FROM siem_correlations
-            WHERE rule_id = 'wifi.deauth_burst'
+            WHERE rule_id = 'possible_deauth_attack'
             """).fetchone()
     finally:
         conn.close()
 
-    assert events["wifi.deauthenticated"]["action"] == "deauthenticate"
-    assert events["wifi.disassociated"]["action"] == "disassociate"
+    assert events["wifi.deauth_seen"]["action"] == "deauth_seen"
+    assert events["wifi.disassoc_seen"]["action"] == "disassoc_seen"
+    assert deauth is not None
+    assert deauth["event_time"] == "2026-05-20T12:01:00+02:00"
+    assert deauth["mac"] == station_mac
+    assert disassoc is not None
+    deauth_fields = json.loads(deauth["fields_json"])
+    disassoc_fields = json.loads(disassoc["fields_json"])
+    assert deauth_fields["timestamp"] == "2026-05-20T12:01:00+02:00"
+    assert deauth_fields["client_mac"] == station_mac
+    assert deauth_fields["source_bssid"] == "34:e1:a9:4d:58:ee"
+    assert deauth_fields["channel"] == "6"
+    assert disassoc_fields["client_mac"] == station_mac
     assert alert is not None
     assert alert["correlation_type"] == "alert"
     assert alert["event_count"] == 3
@@ -185,6 +212,7 @@ def test_deauthentication_burst_creates_siem_alert(tmp_path: Path) -> None:
     fields = json.loads(alert["fields_json"])
     assert fields["threshold"] == 3
     assert fields["window_seconds"] == 600
+    assert fields["burst_count"] == 3
 
 
 def fetch_events(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
