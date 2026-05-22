@@ -528,6 +528,7 @@ def analysis_snapshot(
     last_used = last_used_histogram(conn, host_filter, host_params)
     advertisement_hints = advertisement_hint_summary(conn, scoped_run_id, start, end)
     security_advisories = security_advisory_summary(conn, scoped_run_id)
+    siem_alerts = siem_alert_summary(conn, scoped_run_id)
     conn.close()
     return {
         "category_counts": category_counts,
@@ -542,9 +543,55 @@ def analysis_snapshot(
         "tr064_summary": tr064,
         "host_risk_summary": host_risk,
         "security_advisories": security_advisories,
+        "siem_alerts": siem_alerts,
         "last_used_histogram": last_used,
         "advertisement_hints": advertisement_hints,
         "retained": retained,
         "latest_run": dict(run) if run else None,
         "gaps": gaps,
+    }
+
+
+def siem_alert_summary(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
+    params: list[Any] = []
+    where = "WHERE correlation_type = 'alert'"
+    if run_id is not None:
+        where += " AND run_id = ?"
+        params.append(run_id)
+    total = int(conn.execute(f"SELECT COUNT(*) FROM siem_correlations {where}", params).fetchone()[0])
+    by_severity = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(severity, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM siem_correlations
+            {where}
+            GROUP BY label
+            ORDER BY CASE label WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                     count DESC
+            """,
+            params,
+        )
+    ]
+    top = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT id, rule_id, severity, entity_label, event_count, summary, first_seen, last_seen
+            FROM siem_correlations
+            {where}
+            ORDER BY CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                     COALESCE(last_seen, first_seen, '' ) DESC,
+                     event_count DESC
+            LIMIT 8
+            """,
+            params,
+        )
+    ]
+    return {
+        "available": total > 0,
+        "total": total,
+        "high_or_critical": sum(int(row["count"]) for row in by_severity if row.get("label") in {"critical", "high"}),
+        "by_severity": by_severity,
+        "top": top,
     }

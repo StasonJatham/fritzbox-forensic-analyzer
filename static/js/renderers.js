@@ -464,23 +464,40 @@ function renderAlertPivots(analysis = {}) {
   const target = $("alert-pivots");
   if (!target) return;
   const security = analysis.security_advisories || {};
+  const siemAlerts = analysis.siem_alerts || {};
   const risk = analysis.host_risk_summary || {};
   const riskTotals = risk.totals || {};
   const wan = analysis.tr064_summary?.wan || {};
   const enabledWan = (wan.port_mappings || []).filter((mapping) => mapping.enabled).length;
+  const topAlerts = (siemAlerts.top || []).slice(0, 4).map((row) => ({
+    label: evidenceLabel(row.rule_id || "SIEM alert"),
+    value: evidenceLabel(row.severity || "review"),
+    meta: row.summary || [row.entity_label, row.event_count ? `${row.event_count} events` : ""].filter(Boolean).join(" / "),
+    view: "correlations",
+    level: row.severity || "medium"
+  }));
   const top = (security.top || []).slice(0, 3).map((row) => ({
     label: row.title || row.advisory_id || "Security advisory",
     value: evidenceLabel(row.severity || "review"),
     meta: [row.category, row.subject].filter(Boolean).join(" / ") || "security advisory",
     view: "security_advisories",
+    section: "security",
     level: row.severity || "medium"
   }));
   const rows = [
+    {
+      label: "SIEM alerts",
+      value: siemAlerts.total || 0,
+      meta: `${siemAlerts.high_or_critical || 0} critical/high correlation alert(s)`,
+      view: "correlations",
+      level: siemAlerts.high_or_critical ? "high" : siemAlerts.total ? "medium" : "low"
+    },
     {
       label: "Critical / high",
       value: security.high_or_critical || 0,
       meta: "router exposure and configuration advisories",
       view: "security_advisories",
+      section: "security",
       level: security.high_or_critical ? "high" : "low"
     },
     {
@@ -488,6 +505,7 @@ function renderAlertPivots(analysis = {}) {
       value: enabledWan,
       meta: `${(wan.port_mappings || []).length} retained mapping row(s)`,
       view: "wan_port_mappings",
+      section: "security",
       level: enabledWan ? "medium" : "low"
     },
     {
@@ -495,15 +513,17 @@ function renderAlertPivots(analysis = {}) {
       value: riskTotals.high || riskTotals.medium || 0,
       meta: "host risk summary pivots",
       view: "device_risk_summaries",
+      section: "security",
       level: riskTotals.high ? "high" : riskTotals.medium ? "medium" : "low"
     },
+    ...topAlerts,
     ...top
   ];
   target.innerHTML = rows.map((row) => `
     <button
       class="alert-pivot ${escapeHtml(cssToken(row.level))}"
       type="button"
-      data-pivot-section="security"
+      data-pivot-section="${escapeHtml(row.section || "")}"
       data-pivot-view="${escapeHtml(row.view)}"
       data-pivot-category="all"
     >

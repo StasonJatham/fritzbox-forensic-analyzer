@@ -48,6 +48,7 @@ WIFI_DEAUTH_TEXT_MARKERS = (
     "dis-associated",
     "disassociated",
 )
+HIGH_RISK_WAN_PORTS = {"22", "80", "443", "3389", "5900", "8080", "8443"}
 
 
 def refresh_siem_views(conn: sqlite3.Connection, run_id: int) -> dict[str, int]:
@@ -714,9 +715,22 @@ def generic_typed_artifact_events(conn: sqlite3.Connection, run_id: int) -> Iter
 
 def wan_mapping_severity(row: dict[str, Any]) -> str:
     port = clean(row.get("external_port"))
-    if port in {"22", "80", "443", "3389", "5900", "8080", "8443"}:
+    if port in HIGH_RISK_WAN_PORTS:
         return "critical"
     return "high"
+
+
+def high_risk_wan_mapping_event(event: dict[str, Any]) -> bool:
+    if event.get("record_type") != "wan_port_mappings":
+        return False
+    if event.get("event_kind") != "security.wan_port_mapping_enabled" or event.get("outcome") != "enabled":
+        return False
+    fields = load_json_dict(event.get("fields_json"))
+    return clean(fields.get("external_port")) in HIGH_RISK_WAN_PORTS
+
+
+def port_sort_key(value: str) -> tuple[int, str]:
+    return (int(value), "") if value.isdigit() else (999999, value)
 
 
 def security_advisory_kind(row: dict[str, Any]) -> str:
@@ -1022,11 +1036,17 @@ def build_siem_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]
     correlations = [
         *build_entity_rollup_correlations(events),
         *build_failed_login_burst_correlations(events),
+        *build_login_success_after_failure_correlations(events),
         *build_wifi_failure_burst_correlations(events),
         *build_wifi_deauth_burst_correlations(events),
+        *build_wlan_counter_alert_correlations(events),
+        *build_dns_probe_timeout_correlations(events),
+        *build_high_risk_wan_exposure_correlations(events),
         *build_wifi_session_fragment_correlations(events),
         *build_station_interval_correlations(events),
         *build_dhcp_lease_change_correlations(events),
+        *build_dhcp_ip_conflict_correlations(events),
+        *build_exposure_with_auth_failure_correlations(events),
         *build_exposure_correlations(events),
     ]
     sorted_rows = sorted(correlations, key=lambda row: (row["last_seen"] or "", row["event_count"]), reverse=True)
@@ -1094,6 +1114,60 @@ def build_failed_login_burst_correlations(events: list[dict[str, Any]]) -> list[
     )
 
 
+def build_login_success_after_failure_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    auth_events = [
+        event
+        for event in events
+        if event.get("event_kind") in {"auth.login_failure", "auth.login_success"} and event.get("event_time")
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in auth_events:
+        key = primary_correlation_key(event) or "router:auth"
+        grouped[key].append(event)
+
+    correlations: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        ordered = sorted(items, key=lambda item: item.get("event_time") or "")
+        for index, event in enumerate(ordered):
+            if event.get("event_kind") != "auth.login_success":
+                continue
+            failures = [
+                item
+                for item in ordered[:index]
+                if item.get("event_kind") == "auth.login_failure"
+                and (delta := seconds_between(item.get("event_time"), event.get("event_time"))) is not None
+                and delta <= 60 * 60
+            ]
+            if len(failures) < 2:
+                continue
+            window = [*failures[-10:], event]
+            label = best_entity_label(window) or key
+            correlations.append(
+                make_correlation(
+                    rule_id="auth.login_success_after_failures",
+                    correlation_type="alert",
+                    entity_key=key,
+                    entity_label=label,
+                    events=window,
+                    severity="medium",
+                    confidence=window_confidence(window),
+                    summary=f"{label}: successful FRITZ!Box login after {len(failures)} recent failures",
+                    extra_fields={
+                        "failure_count": len(failures),
+                        "window_seconds": 60 * 60,
+                        "reason": "A successful FRITZ!Box login followed two or more failed logins for the same entity/router within one hour.",
+                        "analyst_reaction": (
+                            "Confirm the successful login was expected. If not, rotate the router password, review users with "
+                            "internet/VPN rights, and preserve the surrounding retained logs."
+                        ),
+                    },
+                    link_reason="Failed-authentication events immediately preceding a successful FRITZ!Box login.",
+                )
+            )
+            break
+    return correlations
+
+
 def build_wifi_failure_burst_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     failures = [
         event for event in events if event.get("event_kind") == "wifi.connection_failed" and event.get("event_time")
@@ -1122,6 +1196,152 @@ def build_wifi_deauth_burst_correlations(events: list[dict[str, Any]]) -> list[d
         summary_action="802.11 deauthentication/disassociation events",
         reason="Three or more retained 802.11 deauthentication or disassociation events for the same entity in 10 minutes.",
     )
+
+
+def build_wlan_counter_alert_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    correlations: list[dict[str, Any]] = []
+    for event in events:
+        kind = clean(event.get("event_kind")) or ""
+        if not kind.startswith("network.wlan_station_counters."):
+            continue
+        value = event_field_int(event, "value")
+        if value is None:
+            continue
+        metric = clean(event_field(event, "metric")) or kind.rsplit(".", 1)[-1]
+        key = primary_correlation_key(event) or event_field_mac_key(event) or "router:wlan_station_counters"
+        label = best_entity_label([event]) or key
+        if metric == "cnt_connect_fail" and value >= 50:
+            severity = "high" if value >= 100 else "medium"
+            correlations.append(
+                make_correlation(
+                    rule_id="wifi.station_high_connect_failures",
+                    correlation_type="alert",
+                    entity_key=key,
+                    entity_label=label,
+                    events=[event],
+                    severity=severity,
+                    confidence=event.get("confidence") or "medium",
+                    summary=f"{label}: WLAN station retained {value} connection failures",
+                    extra_fields={
+                        "metric": metric,
+                        "value": value,
+                        "threshold": 50,
+                        "reason": "FRITZ!Box support data retained a high per-station WiFi connection-failure counter.",
+                        "analyst_reaction": (
+                            "Check whether the MAC belongs to a known device, verify password changes or weak signal, and look "
+                            "for nearby authentication failures or deauth/disassociation bursts."
+                        ),
+                    },
+                    link_reason="High WLAN station connection-failure counter.",
+                )
+            )
+        if metric == "cnt_disconnect_forced" and value > 0:
+            correlations.append(
+                make_correlation(
+                    rule_id="wifi.station_forced_disconnect_counter",
+                    correlation_type="alert",
+                    entity_key=key,
+                    entity_label=label,
+                    events=[event],
+                    severity="medium",
+                    confidence=event.get("confidence") or "medium",
+                    summary=f"{label}: WLAN station retained {value} forced disconnect counter value(s)",
+                    extra_fields={
+                        "metric": metric,
+                        "value": value,
+                        "threshold": 1,
+                        "reason": "FRITZ!Box support data retained a non-zero forced-disconnect counter for a WLAN station.",
+                        "analyst_reaction": (
+                            "Pivot on the station MAC, inspect retained WLAN management events, and compare with normal roaming "
+                            "or mesh-steering activity."
+                        ),
+                    },
+                    link_reason="Non-zero WLAN station forced-disconnect counter.",
+                )
+            )
+    return correlations
+
+
+def build_dns_probe_timeout_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    timeout_events = [
+        event
+        for event in events
+        if event.get("event_kind") == "network.dns_best_server_probe_timeout" and event.get("event_time")
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in timeout_events:
+        server = clean(event_field(event, "dns_server")) or "unknown"
+        grouped[f"dns_server:{server.casefold()}"].append(event)
+
+    correlations: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        ordered = sorted(items, key=lambda item: item.get("event_time") or "")
+        for window in event_windows(ordered, 90 * 60, 5):
+            server = clean(event_field(window[0], "dns_server")) or key.removeprefix("dns_server:")
+            queries = sorted({query for event in window if (query := clean(event_field(event, "dns_query_name")))})
+            correlations.append(
+                make_correlation(
+                    rule_id="network.dns_probe_timeout_burst",
+                    correlation_type="alert",
+                    entity_key=key,
+                    entity_label=f"DNS server {server}",
+                    events=window,
+                    severity="medium",
+                    confidence=window_confidence(window),
+                    summary=f"DNS server {server}: {len(window)} FRITZ!Box best-server probe timeouts in 90 minutes",
+                    extra_fields={
+                        "threshold": 5,
+                        "window_seconds": 90 * 60,
+                        "dns_server": server,
+                        "queries": queries[:20],
+                        "reason": "The router repeatedly timed out while probing its selected DNS resolver.",
+                        "analyst_reaction": (
+                            "Check ISP/router DNS stability, compare affected query names, and review whether clients reported "
+                            "connectivity issues during the retained window."
+                        ),
+                    },
+                    link_reason="DNS best-server probe timeout included in resolver-timeout burst.",
+                )
+            )
+    return correlations
+
+
+def build_high_risk_wan_exposure_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    exposures = [event for event in events if high_risk_wan_mapping_event(event)]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in exposures:
+        grouped[primary_correlation_key(event) or router_exposure_key(event)].append(event)
+
+    correlations: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        label = best_entity_label(items) or key
+        fields = [load_json_dict(event.get("fields_json")) for event in items]
+        ports = sorted(
+            {str(port) for field in fields if (port := clean(field.get("external_port")))},
+            key=port_sort_key,
+        )
+        protocols = sorted({str(protocol).upper() for field in fields if (protocol := clean(field.get("protocol")))})
+        remote_hosts = sorted({remote for field in fields if (remote := clean(field.get("remote_host")))})
+        correlations.append(
+            make_correlation(
+                rule_id="security.high_risk_wan_exposure",
+                correlation_type="alert",
+                entity_key=key,
+                entity_label=label,
+                events=items,
+                severity=max((normalize_severity(item.get("severity")) for item in items), key=severity_weight),
+                confidence=window_confidence(items),
+                summary=f"{label}: high-risk FRITZ!Box WAN port exposure on {', '.join(ports)}",
+                extra_fields={
+                    "ports": ports,
+                    "protocols": protocols,
+                    "remote_hosts": remote_hosts,
+                    "reason": "Enabled FRITZ!Box WAN port mapping exposes a management or remote-access service port.",
+                },
+                link_reason="Enabled high-risk WAN port mapping included in exposure alert.",
+            )
+        )
+    return correlations
 
 
 def build_burst_correlations(
@@ -1280,6 +1500,74 @@ def build_dhcp_lease_change_correlations(events: list[dict[str, Any]]) -> list[d
             )
         )
     return correlations
+
+
+def build_dhcp_ip_conflict_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    leases = [
+        event
+        for event in events
+        if event.get("event_kind") == "network.dhcp_lease_observed" and meaningful_ip(event.get("ip"))
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in leases:
+        grouped[f"ip:{str(event['ip']).casefold()}"].append(event)
+
+    correlations: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        macs = sorted({str(event.get("mac")).casefold() for event in items if meaningful_mac(event.get("mac"))})
+        if len(macs) < 2:
+            continue
+        hostnames = sorted({str(event.get("hostname")) for event in items if clean(event.get("hostname"))})
+        label = best_entity_label(items) or key
+        correlations.append(
+            make_correlation(
+                rule_id="network.dhcp_ip_conflict",
+                correlation_type="alert",
+                entity_key=key,
+                entity_label=label,
+                events=items,
+                severity="medium",
+                confidence=window_confidence(items),
+                summary=f"{label}: DHCP lease IP observed with {len(macs)} different MAC addresses",
+                extra_fields={
+                    "macs": macs,
+                    "hostnames": hostnames,
+                    "reason": "FRITZ!Box DHCP evidence shows the same IP address associated with multiple MAC addresses in this run.",
+                },
+                link_reason="DHCP lease row included in same-IP conflict comparison.",
+            )
+        )
+    return correlations
+
+
+def build_exposure_with_auth_failure_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    exposures = [event for event in events if actionable_exposure_event(event)]
+    failures = [event for event in events if event.get("event_kind") == "auth.login_failure"]
+    if not exposures or not failures:
+        return []
+    evidence = [*exposures[:20], *failures[:20]]
+    return [
+        make_correlation(
+            rule_id="security.exposure_with_auth_failures",
+            correlation_type="alert",
+            entity_key="router:exposure_auth",
+            entity_label="FRITZ!Box exposure and failed logins",
+            events=evidence,
+            severity="high",
+            confidence=window_confidence(evidence),
+            summary=f"FRITZ!Box exposure indicators observed with {len(failures)} retained authentication failure event(s)",
+            extra_fields={
+                "exposure_count": len(exposures),
+                "auth_failure_count": len(failures),
+                "reason": "Router exposure evidence and failed-login evidence both exist in the same acquisition run.",
+                "analyst_reaction": (
+                    "Review remote administration, MyFRITZ, VPN, UPnP/PCP, and port-sharing state; verify failed-login source "
+                    "IPs and rotate credentials if activity is unexpected."
+                ),
+            },
+            link_reason="Exposure evidence and failed-authentication evidence observed in the same run.",
+        )
+    ]
 
 
 def wifi_session_marker(event: dict[str, Any]) -> bool:
@@ -1754,6 +2042,35 @@ def load_json_dict(value: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def event_field(event: dict[str, Any], key: str) -> Any:
+    fields = load_json_dict(event.get("fields_json"))
+    if key in fields:
+        return fields.get(key)
+    raw = fields.get("raw_json")
+    if isinstance(raw, str):
+        raw_fields = load_json_dict(raw)
+        if key in raw_fields:
+            return raw_fields.get(key)
+    if isinstance(raw, dict) and key in raw:
+        return raw.get(key)
+    return event.get(key)
+
+
+def event_field_int(event: dict[str, Any], key: str) -> int | None:
+    value = event_field(event, key)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def event_field_mac_key(event: dict[str, Any]) -> str | None:
+    mac = normalize_mac(event_field(event, "mac"))
+    if meaningful_mac(mac):
+        return f"mac:{mac}"
+    return None
 
 
 def correlation_event_links(events: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:

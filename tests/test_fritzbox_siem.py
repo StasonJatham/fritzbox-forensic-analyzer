@@ -215,6 +215,212 @@ def test_deauthentication_burst_creates_siem_alert(tmp_path: Path) -> None:
     assert fields["burst_count"] == 3
 
 
+def test_fritzbox_specific_wan_and_dhcp_alerts(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+            "wan_port_mappings": [
+                {
+                    "protocol": "TCP",
+                    "external_port": "443",
+                    "internal_client": "192.168.178.50",
+                    "internal_port": "8443",
+                    "description": "admin ui",
+                    "enabled": "1",
+                    "source": "WANIPConn:GetGenericPortMappingEntry",
+                },
+                {
+                    "protocol": "TCP",
+                    "external_port": "12345",
+                    "internal_client": "192.168.178.51",
+                    "internal_port": "12345",
+                    "description": "custom service",
+                    "enabled": "1",
+                    "source": "WANIPConn:GetGenericPortMappingEntry",
+                },
+            ],
+            "dhcp_leases": [
+                {
+                    "observed_at": "2026-05-20T12:00:00+02:00",
+                    "hostname": "laptop",
+                    "mac": "aa:bb:cc:dd:ee:30",
+                    "ip": "192.168.178.30",
+                    "active": "1",
+                    "source": "data_lua_netDhcp",
+                },
+                {
+                    "observed_at": "2026-05-20T12:05:00+02:00",
+                    "hostname": "phone",
+                    "mac": "aa:bb:cc:dd:ee:31",
+                    "ip": "192.168.178.30",
+                    "active": "1",
+                    "source": "data_lua_netDhcp",
+                },
+            ],
+        },
+        db,
+    )
+
+    conn = init_db(db)
+    try:
+        wan_alert = conn.execute("""
+            SELECT correlation_type, entity_key, event_count, severity, fields_json
+            FROM siem_correlations
+            WHERE rule_id = 'security.high_risk_wan_exposure'
+            """).fetchone()
+        dhcp_alert = conn.execute("""
+            SELECT correlation_type, entity_key, event_count, severity, fields_json
+            FROM siem_correlations
+            WHERE rule_id = 'network.dhcp_ip_conflict'
+            """).fetchone()
+    finally:
+        conn.close()
+
+    assert wan_alert is not None
+    assert wan_alert["correlation_type"] == "alert"
+    assert wan_alert["entity_key"] == "ip:192.168.178.50"
+    assert wan_alert["event_count"] == 1
+    assert wan_alert["severity"] == "critical"
+    wan_fields = json.loads(wan_alert["fields_json"])
+    assert wan_fields["ports"] == ["443"]
+    assert wan_fields["protocols"] == ["TCP"]
+
+    assert dhcp_alert is not None
+    assert dhcp_alert["correlation_type"] == "alert"
+    assert dhcp_alert["entity_key"] == "ip:192.168.178.30"
+    assert dhcp_alert["event_count"] == 2
+    assert dhcp_alert["severity"] == "medium"
+    dhcp_fields = json.loads(dhcp_alert["fields_json"])
+    assert dhcp_fields["macs"] == ["aa:bb:cc:dd:ee:30", "aa:bb:cc:dd:ee:31"]
+
+
+def test_fritzbox_auth_dns_and_wlan_counter_alerts(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    dns_events = [
+        {
+            "timestamp": f"2026-05-20T12:{minute:02d}:00+02:00",
+            "category": "support data",
+            "source": "support_data_txt",
+            "message": (
+                "probe triggered, loose best server 217.237.151.51:53 - " f"timeout on IN A test-{minute}.example"
+            ),
+        }
+        for minute in (0, 10, 20, 30, 40)
+    ]
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [
+                {
+                    "timestamp": "2026-05-20T12:00:00+02:00",
+                    "category": "router",
+                    "ip": "192.168.178.44",
+                    "source": "device_log",
+                    "message": (
+                        "Anmeldung an der FRITZ!Box-Benutzeroberfläche von IP-Adresse "
+                        "192.168.178.44 gescheitert (falsches Kennwort)."
+                    ),
+                },
+                {
+                    "timestamp": "2026-05-20T12:03:00+02:00",
+                    "category": "router",
+                    "ip": "192.168.178.44",
+                    "source": "device_log",
+                    "message": (
+                        "Anmeldung an der FRITZ!Box-Benutzeroberfläche von IP-Adresse "
+                        "192.168.178.44 gescheitert (falsches Kennwort)."
+                    ),
+                },
+                {
+                    "timestamp": "2026-05-20T12:05:00+02:00",
+                    "category": "auth",
+                    "ip": "192.168.178.44",
+                    "source": "support_data_txt",
+                    "message": "validate_user: login success from 192.168.178.44",
+                },
+                *dns_events,
+            ],
+            "network_status_snapshots": [
+                {
+                    "observed_at": "2026-05-20T12:00:00+02:00",
+                    "area": "wlan_station_counters",
+                    "metric": "cnt_connect_fail",
+                    "value": "125",
+                    "unit": "count",
+                    "source": "support_station_list",
+                    "confidence": "medium",
+                    "mac": "aa:bb:cc:dd:ee:40",
+                }
+            ],
+            "security_advisories": [
+                {
+                    "advisory_id": "query_lua_user_remote_rights",
+                    "severity": "medium",
+                    "category": "User rights",
+                    "title": "FRITZ!Box user has internet rights",
+                    "subject": "analyst",
+                    "status": "review",
+                    "recommendation": "Verify remote rights.",
+                    "source": "query_lua_user_rights",
+                    "confidence": "medium",
+                }
+            ],
+        },
+        db,
+    )
+
+    conn = init_db(db)
+    try:
+        rule_ids = {row["rule_id"] for row in conn.execute("SELECT rule_id FROM siem_correlations")}
+        auth_alert = conn.execute("""
+            SELECT severity, entity_key, event_count, fields_json
+            FROM siem_correlations
+            WHERE rule_id = 'auth.login_success_after_failures'
+            """).fetchone()
+        dns_alert = conn.execute("""
+            SELECT severity, entity_key, event_count, fields_json
+            FROM siem_correlations
+            WHERE rule_id = 'network.dns_probe_timeout_burst'
+            """).fetchone()
+        wlan_alert = conn.execute("""
+            SELECT severity, entity_key, event_count, fields_json
+            FROM siem_correlations
+            WHERE rule_id = 'wifi.station_high_connect_failures'
+            """).fetchone()
+    finally:
+        conn.close()
+
+    assert "security.exposure_with_auth_failures" in rule_ids
+    assert auth_alert is not None
+    assert auth_alert["severity"] == "medium"
+    assert auth_alert["entity_key"] == "ip:192.168.178.44"
+    assert auth_alert["event_count"] == 3
+    assert json.loads(auth_alert["fields_json"])["failure_count"] == 2
+
+    assert dns_alert is not None
+    assert dns_alert["severity"] == "medium"
+    assert dns_alert["entity_key"] == "dns_server:217.237.151.51"
+    assert dns_alert["event_count"] == 5
+    assert json.loads(dns_alert["fields_json"])["threshold"] == 5
+
+    assert wlan_alert is not None
+    assert wlan_alert["severity"] == "high"
+    assert wlan_alert["entity_key"] == "mac:aa:bb:cc:dd:ee:40"
+    assert json.loads(wlan_alert["fields_json"])["value"] == 125
+
+
 def fetch_events(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     return {row["event_kind"]: row for row in conn.execute("""
             SELECT event_kind, action, outcome, severity, confidence, evidence_level, protocol, fields_json

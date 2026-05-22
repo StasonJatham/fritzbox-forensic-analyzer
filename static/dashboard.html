@@ -7,7 +7,7 @@
   <link rel="icon" href="/static/logo.svg?v=clean-logo" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/logo-192.png?v=clean-logo">
   <title>FRITZ!Box Forensik SIEM</title>
-  <link rel="stylesheet" href="/static/dashboard.css?v=mini-siem8">
+  <link rel="stylesheet" href="/static/dashboard.css?v=mini-siem9">
 </head>
 <body>
   <header>
@@ -153,6 +153,14 @@
           <section class="side-panel field-panel">
             <p class="section-title">Fields</p>
             <div class="field-facets" id="field-facets"></div>
+          </section>
+          <section class="side-panel">
+            <p class="section-title">SIEM Alerts</p>
+            <div class="alert-list" id="alert-pivots"></div>
+          </section>
+          <section class="side-panel">
+            <p class="section-title">Evidence Pivots</p>
+            <div class="correlation-list" id="correlations"></div>
           </section>
         </aside>
         <div class="results-pane">
@@ -438,16 +446,16 @@
     </div>
   </div>
   <!-- Classic scripts are intentionally ordered: state/utils -> table/renderers -> feature APIs -> navigation/app boot. -->
-  <script src="/static/js/state.js?v=mini-siem8"></script>
-  <script src="/static/js/utils.js?v=mini-siem8"></script>
-  <script src="/static/js/table.js?v=mini-siem8"></script>
-  <script src="/static/js/renderers.js?v=mini-siem8"></script>
-  <script src="/static/js/acquisition.js?v=mini-siem8"></script>
-  <script src="/static/js/live_capture.js?v=mini-siem8"></script>
-  <script src="/static/js/investigation_actions.js?v=mini-siem8"></script>
-  <script src="/static/js/api.js?v=mini-siem8"></script>
-  <script src="/static/js/drawer.js?v=mini-siem8"></script>
-  <script src="/static/js/navigation.js?v=mini-siem8"></script>
-  <script src="/static/js/app.js?v=mini-siem8"></script>
+  <script src="/static/js/state.js?v=mini-siem9"></script>
+  <script src="/static/js/utils.js?v=mini-siem9"></script>
+  <script src="/static/js/table.js?v=mini-siem9"></script>
+  <script src="/static/js/renderers.js?v=mini-siem9"></script>
+  <script src="/static/js/acquisition.js?v=mini-siem9"></script>
+  <script src="/static/js/live_capture.js?v=mini-siem9"></script>
+  <script src="/static/js/investigation_actions.js?v=mini-siem9"></script>
+  <script src="/static/js/api.js?v=mini-siem9"></script>
+  <script src="/static/js/drawer.js?v=mini-siem9"></script>
+  <script src="/static/js/navigation.js?v=mini-siem9"></script>
+  <script src="/static/js/app.js?v=mini-siem9"></script>
 </body>
 </html>
