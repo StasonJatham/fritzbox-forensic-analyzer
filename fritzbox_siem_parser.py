@@ -31,6 +31,22 @@ def compile_pattern(pattern: str) -> Pattern[str]:
 
 LOG_PATTERNS: tuple[LogPattern, ...] = (
     LogPattern(
+        rule_id="network.dns_best_server_probe_timeout",
+        regex=compile_pattern(
+            r"\bprobe triggered,\s+loose best server\s+"
+            r"(?P<dns_server>\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}):(?P<dns_port>\d+)\s+-\s+"
+            r"timeout on\s+(?P<dns_class>\S+)\s+(?P<dns_query_type>\S+)\s+(?P<dns_query_name>\S+)"
+        ),
+        category="network",
+        kind="network.dns_best_server_probe_timeout",
+        action="dns_best_server_probe",
+        outcome="timeout",
+        severity="low",
+        protocol="DNS",
+        tags=("dns", "dnsdbest", "timeout", "probe"),
+        priority=40,
+    ),
+    LogPattern(
         rule_id="wifi.ap_sta_connected",
         regex=compile_pattern(r"\b(?P<interface>ath\d+|wlan\d+):\s+AP-STA-CONNECTED\s+(?P<mac>[0-9a-f:]{17})\b"),
         category="wifi",

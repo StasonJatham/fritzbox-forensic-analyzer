@@ -281,7 +281,7 @@ function renderTable() {
 
 function rowAction(row) {
   const type = recordTypeForView(state.view, row);
-  const id = row.record_id || row.id || "";
+  const id = recordIdForView(state.view, row, type);
   return `
     <div class="row-actions">
       <button class="row-action" data-action="evidence" data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">Inspect</button>
@@ -465,7 +465,7 @@ function table(headers, rows, sourceRows = []) {
     rows.map((row, index) => {
       const source = sourceRows[index] || {};
       const type = recordTypeForView(state.view, source);
-      const id = source.record_id || source.id || "";
+      const id = recordIdForView(state.view, source, type);
       return `<tr data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">${row.map((cell, cellIndex) => {
         const raw = text(cell);
         const html = raw.startsWith("<span") || raw.startsWith("<button") || raw.trim().startsWith("<div");
@@ -579,6 +579,12 @@ function recordTypeForView(view, row = {}) {
   if (view === "raw") return "raw";
   if (additionalEvidenceView(view)) return view;
   return "";
+}
+
+function recordIdForView(view, row = {}, type = "") {
+  const normalizedType = type || recordTypeForView(view, row);
+  if (normalizedType === "siem_events" || normalizedType === "siem_correlations") return row.id || row.record_id || "";
+  return row.record_id || row.id || "";
 }
 
 function presenceSpan(row) {

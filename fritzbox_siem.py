@@ -1029,7 +1029,25 @@ def build_siem_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]
         *build_dhcp_lease_change_correlations(events),
         *build_exposure_correlations(events),
     ]
-    return sorted(correlations, key=lambda row: (row["last_seen"] or "", row["event_count"]), reverse=True)
+    sorted_rows = sorted(correlations, key=lambda row: (row["last_seen"] or "", row["event_count"]), reverse=True)
+    return dedupe_siem_correlations(sorted_rows)
+
+
+def dedupe_siem_correlations(correlations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in correlations:
+        key = (
+            clean(row.get("rule_id")) or "",
+            clean(row.get("entity_key")) or "",
+            clean(row.get("window_start")) or "",
+            clean(row.get("window_end")) or "",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
 
 
 def build_entity_rollup_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

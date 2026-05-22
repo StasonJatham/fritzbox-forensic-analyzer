@@ -199,6 +199,24 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
             )
         ]
         row["linked_events"] = linked
+    if table == "event_log":
+        linked = [
+            dict(item)
+            for item in conn.execute(
+                """
+                SELECT id, event_time, event_category, event_kind, action, outcome, severity,
+                       entity, hostname, mac, ip, source, confidence, evidence_level,
+                       record_type, record_id, message, tags_json, fields_json
+                FROM siem_events
+                WHERE record_type = 'event_log'
+                  AND record_id = ?
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                [record_id],
+            )
+        ]
+        row["linked_events"] = linked
     needles = [
         row.get("message"),
         row.get("mac"),

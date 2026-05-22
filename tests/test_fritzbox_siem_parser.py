@@ -77,6 +77,26 @@ def test_parse_probe_request_as_nearby_discovery() -> None:
     assert "nearby" in parsed["tags"]
 
 
+def test_parse_dns_best_server_probe_timeout() -> None:
+    parsed = parse_fritzbox_log_message(
+        "probe triggered, loose best server 217.237.151.51:53 - timeout on IN T65 chat.openai.com"
+    )
+
+    assert parsed["category"] == "network"
+    assert parsed["kind"] == "network.dns_best_server_probe_timeout"
+    assert parsed["action"] == "dns_best_server_probe"
+    assert parsed["outcome"] == "timeout"
+    assert parsed["severity"] == "low"
+    assert parsed["protocol"] == "DNS"
+    assert parsed["ip"] == "217.237.151.51"
+    assert parsed["fields"]["dns_server"] == "217.237.151.51"
+    assert parsed["fields"]["dns_port"] == "53"
+    assert parsed["fields"]["dns_class"] == "IN"
+    assert parsed["fields"]["dns_query_type"] == "T65"
+    assert parsed["fields"]["dns_query_name"] == "chat.openai.com"
+    assert parsed["fields"]["parser_rule_id"] == "network.dns_best_server_probe_timeout"
+
+
 def test_parse_hostapd_wpa_and_radius_support_lines() -> None:
     handshake = parse_fritzbox_log_message("ath1: STA aa:bb:cc:dd:ee:11 WPA: pairwise key handshake completed (RSN)")
     radius = parse_fritzbox_log_message("ath1: STA aa:bb:cc:dd:ee:11 RADIUS: starting accounting session ABC123")
@@ -128,6 +148,7 @@ def test_parser_rule_registry_is_introspectable() -> None:
     assert "wifi.ap_sta_connected" in rule_ids
     assert "wifi.probe_request" in rule_ids
     assert "wifi.radius_accounting_start" in rule_ids
+    assert "network.dns_best_server_probe_timeout" in rule_ids
     assert "auth.soap_failure" in rule_ids
     assert "security.remote_admin_enabled" in rule_ids
     assert "security.wireguard_vpn" in rule_ids
