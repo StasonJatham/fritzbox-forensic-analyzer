@@ -1,21 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 import json
 import re
-from typing import Any, Iterable
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
 
 from fritzbox_siem_parser import parse_fritzbox_log_message
+from fritzbox_support_parsers import (
+    parse_hostapd_lifecycle_event,
+    parse_station_key_value,
+    reason_name,
+    station_state_snapshot_to_dict,
+    support_uptime_seconds,
+    wlan_event_row_to_dict,
+)
 
 LOG_TS_RE = re.compile(
-    r"^(?P<date>\d{1,2}\.\d{1,2}\.(?:\d{2}|\d{4}))\s+"
-    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s+(?P<message>.*)$"
+    r"^(?P<date>\d{1,2}\.\d{1,2}\.(?:\d{2}|\d{4}))\s+" r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s+(?P<message>.*)$"
 )
 SUPPORT_TS_RE = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2})\s+"
-    r"(?P<time>\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\s+-\s+(?P<message>.*)$"
+    r"^(?P<date>\d{4}-\d{2}-\d{2})\s+" r"(?P<time>\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\s+-\s+(?P<message>.*)$"
 )
 STEERING_HISTORY_RE = re.compile(
     r"OPTIMISATION\s+RCPI\s+STA\s+(?P<sta>[0-9a-fA-F:]{17})\s+"
@@ -79,7 +86,13 @@ WLAN_CHANNEL_LOAD_RE = re.compile(
 )
 AP_STA_EVENT_RE = re.compile(
     r"(?P<iface>ath\d+):\s+(?P<event>AP-STA-CONNECTED|AP-STA-DISCONNECTED|EAPOL-4WAY-HS-COMPLETED)\s+"
-    r"(?P<mac>[0-9a-fA-F:]{17})",
+    r"(?P<mac>[0-9a-fA-F:]{17})(?P<detail>.*)",
+    re.I,
+)
+HOSTAPD_CLIENT_LIFECYCLE_RE = re.compile(
+    r"(?P<iface>ath\d+):\s+(?:STA\s+)?(?P<mac>[0-9a-fA-F:]{17}).{0,80}?"
+    r"(?P<event>authenticated|associated|reassociated|disassociated|deauthenticated|auth|assoc|reassoc|disassoc|deauth)"
+    r"(?:.*?(?:reason|reason_code|status|status_code)[=:\s]+(?P<reason>\d+|0x[0-9a-fA-F]+))?",
     re.I,
 )
 WPA_HANDSHAKE_RE = re.compile(
@@ -93,8 +106,7 @@ RADIUS_ACCOUNTING_RE = re.compile(
     re.I,
 )
 ASSOCIATION_REQUEST_RE = re.compile(
-    r"STA\s+(?P<mac>[0-9a-fA-F:]{17}).*Association Request|"
-    r"Association Request.*STA\s+(?P<mac2>[0-9a-fA-F:]{17})",
+    r"STA\s+(?P<mac>[0-9a-fA-F:]{17}).*Association Request|" r"Association Request.*STA\s+(?P<mac2>[0-9a-fA-F:]{17})",
     re.I,
 )
 MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
@@ -562,9 +574,9 @@ def lan_device_host_rows(
                 "last_seen": device.get("last_seen"),
                 "last_connected": device.get("last_connected"),
                 "last_activity": device.get("last_connected") or device.get("last_seen") or device.get("first_seen"),
-                "last_activity_source": "fritzbox_landevice_lastused"
-                if device.get("last_connected")
-                else "fritzbox_landevice_state",
+                "last_activity_source": (
+                    "fritzbox_landevice_lastused" if device.get("last_connected") else "fritzbox_landevice_state"
+                ),
                 "last_activity_confidence": "medium" if device.get("last_connected") else "low",
                 "last_activity_note": "FRITZ!Box web UI LAN-device state retained this device even when the official host list did not expose it.",
             }
@@ -593,6 +605,9 @@ def build_available_wifi_connections(
         elif event_name == "station_history_interval":
             derived_time_type = "80211_station_history_interval"
             derived_confidence = "high"
+        elif event_name == "station_state_snapshot":
+            derived_time_type = "80211_station_state_snapshot"
+            derived_confidence = "medium"
         elif event_name == "wlan_event_table_row":
             derived_time_type = "80211_wlan_events_table"
             derived_confidence = "medium"
@@ -607,10 +622,14 @@ def build_available_wifi_connections(
         }:
             derived_time_type = f"80211_{event_name}"
             derived_confidence = "high" if event_name in {"ap_sta_connected", "wpa_pairwise_handshake"} else "medium"
+        if event.get("hostapd_action") in {"assoc", "reassoc", "disassoc", "deauth"}:
+            derived_time_type = f"80211_hostapd_{event.get('hostapd_action')}"
+            derived_confidence = "high" if event.get("hostapd_action") in {"assoc", "reassoc"} else "medium"
         timestamped_presence_events = {
             "connected",
             "steering_observation",
             "station_history_interval",
+            "station_state_snapshot",
             "wlan_event_table_row",
             "wpa_pairwise_handshake",
             "wpa_group_handshake",
@@ -633,10 +652,35 @@ def build_available_wifi_connections(
                 "ip": event.get("ip"),
                 "last_connected": event.get("timestamp") if event_name in exact_connection_events else None,
                 "source": event.get("source") or "device_log",
-                "confidence": "support_steering_history"
-                if event_name == "steering_observation"
-                else event.get("confidence") or "connection_event",
+                "confidence": (
+                    "support_steering_history"
+                    if event_name == "steering_observation"
+                    else event.get("confidence") or "connection_event"
+                ),
                 "message": event.get("message"),
+                "disconnected_at": event.get("disconnected_at"),
+                "duration_seconds": event.get("duration_seconds"),
+                "interval_open": event.get("interval_open"),
+                "reason_code": event.get("reason_code"),
+                "reason_name": event.get("reason_name"),
+                "connect_reason_code": event.get("connect_reason_code"),
+                "connect_reason_name": event.get("connect_reason_name"),
+                "disconnect_reason_code": event.get("disconnect_reason_code"),
+                "disconnect_reason_name": event.get("disconnect_reason_name"),
+                "hostapd_event": event.get("hostapd_event"),
+                "hostapd_action": event.get("hostapd_action"),
+                "last_seen": event.get("last_seen"),
+                "is_active": event.get("is_active"),
+                "is_guest": event.get("is_guest"),
+                "station_visible": event.get("station_visible"),
+                "rssi": event.get("rssi"),
+                "quality": event.get("quality"),
+                "bssid": event.get("bssid"),
+                "role_id": event.get("role_id"),
+                "if_name": event.get("if_name"),
+                "connect_state": event.get("connect_state"),
+                "event_id": event.get("event_id"),
+                "details_hex": event.get("details_hex"),
             }
         )
     for device in mesh_wifi_devices:
@@ -685,46 +729,118 @@ def build_available_wifi_connections(
     return sorted(records, key=lambda item: item.get("timestamp") or "", reverse=True)
 
 
-def parse_support_wifi_observations(content: str | None) -> list[dict[str, Any]]:
+def parse_support_wifi_observations(content: str | None, observed_at: str | None = None) -> list[dict[str, Any]]:
     if not content:
         return []
     observations: list[dict[str, Any]] = []
     section = ""
+    station_subsection = ""
     current_station_mac: str | None = None
+    current_station_state: dict[str, Any] = {}
+    uptime_seconds = support_uptime_seconds(content)
+
+    def flush_station_state() -> None:
+        nonlocal current_station_state
+        snapshot = station_state_snapshot_to_dict(
+            current_station_state,
+            observed_at=observed_at,
+            uptime_seconds=uptime_seconds,
+        )
+        if snapshot:
+            observations.append(
+                {
+                    **snapshot,
+                    "event": "station_state_snapshot",
+                    "hostname": snapshot.get("hostname"),
+                    "ip": snapshot.get("ip"),
+                    "interface": snapshot.get("if_name"),
+                    "source": "support_data_station_list",
+                    "confidence": "support_station_state_snapshot",
+                    "message": (
+                        f"STATION_LIST state snapshot for {snapshot.get('mac')}: "
+                        f"active={snapshot.get('is_active')} guest={snapshot.get('is_guest')} "
+                        f"visible={snapshot.get('station_visible')} rssi={snapshot.get('rssi')} "
+                        f"quality={snapshot.get('quality')} bssid={snapshot.get('bssid')} "
+                        f"role={snapshot.get('role_id')} if={snapshot.get('if_name')} "
+                        f"connect_state={snapshot.get('connect_state')}"
+                    ),
+                }
+            )
+        current_station_state = {}
+
     for line_number, raw_line in enumerate(content.splitlines(), start=1):
         line = raw_line.rstrip()
         section_candidate = support_section_title(line)
         if section_candidate:
+            if "STATION_LIST" in section:
+                flush_station_state()
             section = section_candidate
+            station_subsection = ""
             current_station_mac = None
             continue
-        if "STATION_LIST" in section and re.match(r"^\s+mac\s+=", line):
-            current_station_mac = parse_mac(line) or current_station_mac
-            continue
+        if "STATION_LIST" in section:
+            if line.startswith("----------------------------------------") or "Station management:" in line:
+                flush_station_state()
+                current_station_mac = None
+                current_station_state = {"block_line": line_number}
+                station_subsection = "station"
+                continue
+            if "Station connection:" in line:
+                station_subsection = "connection"
+                continue
+            if "Networking infos:" in line:
+                station_subsection = "networking"
+                continue
+            if "Connect history:" in line:
+                station_subsection = "history"
+                continue
+            station_key_value = parse_station_key_value(line)
+            if station_key_value:
+                key, value = station_key_value
+                if key == "mac":
+                    current_station_mac = parse_mac(value) or current_station_mac
+                    current_station_state["mac"] = current_station_mac
+                    current_station_state["mac_line"] = line_number
+                elif key == "last_seen" and station_subsection == "station":
+                    current_station_state["station_last_seen"] = value
+                    current_station_state["station_last_seen_line"] = line_number
+                elif key == "last_seen" and station_subsection == "networking":
+                    current_station_state["networking_last_seen"] = value
+                    current_station_state["networking_last_seen_line"] = line_number
+                else:
+                    current_station_state[key] = value
+                continue
         wlan_row = WLAN_EVENTS_ROW_RE.match(line)
         if wlan_row:
-            timestamp = parse_compact_support_timestamp(wlan_row.group("timestamp"))
-            event_id = wlan_row.group("event_id")
+            details = wlan_event_row_to_dict(wlan_row, line_number)
+            event_id = str(details["event_id"])
             observations.append(
                 {
-                    "timestamp": timestamp.isoformat() if timestamp else None,
+                    "timestamp": details["timestamp"],
                     "event": "wlan_event_table_row",
                     "hostname": None,
-                    "mac": parse_mac(wlan_row.group("mac")),
+                    "mac": details["mac"],
                     "ip": None,
-                    "interface": clean_dash(wlan_row.group("iface")),
-                    "radio_band": wlan_row.group("band"),
-                    "rate": wlan_row.group("rate"),
-                    "channel": wlan_row.group("channel"),
-                    "previous_channel": wlan_row.group("prev_channel"),
+                    "interface": details["interface"],
+                    "radio_band": str(details["band"]),
+                    "radio_band_id": details["band"],
+                    "rate": str(details["rate"]),
+                    "rate_value": details["rate"],
+                    "channel": str(details["channel"]),
+                    "channel_number": details["channel"],
+                    "previous_channel": str(details["previous_channel"]),
+                    "previous_channel_number": details["previous_channel"],
                     "raw_event_id": event_id,
-                    "raw_details": wlan_row.group("details"),
+                    "event_id": details["event_id"],
+                    "raw_details": details["details_hex"],
+                    "details_hex": details["details_hex"],
+                    "details_int": details["details_int"],
                     "source": "support_data_wlan_events",
                     "confidence": "support_wlan_events_table",
                     "message": (
-                        f"WLAN_EVENTS row: event_id={event_id} band={wlan_row.group('band')} "
-                        f"rate={wlan_row.group('rate')} channel={wlan_row.group('channel')} "
-                        f"details={wlan_row.group('details')}"
+                        f"WLAN_EVENTS row: event_id={event_id} band={details['band']} "
+                        f"rate={details['rate']} channel={details['channel']} "
+                        f"details={details['details_hex']}"
                     ),
                     "line_number": line_number,
                 }
@@ -736,6 +852,11 @@ def parse_support_wifi_observations(content: str | None) -> list[dict[str, Any]]
             disconnected_at = parse_compact_support_timestamp(station_row.group("disconnected"))
             if connected_at is None:
                 continue
+            duration_seconds = (
+                int((disconnected_at - connected_at).total_seconds()) if disconnected_at is not None else None
+            )
+            connect_reason_code = int(station_row.group("connect_reason"), 16)
+            disconnect_reason_code = int(station_row.group("disconnect_reason"), 16)
             observations.append(
                 {
                     "timestamp": connected_at.isoformat(),
@@ -752,6 +873,12 @@ def parse_support_wifi_observations(content: str | None) -> list[dict[str, Any]]
                     "disconnect_status": station_row.group("disconnect_status"),
                     "disconnect_initiator": station_row.group("disconnect_initiator"),
                     "disconnect_reason": station_row.group("disconnect_reason"),
+                    "connect_reason_code": connect_reason_code,
+                    "connect_reason_name": reason_name(connect_reason_code),
+                    "disconnect_reason_code": disconnect_reason_code,
+                    "disconnect_reason_name": reason_name(disconnect_reason_code),
+                    "duration_seconds": duration_seconds,
+                    "interval_open": disconnected_at is None,
                     "wlan_mode": station_row.group("wlan_mode"),
                     "quality": station_row.group("quality"),
                     "source": "support_data_station_list",
@@ -765,7 +892,250 @@ def parse_support_wifi_observations(content: str | None) -> list[dict[str, Any]]
                     "line_number": line_number,
                 }
             )
+    if "STATION_LIST" in section:
+        flush_station_state()
     return observations
+
+
+STATION_STATE_KEYS = {
+    "last_seen",
+    "is_active",
+    "is_guest",
+    "rssi",
+    "quality",
+    "bssid",
+    "role_id",
+    "if_name",
+    "connect_state",
+    "speed",
+    "hostname",
+    "ip",
+    "ipv4",
+    "ip_addr",
+    "ip_address",
+}
+
+
+def parse_support_wifi_details(content: str | None, observed_at: str) -> dict[str, list[dict[str, Any]]]:
+    """Parse support-data WLAN sections into typed evidence rows.
+
+    FRITZ!OS support-data formats vary by firmware. This parser is deliberately
+    tolerant: it promotes well-known STATION_LIST key/value fields and reuses the
+    existing WLAN_EVENTS / station-history recognizers without assuming one exact
+    section layout.
+    """
+
+    rows = {
+        "wlan_station_state_snapshots": [],
+        "wlan_station_intervals": [],
+        "wlan_ap_client_events": parse_support_ap_client_events(content),
+        "wlan_event_details": [],
+    }
+    for observation in parse_support_wifi_observations(content, observed_at):
+        if observation.get("event") == "station_state_snapshot":
+            rows["wlan_station_state_snapshots"].append(station_state_row(observation))
+        elif observation.get("event") == "station_history_interval":
+            rows["wlan_station_intervals"].append(station_interval_row(observation))
+        elif observation.get("event") == "wlan_event_table_row":
+            rows["wlan_event_details"].append(wlan_event_detail_row(observation))
+    return rows
+
+
+def parse_support_station_state_snapshots(content: str | None, observed_at: str) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    rows: list[dict[str, Any]] = []
+    section = ""
+    current: dict[str, Any] = {}
+
+    def flush() -> None:
+        if not current.get("mac"):
+            return
+        rows.append(
+            {
+                "observed_at": observed_at,
+                "mac": current.get("mac"),
+                "hostname": current.get("hostname") or current.get("name"),
+                "ip": current.get("ip"),
+                "interface": current.get("if_name") or current.get("interface"),
+                "bssid": parse_mac(str(current.get("bssid") or "")),
+                "role_id": current.get("role_id"),
+                "connect_state": current.get("connect_state"),
+                "active": current.get("is_active"),
+                "guest": current.get("is_guest"),
+                "last_seen": support_value_to_timestamp(current.get("last_seen")) or current.get("last_seen"),
+                "rssi": current.get("rssi"),
+                "quality": current.get("quality"),
+                "speed": current.get("speed"),
+                "source": "support_station_list",
+                "evidence_note": (
+                    "WLAN station state parsed from FRITZ!Box support-data STATION_LIST. "
+                    "This is router-retained state, not a guaranteed complete session log."
+                ),
+            }
+        )
+
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        section_candidate = support_section_title(line)
+        if section_candidate:
+            if "STATION_LIST" in section:
+                flush()
+                current = {}
+            section = section_candidate
+            continue
+        if "STATION_LIST" not in section:
+            continue
+        key_value = SUPPORT_KEY_VALUE_RE.match(line.strip())
+        if not key_value:
+            continue
+        key = key_value.group("key").strip()
+        value = key_value.group("value").strip()
+        normalized_key = key.casefold().replace("-", "_")
+        if normalized_key == "mac":
+            flush()
+            current = {"mac": parse_mac(value) or parse_mac(line)}
+            continue
+        if normalized_key in STATION_STATE_KEYS or normalized_key in {"name", "interface"}:
+            current[normalized_key] = value
+    if "STATION_LIST" in section:
+        flush()
+    return rows
+
+
+def support_value_to_timestamp(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    compact = parse_compact_support_timestamp(text)
+    if compact:
+        return compact.isoformat()
+    iso = parse_iso_local_timestamp(text)
+    if iso:
+        return iso.isoformat()
+    return None
+
+
+def station_interval_row(observation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "connected_at": observation.get("timestamp"),
+        "disconnected_at": observation.get("disconnected_at"),
+        "mac": observation.get("mac"),
+        "interface": observation.get("interface"),
+        "role": observation.get("role"),
+        "connect_status": observation.get("connect_status"),
+        "connect_initiator": observation.get("connect_initiator"),
+        "connect_reason": observation.get("connect_reason"),
+        "disconnect_status": observation.get("disconnect_status"),
+        "disconnect_initiator": observation.get("disconnect_initiator"),
+        "disconnect_reason": observation.get("disconnect_reason"),
+        "wlan_mode": observation.get("wlan_mode"),
+        "quality": observation.get("quality"),
+        "source": observation.get("source") or "support_data_station_list",
+        "evidence_note": (
+            "WLAN station history interval parsed from FRITZ!Box support-data STATION_LIST. "
+            "Intervals are retained diagnostic history and may be incomplete."
+        ),
+    }
+
+
+def station_state_row(observation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "observed_at": observation.get("observed_at") or observation.get("timestamp"),
+        "mac": observation.get("mac"),
+        "hostname": observation.get("hostname"),
+        "ip": observation.get("ip"),
+        "interface": observation.get("interface") or observation.get("if_name"),
+        "bssid": observation.get("bssid"),
+        "role_id": observation.get("role_id"),
+        "connect_state": observation.get("connect_state"),
+        "active": observation.get("is_active"),
+        "guest": observation.get("is_guest"),
+        "last_seen": observation.get("last_seen") or observation.get("timestamp"),
+        "rssi": observation.get("rssi"),
+        "quality": observation.get("quality"),
+        "speed": observation.get("speed") or observation.get("station_type"),
+        "source": observation.get("source") or "support_data_station_list",
+        "evidence_note": (
+            "WLAN station state parsed from FRITZ!Box support-data STATION_LIST. "
+            "This is router-retained state, not a guaranteed complete session log."
+        ),
+    }
+
+
+def wlan_event_detail_row(observation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "event_time": observation.get("timestamp"),
+        "event_id": observation.get("raw_event_id"),
+        "mac": observation.get("mac"),
+        "interface": observation.get("interface"),
+        "band": observation.get("radio_band"),
+        "rate": observation.get("rate"),
+        "channel": observation.get("channel"),
+        "previous_channel": observation.get("previous_channel"),
+        "details": observation.get("raw_details"),
+        "source": observation.get("source") or "support_data_wlan_events",
+        "evidence_note": "WLAN_EVENTS row parsed from FRITZ!Box support-data diagnostics.",
+    }
+
+
+def parse_support_ap_client_events(content: str | None) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        entry = next(iter(parse_device_log(raw_line, source="support_data_hostapd")), None)
+        if entry is None:
+            continue
+        parsed = parse_support_ap_wifi_event(entry)
+        if not parsed:
+            lifecycle = HOSTAPD_CLIENT_LIFECYCLE_RE.search(entry.message)
+            if not lifecycle:
+                continue
+            parsed = {
+                "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+                "event": hostapd_event_kind(lifecycle.group("event")),
+                "mac": parse_mac(lifecycle.group("mac")),
+                "interface": lifecycle.group("iface"),
+                "reason_code": lifecycle.group("reason"),
+                "source": "support_data_hostapd",
+                "confidence": "support_hostapd_lifecycle",
+                "message": entry.message,
+            }
+        rows.append(
+            {
+                "event_time": parsed.get("timestamp"),
+                "event_kind": parsed.get("event"),
+                "mac": parsed.get("mac"),
+                "interface": parsed.get("interface"),
+                "reason_code": parsed.get("reason_code")
+                or parsed.get("connect_reason")
+                or parsed.get("disconnect_reason"),
+                "status_code": parsed.get("status_code"),
+                "cipher": parsed.get("cipher"),
+                "session": parsed.get("session"),
+                "source": parsed.get("source") or "support_data_hostapd",
+                "message": parsed.get("message"),
+                "line_number": line_number,
+                "evidence_note": "AP-side client lifecycle event parsed from hostapd/support-data diagnostics.",
+            }
+        )
+    return rows
+
+
+def hostapd_event_kind(value: str | None) -> str:
+    lowered = str(value or "").casefold()
+    if lowered in {"auth", "authenticated"}:
+        return "authenticated"
+    if lowered in {"assoc", "associated"}:
+        return "associated"
+    if lowered in {"reassoc", "reassociated"}:
+        return "reassociated"
+    if lowered in {"disassoc", "disassociated"}:
+        return "disassociated"
+    if lowered in {"deauth", "deauthenticated"}:
+        return "deauthenticated"
+    return lowered or "client_event"
 
 
 def parse_support_wlan_environment(
@@ -1004,6 +1374,10 @@ def parse_support_ap_wifi_event(entry: FritzLogEntry) -> dict[str, Any] | None:
             "AP-STA-DISCONNECTED": "ap_sta_disconnected",
             "EAPOL-4WAY-HS-COMPLETED": "eapol_4way_completed",
         }
+        reason_match = re.search(r"\breason[=:\s]+(?P<reason>\d+)\b", ap_sta.group("detail") or "", re.I)
+        reason_code = int(reason_match.group("reason")) if reason_match else None
+        status_match = re.search(r"\bstatus(?:[_\s]+code)?[=:\s]+(?P<status>\d+)\b", ap_sta.group("detail") or "", re.I)
+        status_code = int(status_match.group("status")) if status_match else None
         return {
             "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
             "event": event_map[raw_event],
@@ -1012,9 +1386,27 @@ def parse_support_ap_wifi_event(entry: FritzLogEntry) -> dict[str, Any] | None:
             "ip": None,
             "interface": ap_sta.group("iface"),
             "active_now": None,
+            "hostapd_event": raw_event.lower(),
+            "hostapd_action": event_map[raw_event].replace("ap_sta_", ""),
+            "reason_code": reason_code,
+            "reason_name": reason_name(reason_code),
+            "status_code": status_code,
             "source": "support_data_hostapd",
             "confidence": "support_ap_sta_event",
             "message": entry.message,
+        }
+
+    lifecycle = parse_hostapd_lifecycle_event(entry.message)
+    if lifecycle:
+        return {
+            "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+            "hostname": None,
+            "ip": None,
+            "active_now": None,
+            "source": "support_data_hostapd",
+            "confidence": "support_hostapd_lifecycle_event",
+            "message": entry.message,
+            **lifecycle,
         }
 
     handshake = WPA_HANDSHAKE_RE.search(entry.message)
@@ -1195,9 +1587,11 @@ def build_host_seen_index(
                     activity_candidates.append(
                         (
                             timestamp,
-                            "exact_wifi_connection"
-                            if event.get("event") == "connected"
-                            else f"support_{event.get('event')}",
+                            (
+                                "exact_wifi_connection"
+                                if event.get("event") == "connected"
+                                else f"support_{event.get('event')}"
+                            ),
                             "high",
                             "Retained WLAN/AP-side connection evidence matched this host.",
                         )
@@ -1577,7 +1971,8 @@ def data_lua_findings(content: str | None, observed_at: str) -> list[dict[str, A
     for page, payload in pages.items():
         if not isinstance(payload, dict) or not payload.get("ok"):
             continue
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        raw_data = payload.get("data")
+        data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
         if page == "homeNet":
             findings.extend(home_net_findings(data, observed_at))
         elif page in {"netCnt", "netMoni", "inetstat", "dsl", "wlan", "wGuest", "mesh"} and data:
@@ -1598,8 +1993,13 @@ def data_lua_findings(content: str | None, observed_at: str) -> list[dict[str, A
 
 def home_net_findings(data: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    nested_net = (data.get("data") or {}).get("net") if isinstance(data.get("data"), dict) else {}
-    devices = data.get("devices") or (data.get("topology") or {}).get("devices") or nested_net.get("devices") or []
+    nested_data = data.get("data")
+    nested_data = nested_data if isinstance(nested_data, dict) else {}
+    nested_net = nested_data.get("net")
+    nested_net = nested_net if isinstance(nested_net, dict) else {}
+    topology = data.get("topology")
+    topology = topology if isinstance(topology, dict) else {}
+    devices = data.get("devices") or topology.get("devices") or nested_net.get("devices") or []
     if isinstance(devices, dict):
         devices = list(devices.values())
     if nested_net:
@@ -1682,14 +2082,394 @@ def query_lua_findings(content: str | None, observed_at: str) -> list[dict[str, 
     return findings
 
 
+def parse_webui_typed_artifacts(exports: dict[str, Any], observed_at: str) -> dict[str, list[dict[str, Any]]]:
+    """Promote firmware-dependent Web UI artifacts into typed evidence rows."""
+
+    return {
+        "wlan_station_state_snapshots": [
+            *parse_query_lua_wlan_state(exports.get("query_lua_artifacts_json"), observed_at),
+            *parse_data_lua_wlan_state(exports.get("data_lua_pages_json"), observed_at),
+        ],
+        "dhcp_leases": parse_data_lua_dhcp_leases(exports.get("data_lua_pages_json"), observed_at),
+        "aha_device_states": parse_aha_device_states(exports, observed_at),
+        "telephony_records": parse_telephony_records(exports, observed_at),
+        "security_advisories": parse_query_lua_user_rights(exports.get("query_lua_artifacts_json"), observed_at),
+    }
+
+
+def parse_query_lua_wlan_state(content: Any, observed_at: str) -> list[dict[str, Any]]:
+    artifacts = decode_json_object(content)
+    rows: list[dict[str, Any]] = []
+    for artifact_name in ("wlan_known_devices", "wlan_stations"):
+        payload = artifacts.get(artifact_name)
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        for index, row in enumerate(iter_payload_rows(data)):
+            if not isinstance(row, dict):
+                continue
+            if not first_payload_value(
+                row,
+                "mac",
+                "macAddress",
+                "macAddr",
+                "bssid",
+                "rssi",
+                "signalStrength",
+                "lastConnected",
+                "last_connected",
+                "lastSeen",
+            ):
+                continue
+            rows.append(wlan_station_state_row(row, observed_at, f"query_lua_{artifact_name}", index))
+    return rows
+
+
+def parse_data_lua_wlan_state(content: Any, observed_at: str) -> list[dict[str, Any]]:
+    pages = decode_json_object(content)
+    rows: list[dict[str, Any]] = []
+    for page_name in ("wlanSta", "wlan", "wGuest"):
+        payload = pages.get(page_name)
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        for index, row in enumerate(iter_payload_rows(data)):
+            if not isinstance(row, dict):
+                continue
+            if not first_payload_value(
+                row,
+                "mac",
+                "macaddr",
+                "macAddress",
+                "macAddr",
+                "bssid",
+                "rssi",
+                "quality",
+                "connect_state",
+                "connectState",
+                "if_name",
+                "ifName",
+            ):
+                continue
+            rows.append(wlan_station_state_row(row, observed_at, f"data_lua_{page_name}", index))
+    return rows
+
+
+def wlan_station_state_row(row: dict[str, Any], observed_at: str, source: str, index: int) -> dict[str, Any]:
+    mac = parse_mac(
+        str(
+            first_payload_value(
+                row,
+                "mac",
+                "macaddr",
+                "mac_address",
+                "macAddress",
+                "mac_addr",
+                "macAddr",
+                "sta_mac",
+                "staMac",
+                "address",
+            )
+            or ""
+        )
+    )
+    ip = first_payload_value(row, "ip", "ipv4", "ipaddr", "ip_address", "ipAddress", "ip_addr")
+    hostname = first_payload_value(row, "hostname", "host", "hostName", "name", "devname", "device_name", "deviceName")
+    return {
+        "observed_at": observed_at,
+        "mac": mac,
+        "hostname": hostname,
+        "ip": ip,
+        "interface": first_payload_value(row, "if_name", "ifName", "iface", "interface", "radio", "ap", "apId"),
+        "bssid": parse_mac(str(first_payload_value(row, "bssid", "ap_mac", "apMac", "apBssid") or "")),
+        "role_id": first_payload_value(row, "role_id", "role", "station_type"),
+        "connect_state": first_payload_value(row, "connect_state", "state", "status"),
+        "active": first_payload_value(row, "is_active", "isActive", "active", "online", "connected"),
+        "guest": first_payload_value(row, "is_guest", "isGuest", "guest", "guestDevice"),
+        "last_seen": unix_timestamp_to_iso(
+            first_payload_value(row, "last_seen", "lastSeen", "lastused", "lastUsed", "last_connected", "lastConnected")
+        )
+        or first_payload_value(row, "last_seen", "lastSeen", "lastused", "lastUsed", "last_connected", "lastConnected"),
+        "rssi": first_payload_value(row, "rssi", "rssiDbm", "signal", "signal_strength", "signalStrength"),
+        "quality": first_payload_value(row, "quality", "quality_percent", "qualityPercent"),
+        "speed": first_payload_value(row, "speed", "txrate", "txRate", "rxrate", "rxRate", "rate", "linkRate"),
+        "source": source,
+        "record_index": index,
+        "raw": row,
+        "evidence_note": (
+            "WLAN station state parsed from internal FRITZ!Box Web UI data. "
+            "Field availability is firmware-dependent."
+        ),
+    }
+
+
+def parse_data_lua_dhcp_leases(content: Any, observed_at: str) -> list[dict[str, Any]]:
+    pages = decode_json_object(content)
+    rows: list[dict[str, Any]] = []
+    for page_name in ("netDhcp", "netDev", "homeNet"):
+        payload = pages.get(page_name)
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        for index, row in enumerate(iter_payload_rows(data)):
+            if not isinstance(row, dict):
+                continue
+            ip = first_payload_value(row, "ip", "ipv4", "ipaddr", "ip_address", "ipAddress", "ip_addr")
+            mac = parse_mac(
+                str(first_payload_value(row, "mac", "macaddr", "mac_address", "macAddress", "macAddr") or "")
+            )
+            if not ip and not mac:
+                continue
+            lease_expires = first_payload_value(
+                row,
+                "lease_expires",
+                "leaseExpires",
+                "expires",
+                "expiresAt",
+                "valid_until",
+                "validUntil",
+                "lease_time",
+                "leaseTime",
+                "leaseEnd",
+            )
+            rows.append(
+                {
+                    "observed_at": observed_at,
+                    "hostname": first_payload_value(
+                        row, "hostname", "host", "hostName", "name", "devname", "deviceName"
+                    ),
+                    "mac": mac,
+                    "ip": ip,
+                    "lease_expires": unix_timestamp_to_iso(lease_expires) or lease_expires,
+                    "active": first_payload_value(row, "active", "isActive", "online", "connected"),
+                    "source": f"data_lua_{page_name}",
+                    "record_index": index,
+                    "raw": row,
+                    "evidence_note": "DHCP/client lease context parsed from internal FRITZ!Box Web UI data.",
+                }
+            )
+    return rows
+
+
+def parse_query_lua_user_rights(content: Any, observed_at: str) -> list[dict[str, Any]]:
+    artifacts = decode_json_object(content)
+    payload = artifacts.get("user_rights")
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(iter_payload_rows(data)):
+        if not isinstance(row, dict):
+            continue
+        username = first_payload_value(row, "name", "username", "user")
+        rights = {key: value for key, value in row.items() if key not in {"name", "username", "user"}}
+        enabled_remote = any(
+            truthy(first_payload_value(row, key))
+            for key in (
+                "frominternet",
+                "fromInternet",
+                "remote_access",
+                "remoteAccess",
+                "vpn",
+                "vpnAccess",
+                "wireguard",
+                "admin",
+                "box_admin",
+                "boxAdmin",
+                "box_admin_rights",
+            )
+        )
+        if not username and not rights:
+            continue
+        rows.append(
+            {
+                "advisory_id": "webui_user_remote_rights" if enabled_remote else "webui_user_rights",
+                "severity": "medium" if enabled_remote else "low",
+                "category": "Authentication",
+                "title": "FRITZ!Box user rights parsed from Web UI state",
+                "subject": str(username or f"user_{index}"),
+                "status": "review",
+                "recommendation": "Verify each FRITZ!Box user, remote access right, VPN right, and admin permission is expected.",
+                "source": "query_lua_user_rights",
+                "confidence": "medium",
+                "evidence_json": {"observed_at": observed_at, "rights": rights},
+                "evidence_level": "inferred",
+                "evidence_note": "Security advisory derived from internal query.lua user-rights state.",
+            }
+        )
+    return rows
+
+
+def parse_aha_device_states(exports: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(parse_aha_xml_devices(exports.get("aha_device_list_xml"))):
+        rows.append(aha_device_state_row(row, observed_at, "aha_device_list_xml", index))
+    stats = decode_json_object(exports.get("aha_device_stats_json"))
+    for index, row in enumerate(iter_payload_rows(stats)):
+        if isinstance(row, dict):
+            rows.append(aha_device_state_row(row, observed_at, "aha_device_stats_json", index))
+    return rows
+
+
+def parse_aha_xml_devices(content: Any) -> list[dict[str, Any]]:
+    if not isinstance(content, str) or not content.strip():
+        return []
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for device in root.findall(".//device"):
+        rows.append(
+            {
+                "device_id": device.get("identifier") or device.get("id"),
+                "name": device.findtext("name"),
+                "productname": device.get("productname"),
+                "manufacturer": device.get("manufacturer"),
+                "functionbitmask": device.get("functionbitmask"),
+                "state": device.findtext(".//state"),
+                "temperature": device.findtext(".//temperature/celsius"),
+                "humidity": device.findtext(".//humidity/rel_humidity"),
+                "power": device.findtext(".//powermeter/power"),
+                "energy": device.findtext(".//powermeter/energy"),
+            }
+        )
+    return rows
+
+
+def aha_device_state_row(row: dict[str, Any], observed_at: str, source: str, index: int) -> dict[str, Any]:
+    return {
+        "observed_at": observed_at,
+        "device_id": first_payload_value(row, "device_id", "identifier", "ain", "id"),
+        "name": first_payload_value(row, "name", "device_name"),
+        "productname": first_payload_value(row, "productname", "product", "model"),
+        "manufacturer": first_payload_value(row, "manufacturer", "vendor"),
+        "functionbitmask": first_payload_value(row, "functionbitmask"),
+        "state": first_payload_value(row, "state", "switch_state", "present"),
+        "temperature": first_payload_value(row, "temperature", "celsius"),
+        "humidity": first_payload_value(row, "humidity", "rel_humidity"),
+        "power": first_payload_value(row, "power"),
+        "energy": first_payload_value(row, "energy"),
+        "source": source,
+        "record_index": index,
+        "raw": row,
+        "evidence_note": "AHA/smart-home device state parsed from FRITZ!Box AHA artifacts.",
+    }
+
+
+def parse_telephony_records(exports: dict[str, Any], observed_at: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    rows.extend(parse_call_list_xml(exports.get("call_list_xml"), observed_at))
+    rows.extend(parse_phonebooks_xml(exports.get("phonebooks_xml_json"), observed_at))
+    return rows
+
+
+def parse_call_list_xml(content: Any, observed_at: str) -> list[dict[str, Any]]:
+    if not isinstance(content, str) or not content.strip():
+        return []
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for index, call in enumerate(root.findall(".//Call")):
+        rows.append(
+            {
+                "observed_at": observed_at,
+                "record_type": "call",
+                "name": call.findtext("Name"),
+                "number": call.findtext("Caller") or call.findtext("Called") or call.findtext("Number"),
+                "direction": call.findtext("Type"),
+                "timestamp": call.findtext("Date"),
+                "duration": call.findtext("Duration"),
+                "source": "call_list_xml",
+                "record_index": index,
+                "evidence_note": "Sensitive telephony call-list metadata parsed from FRITZ!Box telephony artifact.",
+            }
+        )
+    return rows
+
+
+def parse_phonebooks_xml(content: Any, observed_at: str) -> list[dict[str, Any]]:
+    books = decode_json_object(content)
+    rows: list[dict[str, Any]] = []
+    for name, value in books.items():
+        xml_text = value if isinstance(value, str) else value.get("content") if isinstance(value, dict) else ""
+        if not isinstance(xml_text, str) or not xml_text.strip():
+            continue
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            continue
+        for index, contact in enumerate(root.findall(".//contact")):
+            display_name = contact.findtext(".//realName") or contact.findtext(".//uniqueid")
+            numbers = [number.text for number in contact.findall(".//number") if number.text]
+            rows.append(
+                {
+                    "observed_at": observed_at,
+                    "record_type": "phonebook_contact",
+                    "name": display_name,
+                    "number": ", ".join(numbers),
+                    "direction": None,
+                    "timestamp": None,
+                    "duration": None,
+                    "source": "phonebooks_xml_json",
+                    "record_index": f"{name}:{index}",
+                    "evidence_note": "Sensitive phonebook metadata parsed from FRITZ!Box telephony artifact.",
+                }
+            )
+    return rows
+
+
+def decode_json_object(content: Any) -> dict[str, Any]:
+    if isinstance(content, dict):
+        return content
+    if not isinstance(content, str) or not content.strip():
+        return {}
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def iter_payload_rows(value: Any) -> Iterable[Any]:
+    if isinstance(value, list):
+        yield from value
+        return
+    if not isinstance(value, dict):
+        return
+    for key in ("list", "rows", "devices", "stations", "wlan_stations", "wlan_known_devices", "leases", "data"):
+        nested = value.get(key)
+        if isinstance(nested, list):
+            yield from nested
+            return
+        if isinstance(nested, dict):
+            yield from iter_payload_rows(nested)
+            return
+    for nested in value.values():
+        if isinstance(nested, list):
+            yield from nested
+        elif isinstance(nested, dict):
+            yield from iter_payload_rows(nested)
+
+
+def first_payload_value(row: dict[str, Any], *keys: str) -> Any:
+    lowered = {normalize_payload_key(str(key)): value for key, value in row.items()}
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+        value = lowered.get(normalize_payload_key(key))
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def normalize_payload_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
 def summarize_payload(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
-        summary: dict[str, Any] = {"keys": sorted(str(key) for key in value.keys())[:40]}
+        summary: dict[str, Any] = {"keys": sorted(str(key) for key in value)[:40]}
         for key, item in value.items():
             if isinstance(item, list):
                 summary[f"{key}_count"] = len(item)
             elif isinstance(item, dict):
-                summary[f"{key}_keys"] = sorted(str(child) for child in item.keys())[:20]
+                summary[f"{key}_keys"] = sorted(str(child) for child in item)[:20]
         return summary
     if isinstance(value, list):
         return {"rows": len(value), "sample": value[:3]}

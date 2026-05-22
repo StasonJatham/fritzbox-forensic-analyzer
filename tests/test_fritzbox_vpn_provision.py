@@ -63,8 +63,7 @@ def test_build_plan_redacts_dyndns_secrets_from_intent_and_steps() -> None:
             username="user",
             password="super-secret-token",
             update_url=(
-                "https://dyn.example/update?hostname=<domain>&myip=<ipaddr>&user=<username>"
-                "&pass=super-secret-token"
+                "https://dyn.example/update?hostname=<domain>&myip=<ipaddr>&user=<username>" "&pass=super-secret-token"
             ),
         ),
         wireguard=WireGuardIntent(client_name="phone"),

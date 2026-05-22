@@ -7,6 +7,7 @@ from fritzbox_collectors import (
     fetch_aha_artifacts,
     fetch_avm_path,
     fetch_support_data,
+    fetch_telephony_exports,
     fetch_webui_readonly_artifacts,
     fetch_webui_readonly_endpoint,
     is_read_only_action,
@@ -164,3 +165,28 @@ def test_fetch_aha_artifacts_collects_switch_stats() -> None:
     assert artifacts["aha_device_list_xml"] == "<devicelist/>"
     assert artifacts["aha_switch_list_txt"] == "AIN-1,AIN-2"
     assert "AIN-1" in artifacts["aha_device_stats_json"]
+
+
+def test_telephony_export_keeps_phonebooks_when_call_list_download_fails(monkeypatch) -> None:
+    class FakeFc:
+        def call_action(self, _service, action, arguments=None):
+            if action == "GetCallList":
+                return {"NewCallListURL": "/call-list.xml"}
+            if action == "GetPhonebookList":
+                return {"NewPhonebookList": "0"}
+            if action == "GetPhonebook":
+                assert arguments is not None
+                return {"NewPhonebookURL": f"/phonebook-{arguments['NewPhonebookID']}.xml"}
+            raise AssertionError(action)
+
+    def fake_fetch_avm_path(_address, _port, path, **_kwargs):
+        if path == "/call-list.xml":
+            raise TimeoutError("timed out")
+        return "<phonebook />"
+
+    monkeypatch.setattr("fritzbox_collectors.fetch_avm_path", fake_fetch_avm_path)
+
+    artifacts = fetch_telephony_exports(FakeFc(), "192.0.2.1", 49000)
+
+    assert "call_list_xml" not in artifacts
+    assert artifacts["phonebooks_xml_json"] == '{"0": "<phonebook />"}'

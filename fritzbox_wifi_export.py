@@ -3,20 +3,23 @@ from __future__ import annotations
 
 import argparse
 import csv
-from datetime import datetime
-from getpass import getpass
 import json
 import os
-from pathlib import Path
 import sys
+from datetime import datetime
+from getpass import getpass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from urllib.request import urlopen
 from xml.etree import ElementTree as ET
 
 from fritzbox_log_store import ingest_dataset
+from fritzbox_logging import get_logger
 from fritzbox_parsers import (
     FritzLogEntry as FritzLogEntry,
+)
+from fritzbox_parsers import (
     build_available_wifi_connections,
     build_forensic_findings,
     build_host_seen_index,
@@ -32,10 +35,10 @@ from fritzbox_parsers import (
     parse_landevice_query,
     parse_mesh_wifi_devices,
     parse_support_data,
-    parse_support_wlan_environment,
     parse_support_wifi_observations,
-    parse_wlan_device_lists,
+    parse_support_wlan_environment,
     parse_wifi_event,
+    parse_wlan_device_lists,
 )
 from fritzbox_raw_acquisition import (
     acquire_critical_bundle,
@@ -43,8 +46,6 @@ from fritzbox_raw_acquisition import (
     acquire_raw_bundle,
     load_raw_bundle,
 )
-from fritzbox_logging import get_logger
-
 
 logger = get_logger("wifi_export")
 
@@ -150,7 +151,7 @@ def detect_fritzbox_user(address: str, use_tls: bool, timeout: int = 5) -> str |
     host = address.removeprefix("http://").removeprefix("https://").rstrip("/")
     url = f"{scheme}://{host}/login_sid.lua?version=2"
     try:
-        with urlopen(url, timeout=timeout) as response:  # noqa: S310 - local router endpoint from user config.
+        with urlopen(url, timeout=timeout) as response:
             payload = response.read(64 * 1024)
     except Exception as exc:
         logger.debug("FRITZ!Box user auto-detection failed: %s", exc)
@@ -205,7 +206,9 @@ def build_dataset_from_raw_exports(
         if event["event"] == "disconnected" and not args.include_disconnects:
             continue
         events.append(event)
-    events = deduplicate_wifi_events([*events, *filter_recent_wifi_events(parse_support_wifi_observations(support_raw), args.hours)])
+    events = deduplicate_wifi_events(
+        [*events, *filter_recent_wifi_events(parse_support_wifi_observations(support_raw, generated_at), args.hours)]
+    )
 
     event_log = [
         entry_to_dict(entry)

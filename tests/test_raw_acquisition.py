@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 from fritzbox_raw_acquisition import (
     RawAcquisitionWriter,
@@ -15,7 +17,7 @@ from fritzbox_wifi_export import build_dataset_from_raw_exports
 
 class FakeResponse:
     status_code = 200
-    headers = {"content-type": "text/html"}
+    headers: ClassVar[dict[str, str]] = {"content-type": "text/html"}
     text = "<!doctype html><html>Login</html>"
     content = text.encode()
 
@@ -57,6 +59,24 @@ def test_load_raw_bundle_reconstructs_combined_wlan_device_lists(tmp_path: Path)
     assert '"2"' in bundle["wlan_device_list_xml"]
 
 
+def test_load_raw_bundle_reconstructs_webui_aggregates_with_failures(tmp_path: Path) -> None:
+    writer = RawAcquisitionWriter(tmp_path, "2026-05-21T08:00:00+02:00")
+    writer.write_text("query_lua_wlan_stations", '{"wlan": []}', "webui_query_lua")
+    writer.write_error("query_lua_wlan_known_devices", "webui_query_lua", "timeout")
+    writer.write_text("data_lua_page_log", '{"log": []}', "webui_data_lua")
+    writer.write_error("data_lua_page_wlanSta", "webui_data_lua", "HTML login/UI response instead of raw API payload")
+    writer.write_summary()
+
+    bundle = load_raw_bundle(tmp_path)
+
+    assert '"wlan_stations"' in bundle["query_lua_artifacts_json"]
+    assert '"wlan_known_devices"' in bundle["query_lua_artifacts_json"]
+    assert '"ok": false' in bundle["query_lua_artifacts_json"]
+    assert '"log"' in bundle["data_lua_pages_json"]
+    assert '"wlanSta"' in bundle["data_lua_pages_json"]
+    assert "HTML login/UI response" in bundle["data_lua_pages_json"]
+
+
 def test_build_dataset_from_raw_bundle_parses_available_data(tmp_path: Path) -> None:
     writer = RawAcquisitionWriter(tmp_path, "2026-05-21T08:00:00+02:00")
     writer.write_json(
@@ -72,7 +92,7 @@ def test_build_dataset_from_raw_bundle_parses_available_data(tmp_path: Path) -> 
     writer.write_summary()
 
     dataset = build_dataset_from_raw_exports(
-        SimpleNamespace(address="192.0.2.1", port=49000, tls=False, hours=10000, include_disconnects=True),
+        argparse.Namespace(address="192.0.2.1", port=49000, tls=False, hours=10000, include_disconnects=True),
         load_raw_bundle(tmp_path),
         "2026-05-21T08:00:00+02:00",
         tmp_path,
@@ -103,7 +123,7 @@ def test_build_dataset_merges_wlan_filtered_device_log_xml(tmp_path: Path) -> No
     writer.write_summary()
 
     dataset = build_dataset_from_raw_exports(
-        SimpleNamespace(address="192.0.2.1", port=49000, tls=False, hours=10000, include_disconnects=True),
+        argparse.Namespace(address="192.0.2.1", port=49000, tls=False, hours=10000, include_disconnects=True),
         load_raw_bundle(tmp_path),
         "2026-05-21T08:00:00+02:00",
         tmp_path,
@@ -117,7 +137,9 @@ def test_build_dataset_merges_wlan_filtered_device_log_xml(tmp_path: Path) -> No
 
 
 def test_webui_payload_rejects_login_html() -> None:
-    fc = SimpleNamespace(http_interface=SimpleNamespace(fc=SimpleNamespace(session=FakeSession()), router_url="http://x"))
+    fc = SimpleNamespace(
+        http_interface=SimpleNamespace(fc=SimpleNamespace(session=FakeSession()), router_url="http://x")
+    )
 
     raw, error = fetch_webui_payload(fc, "query.lua", {"sid": "bad"})
 
@@ -159,6 +181,7 @@ def test_paced_indexed_results_pauses_between_items(monkeypatch) -> None:
             if action == "GetHostNumberOfEntries":
                 return {"NewHostNumberOfEntries": "2"}
             if action == "GetGenericHostEntry":
+                assert arguments is not None
                 return {"NewIndex": arguments["NewIndex"]}
             return {}
 

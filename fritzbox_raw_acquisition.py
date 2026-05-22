@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 import json
-from multiprocessing import get_context
 import os
-from pathlib import Path
 import re
 import shutil
 import time
 import traceback
-from typing import Any, Callable
+from collections.abc import Callable, Iterable
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime
+from multiprocessing import get_context
+from pathlib import Path
+from typing import Any
 
 from fritzbox_collectors import (
     DATA_LUA_PAGES,
@@ -34,13 +36,12 @@ from fritzbox_collectors import (
     get_router_time,
     get_webui_sid,
     is_html_response,
-    is_support_data_response,
     is_read_only_action,
+    is_support_data_response,
     safe_call_action,
     tr064_service_inventory,
 )
 from fritzbox_logging import get_logger, redact
-
 
 RAW_OUTPUT_ROOT = Path("output")
 RAW_SCHEMA_VERSION = 1
@@ -102,7 +103,9 @@ class RawAcquisitionWriter:
         restrict_path_permissions(path, 0o600)
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         self.artifacts[name] = path.name
-        self.add_attempt(name, surface, True, path=path.name, bytes=len(content.encode("utf-8")), sha256=digest, **details)
+        self.add_attempt(
+            name, surface, True, path=path.name, bytes=len(content.encode("utf-8")), sha256=digest, **details
+        )
         logger.debug("raw artifact written artifact=%s surface=%s path=%s bytes=%s", name, surface, path, len(content))
 
     def write_json(self, name: str, payload: Any, surface: str, **details: Any) -> None:
@@ -117,7 +120,13 @@ class RawAcquisitionWriter:
         digest = file_sha256(target)
         self.artifacts[name] = target.name
         self.add_attempt(name, surface, True, path=target.name, bytes=target.stat().st_size, sha256=digest, **details)
-        logger.debug("raw artifact file written artifact=%s surface=%s path=%s bytes=%s", name, surface, target, target.stat().st_size)
+        logger.debug(
+            "raw artifact file written artifact=%s surface=%s path=%s bytes=%s",
+            name,
+            surface,
+            target,
+            target.stat().st_size,
+        )
 
     def write_error(self, name: str, surface: str, error: Any, **details: Any) -> None:
         message = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
@@ -234,7 +243,9 @@ def acquire_raw_bundle(
     run_stage(writer, "query_lua", lambda: collect_query_lua(writer, fc, delay), progress_callback)
     run_stage(writer, "webui_readonly", lambda: collect_webui_readonly(writer, fc, delay), progress_callback)
     run_stage(writer, "tr064_snapshot", lambda: collect_tr064_snapshot_raw(writer, fc, delay), progress_callback)
-    run_stage(writer, "optional_surfaces", lambda: collect_optional_surfaces(writer, fc, args, delay), progress_callback)
+    run_stage(
+        writer, "optional_surfaces", lambda: collect_optional_surfaces(writer, fc, args, delay), progress_callback
+    )
     writer.write_summary()
     logger.info(
         "raw acquisition finished dir=%s attempts=%s successful=%s failed=%s",
@@ -286,10 +297,22 @@ def acquire_hard_timeout_bundle(
         "tls": bool(getattr(args, "tls", False)),
     }
     jobs = [
-        ("core_tr064", "device_info_json", "call", {**base, "service": "DeviceInfo:1", "action": "GetInfo"}, hard_timeout()),
+        (
+            "core_tr064",
+            "device_info_json",
+            "call",
+            {**base, "service": "DeviceInfo:1", "action": "GetInfo"},
+            hard_timeout(),
+        ),
         ("core_tr064", "router_time_json", "call", {**base, "service": "Time:1", "action": "GetInfo"}, hard_timeout()),
         ("core_tr064", "hosts_tr064_generic_json", "hosts", base, hard_timeout(90)),
-        ("core_tr064", "device_log_text_json", "call", {**base, "service": "DeviceInfo:1", "action": "GetDeviceLog"}, hard_timeout(45)),
+        (
+            "core_tr064",
+            "device_log_text_json",
+            "call",
+            {**base, "service": "DeviceInfo:1", "action": "GetDeviceLog"},
+            hard_timeout(45),
+        ),
         *avm_export_path_jobs(base, timeout=hard_timeout(60)),
         ("webui_query_lua", "landevice_query_json", "landevice_query", base, hard_timeout(45)),
         *[
@@ -304,7 +327,13 @@ def acquire_hard_timeout_bundle(
         ],
         ("support_bundle", "support_lua_page_html", "support_lua", base, hard_timeout(45)),
         ("support_bundle", "support_data_txt", "support", base, support_hard_timeout()),
-        ("network_state", "wan_ip_info_json", "call", {**base, "service": "WANIPConn:1", "action": "GetInfo"}, hard_timeout()),
+        (
+            "network_state",
+            "wan_ip_info_json",
+            "call",
+            {**base, "service": "WANIPConn:1", "action": "GetInfo"},
+            hard_timeout(),
+        ),
         (
             "network_state",
             "wan_external_ip_json",
@@ -389,7 +418,13 @@ def acquire_critical_bundle(
     critical_pages = ("log", "homeNet", "netDev", "wlan", "wlanSta", "wlanMonitor", "wlanRadar", "mesh")
     jobs = [
         ("support_bundle", "support_lua_page_html", "support_lua", base, hard_timeout(45)),
-        ("core_tr064", "device_log_text_json", "call", {**base, "service": "DeviceInfo:1", "action": "GetDeviceLog"}, hard_timeout(60)),
+        (
+            "core_tr064",
+            "device_log_text_json",
+            "call",
+            {**base, "service": "DeviceInfo:1", "action": "GetDeviceLog"},
+            hard_timeout(60),
+        ),
         ("core_tr064", "hosts_tr064_generic_json", "hosts", base, hard_timeout(120)),
         *avm_export_path_jobs(base, timeout=hard_timeout(75)),
         ("webui_query_lua", "landevice_query_json", "landevice_query", base, hard_timeout(60)),
@@ -413,7 +448,13 @@ def acquire_critical_bundle(
             )
             for page in critical_pages
         ],
-        ("core_tr064", "device_info_json", "call", {**base, "service": "DeviceInfo:1", "action": "GetInfo"}, hard_timeout()),
+        (
+            "core_tr064",
+            "device_info_json",
+            "call",
+            {**base, "service": "DeviceInfo:1", "action": "GetInfo"},
+            hard_timeout(),
+        ),
         ("core_tr064", "router_time_json", "call", {**base, "service": "Time:1", "action": "GetInfo"}, hard_timeout()),
         ("support_bundle", "support_data_txt", "support", base, support_hard_timeout()),
     ]
@@ -493,7 +534,7 @@ def run_child_artifact(
     payload: dict[str, Any],
     timeout: int,
 ) -> None:
-    context = get_context(os.getenv("FRITZBOX_CHILD_START_METHOD", "spawn"))
+    context: Any = get_context(os.getenv("FRITZBOX_CHILD_START_METHOD", "spawn"))
     queue = context.Queue()
     process = context.Process(target=child_artifact_worker, args=(kind, payload, queue))
     process.start()
@@ -506,7 +547,9 @@ def run_child_artifact(
     try:
         status, content = queue.get_nowait()
     except Exception as exc:
-        writer.write_error(name, surface, f"missing child result: exitcode={process.exitcode} {type(exc).__name__}: {exc}")
+        writer.write_error(
+            name, surface, f"missing child result: exitcode={process.exitcode} {type(exc).__name__}: {exc}"
+        )
         return
     if status == "ok":
         writer.write_text(name, content, surface)
@@ -671,7 +714,10 @@ def fetch_support_data_to_file(fc: Any, target: Path) -> Path | None:
             with part.open("wb") as handle:
                 iter_content = getattr(response, "iter_content", None)
                 if callable(iter_content):
-                    for chunk in iter_content(chunk_size=64 * 1024):
+                    chunks = iter_content(chunk_size=64 * 1024)
+                    if not isinstance(chunks, Iterable):
+                        continue
+                    for chunk in chunks:
                         if chunk:
                             handle.write(chunk)
                 else:
@@ -733,7 +779,9 @@ def collect_core_tr064(writer: RawAcquisitionWriter, fc: Any, delay: float) -> N
     pause(delay)
     safe_write_call(writer, "router_time_json", "tr064_core", lambda: get_router_time(fc), as_json=True)
     pause(delay)
-    safe_write_call(writer, "hosts_tr064_generic_json", "tr064_core", lambda: collect_hosts_paced(fc, delay), as_json=True)
+    safe_write_call(
+        writer, "hosts_tr064_generic_json", "tr064_core", lambda: collect_hosts_paced(fc, delay), as_json=True
+    )
     pause(delay)
     safe_write_call(writer, "device_log_text", "tr064_core", lambda: get_device_log(fc), as_json=False)
     pause(delay)
@@ -789,7 +837,9 @@ def fetch_and_write_avm_path(
         writer.write_error(name, "tr064_export_path", exc, service=service, action=action, path=str(path))
         return None
     if not content:
-        writer.write_error(name, "tr064_export_path", "empty export response", service=service, action=action, path=str(path))
+        writer.write_error(
+            name, "tr064_export_path", "empty export response", service=service, action=action, path=str(path)
+        )
         return None
     writer.write_text(name, content, "tr064_export_path", service=service, action=action, path=str(path))
     return content
@@ -801,18 +851,27 @@ def collect_webui_pages(writer: RawAcquisitionWriter, fc: Any, delay: float) -> 
     if sid is None:
         for page in DATA_LUA_PAGES:
             writer.write_error(f"data_lua_page_{page}", "webui_data_lua", "no valid Web UI SID; skipped", page=page)
+            pages[page] = {"ok": False, "error": "no valid Web UI SID; skipped", "page": page}
+        writer.write_json("data_lua_pages_json", pages, "webui_data_lua", count=0, failed=len(pages))
         return
     for page in DATA_LUA_PAGES:
         raw, error = fetch_webui_payload(fc, "data.lua", {"page": page, "sid": sid})
         name = f"data_lua_page_{page}"
         if error:
             writer.write_error(name, "webui_data_lua", error, page=page)
+            pages[page] = {"ok": False, "error": error, "page": page}
         else:
             writer.write_text(name, raw, "webui_data_lua", page=page)
             pages[page] = decode_webui_payload(raw)
         pause(delay)
     if pages:
-        writer.write_json("data_lua_pages_json", pages, "webui_data_lua", count=len(pages))
+        writer.write_json(
+            "data_lua_pages_json",
+            pages,
+            "webui_data_lua",
+            count=sum(1 for item in pages.values() if item.get("ok") is not False),
+            failed=sum(1 for item in pages.values() if item.get("ok") is False),
+        )
 
 
 def collect_query_lua(writer: RawAcquisitionWriter, fc: Any, delay: float) -> None:
@@ -821,7 +880,9 @@ def collect_query_lua(writer: RawAcquisitionWriter, fc: Any, delay: float) -> No
     if sid is None:
         for name, query in QUERY_LUA_QUERIES.items():
             writer.write_error(f"query_lua_{name}", "webui_query_lua", "no valid Web UI SID; skipped", query=query)
+            artifacts[name] = {"ok": False, "error": "no valid Web UI SID; skipped", "query": query}
         writer.write_error("landevice_query_json", "webui_query_lua", "no valid Web UI SID; skipped")
+        writer.write_json("query_lua_artifacts_json", artifacts, "webui_query_lua", count=0, failed=len(artifacts))
         return
 
     for fields in (LANDEVICE_RICH_FIELDS, LANDEVICE_FALLBACK_FIELDS):
@@ -845,7 +906,13 @@ def collect_query_lua(writer: RawAcquisitionWriter, fc: Any, delay: float) -> No
             artifacts[name] = {"ok": True, **decode_query_payload(raw), "query": query}
         pause(delay)
     if artifacts:
-        writer.write_json("query_lua_artifacts_json", artifacts, "webui_query_lua", count=len(artifacts))
+        writer.write_json(
+            "query_lua_artifacts_json",
+            artifacts,
+            "webui_query_lua",
+            count=sum(1 for item in artifacts.values() if item.get("ok") is not False),
+            failed=sum(1 for item in artifacts.values() if item.get("ok") is False),
+        )
 
 
 def collect_webui_readonly(writer: RawAcquisitionWriter, fc: Any, delay: float) -> None:
@@ -891,7 +958,7 @@ def collect_tr064_snapshot_raw(writer: RawAcquisitionWriter, fc: Any, delay: flo
     except Exception as exc:
         writer.write_error("tr064_service_inventory_json", "tr064_snapshot", exc)
 
-    core_actions = [
+    core_actions: list[tuple[str, str, str, dict[str, Any]]] = [
         ("device_info", "DeviceInfo:1", "GetInfo", {}),
         ("time_info", "Time:1", "GetInfo", {}),
         ("user_interface", "UserInterface:1", "GetInfo", {}),
@@ -1154,10 +1221,8 @@ def load_raw_bundle(directory: Path) -> dict[str, str]:
 
 def normalize_hard_timeout_artifacts(artifacts: dict[str, str]) -> None:
     if "device_log_text" not in artifacts and "device_log_text_json" in artifacts:
-        try:
+        with suppress(json.JSONDecodeError, AttributeError):
             artifacts["device_log_text"] = json.loads(artifacts["device_log_text_json"]).get("NewDeviceLog", "")
-        except (json.JSONDecodeError, AttributeError):
-            pass
     if "support_bundle_json" in artifacts:
         try:
             support_bundle = json.loads(artifacts["support_bundle_json"])
@@ -1195,17 +1260,34 @@ def reconstruct_combined_artifacts(artifacts: dict[str, str]) -> None:
         pages = {}
         for name, raw in artifacts.items():
             if name.startswith("data_lua_page_"):
-                pages[name.removeprefix("data_lua_page_")] = decode_webui_payload(raw)
+                if name.endswith("_error"):
+                    page = name.removeprefix("data_lua_page_").removesuffix("_error")
+                    pages[page] = {"ok": False, "error": raw.strip(), "page": page}
+                else:
+                    pages[name.removeprefix("data_lua_page_")] = decode_webui_payload(raw)
         if pages:
             artifacts["data_lua_pages_json"] = json.dumps(pages, sort_keys=True, default=str)
     if "query_lua_artifacts_json" not in artifacts:
         queries = {}
         for name, raw in artifacts.items():
             if name.startswith("query_lua_"):
-                query_name = name.removeprefix("query_lua_")
-                queries[query_name] = {"ok": True, **decode_query_payload(raw), "query": QUERY_LUA_QUERIES.get(query_name)}
+                if name.endswith("_error"):
+                    query_name = name.removeprefix("query_lua_").removesuffix("_error")
+                    queries[query_name] = {
+                        "ok": False,
+                        "error": raw.strip(),
+                        "query": QUERY_LUA_QUERIES.get(query_name),
+                    }
+                else:
+                    query_name = name.removeprefix("query_lua_")
+                    queries[query_name] = {
+                        "ok": True,
+                        **decode_query_payload(raw),
+                        "query": QUERY_LUA_QUERIES.get(query_name),
+                    }
         if queries:
             artifacts["query_lua_artifacts_json"] = json.dumps(queries, sort_keys=True, default=str)
+
 
 def artifact_name_from_path(path: Path) -> str:
     if path.name.endswith(".error.txt"):

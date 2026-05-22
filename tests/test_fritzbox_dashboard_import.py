@@ -1,14 +1,15 @@
 import io
 import json
 import time
-from types import SimpleNamespace
-from pathlib import Path
 import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
-from fritzbox_api_models import LiveCaptureRequest, SettingsRequest
 import fritzbox_wifi_dashboard as dashboard
+from fritzbox_api_models import LiveCaptureRequest, SettingsRequest
 from fritzbox_log_store import ingest_dataset, latest_snapshot
 
 
@@ -106,13 +107,15 @@ def test_api_docs_are_disabled_by_default(monkeypatch) -> None:
     app = dashboard.create_app()
 
     assert app.openapi_url is None
-    assert not any(route.path == "/docs" for route in app.routes)
+    assert not any(getattr(route, "path", "") == "/docs" for route in app.routes)
 
 
 def test_parser_rules_endpoint_exposes_registry(monkeypatch) -> None:
     monkeypatch.delenv("FRITZBOX_ALLOW_PUBLIC_BIND", raising=False)
     app = dashboard.create_app()
-    endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/parser-rules")
+    endpoint = next(
+        cast(Any, route).endpoint for route in app.routes if getattr(route, "path", "") == "/api/parser-rules"
+    )
 
     payload = json.loads(endpoint().body)
 
@@ -122,7 +125,9 @@ def test_parser_rules_endpoint_exposes_registry(monkeypatch) -> None:
 
 def test_live_80211_status_degrades_when_router_is_unreachable(monkeypatch) -> None:
     app = dashboard.create_app()
-    endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/live-80211/status")
+    endpoint = next(
+        cast(Any, route).endpoint for route in app.routes if getattr(route, "path", "") == "/api/live-80211/status"
+    )
     monkeypatch.setattr(
         dashboard,
         "fritz_connection_from_stored_settings",
@@ -138,7 +143,9 @@ def test_live_80211_status_degrades_when_router_is_unreachable(monkeypatch) -> N
 
 def test_live_80211_capture_degrades_when_router_is_unreachable(monkeypatch) -> None:
     app = dashboard.create_app()
-    endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/live-80211/capture")
+    endpoint = next(
+        cast(Any, route).endpoint for route in app.routes if getattr(route, "path", "") == "/api/live-80211/capture"
+    )
     monkeypatch.setattr(
         dashboard,
         "fritz_connection_from_stored_settings",
@@ -187,16 +194,16 @@ def test_public_bind_requires_api_token_for_api(monkeypatch) -> None:
     monkeypatch.delenv("FRITZBOX_API_TOKEN", raising=False)
 
     assert dashboard.api_auth_required()
-    assert not dashboard.request_has_api_token(SimpleNamespace(headers={}))
+    assert not dashboard.request_has_api_token(cast(Any, SimpleNamespace(headers={})))
 
 
 def test_configured_api_token_allows_api_access(monkeypatch) -> None:
     monkeypatch.setenv("FRITZBOX_ALLOW_PUBLIC_BIND", "1")
     monkeypatch.setenv("FRITZBOX_API_TOKEN", "test-token")
 
-    assert not dashboard.request_has_api_token(SimpleNamespace(headers={}))
-    assert dashboard.request_has_api_token(SimpleNamespace(headers={"authorization": "Bearer test-token"}))
-    assert dashboard.request_has_api_token(SimpleNamespace(headers={"x-api-token": "test-token"}))
+    assert not dashboard.request_has_api_token(cast(Any, SimpleNamespace(headers={})))
+    assert dashboard.request_has_api_token(cast(Any, SimpleNamespace(headers={"authorization": "Bearer test-token"})))
+    assert dashboard.request_has_api_token(cast(Any, SimpleNamespace(headers={"x-api-token": "test-token"})))
 
 
 def test_acquisition_job_manager_runs_pipeline_in_background(monkeypatch) -> None:

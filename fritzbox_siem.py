@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import datetime
 import json
 import re
 import sqlite3
-from typing import Any, Iterable
+from collections import defaultdict
+from collections.abc import Iterable
+from datetime import datetime
+from typing import Any
 
 from fritzbox_siem_parser import parse_fritzbox_log_message
-
 
 MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -93,11 +93,14 @@ def build_siem_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[st
     yield from host_filter_events(conn, run_id)
     yield from device_risk_events(conn, run_id)
     yield from security_advisory_events(conn, run_id)
+    yield from typed_artifact_events(conn, run_id)
     yield from raw_artifact_events(conn, run_id)
 
 
 def event_log_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
-    for row in select_dicts(conn, "SELECT * FROM event_log WHERE run_id = ? ORDER BY COALESCE(timestamp, '')", [run_id]):
+    for row in select_dicts(
+        conn, "SELECT * FROM event_log WHERE run_id = ? ORDER BY COALESCE(timestamp, '')", [run_id]
+    ):
         parsed = classify_router_log(row.get("message") or "", row.get("category") or "")
         fields = {
             "router_category": row.get("category"),
@@ -159,7 +162,9 @@ def wifi_connection_events(conn: sqlite3.Connection, run_id: int) -> Iterable[di
 
 def host_presence_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
     for row in observed_table_rows(conn, "hosts", "host", run_id):
-        event_time = row.get("last_activity") or row.get("last_connected") or row.get("last_seen") or row.get("first_seen")
+        event_time = (
+            row.get("last_activity") or row.get("last_connected") or row.get("last_seen") or row.get("first_seen")
+        )
         active = bool(row.get("active_now"))
         interface = clean(row.get("interface"))
         tags = ["asset", "presence", "active" if active else "inactive"]
@@ -302,26 +307,44 @@ def network_status_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dic
 def wan_port_mapping_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
     for row in select_dicts(conn, "SELECT * FROM wan_port_mappings WHERE run_id = ?", [run_id]):
         enabled = truthy(row.get("enabled"))
+        severity = wan_mapping_severity(row) if enabled else "info"
+        external = clean(row.get("external_port")) or "?"
+        internal = clean(row.get("internal_port")) or "?"
+        protocol = clean(row.get("protocol")) or "unknown"
+        remote_host = clean(row.get("remote_host"))
+        description = clean(row.get("description"))
         yield normalized_event(
             record_type="wan_port_mappings",
             record_id=row["id"],
             event_time=None,
             event_category="security",
-            event_kind="security.wan_port_mapping",
-            action="port_mapping",
+            event_kind="security.wan_port_mapping_enabled" if enabled else "security.wan_port_mapping_disabled",
+            action="wan_port_mapping",
             outcome="enabled" if enabled else "disabled",
-            severity="high" if enabled else "info",
+            severity=severity,
             hostname=None,
             mac=None,
             ip=row.get("internal_client"),
             interface="WAN",
-            protocol=row.get("protocol"),
+            protocol=protocol,
             source=row.get("source"),
             confidence="high",
             evidence_level=row.get("evidence_level"),
             evidence_note=row.get("evidence_note"),
-            message=f"WAN {row.get('protocol') or ''} {row.get('external_port') or ''} -> {row.get('internal_client') or ''}:{row.get('internal_port') or ''}",
-            tags=["security", "wan", "exposure", "enabled" if enabled else "disabled"],
+            message=(
+                f"WAN {protocol.upper()} {external} -> {row.get('internal_client') or 'unknown'}:{internal}"
+                + (f" ({description})" if description else "")
+                + (f" remote {remote_host}" if remote_host else "")
+            ),
+            tags=[
+                "security",
+                "wan",
+                "exposure",
+                "port_mapping",
+                "enabled" if enabled else "disabled",
+                slug(protocol),
+                f"wan_port_{external}",
+            ],
             fields=row,
         )
 
@@ -435,13 +458,15 @@ def device_risk_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[s
 def security_advisory_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
     for row in select_dicts(conn, "SELECT * FROM security_advisories WHERE run_id = ?", [run_id]):
         severity = clean(row.get("severity")) or "medium"
+        advisory_id = clean(row.get("advisory_id")) or "advisory"
+        advisory_kind = security_advisory_kind(row)
         yield normalized_event(
             record_type="security_advisories",
             record_id=row["id"],
             event_time=None,
             event_category="security",
-            event_kind=f"security.{slug(row.get('advisory_id') or 'advisory')}",
-            action="advisory",
+            event_kind=advisory_kind,
+            action=security_advisory_action(row),
             outcome=row.get("status") or "review",
             severity=severity,
             hostname=row.get("subject"),
@@ -454,9 +479,327 @@ def security_advisory_events(conn: sqlite3.Connection, run_id: int) -> Iterable[
             evidence_level=row.get("evidence_level"),
             evidence_note=row.get("evidence_note"),
             message=row.get("title") or row.get("recommendation"),
-            tags=["security", "advisory", severity, slug(row.get("category") or "")],
+            tags=[
+                "security",
+                "advisory",
+                severity,
+                slug(row.get("category") or ""),
+                slug(advisory_id),
+                *security_advisory_tags(row),
+            ],
             fields=row,
         )
+
+
+def typed_artifact_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
+    yield from wlan_station_state_events(conn, run_id)
+    yield from wlan_station_interval_events(conn, run_id)
+    yield from wlan_ap_client_events(conn, run_id)
+    yield from wlan_event_detail_events(conn, run_id)
+    yield from dhcp_lease_events(conn, run_id)
+    yield from generic_typed_artifact_events(conn, run_id)
+
+
+def wlan_station_state_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
+    if not table_exists(conn, "wlan_station_state_snapshots"):
+        return
+    for row in select_dicts(conn, "SELECT * FROM wlan_station_state_snapshots WHERE run_id = ?", [run_id]):
+        active = truthy(row.get("active"))
+        outcome = "active" if active else "known"
+        if clean(row.get("connect_state")) and not active:
+            outcome = "state_retained"
+        yield normalized_event(
+            record_type="wlan_station_state_snapshots",
+            record_id=row["id"],
+            event_time=row.get("observed_at") or row.get("last_seen"),
+            event_category="wifi",
+            event_kind="wifi.station_state_snapshot",
+            action="station_state_snapshot",
+            outcome=outcome,
+            severity="info",
+            hostname=row.get("hostname"),
+            mac=row.get("mac"),
+            ip=row.get("ip"),
+            interface=row.get("interface"),
+            protocol="802.11",
+            source=row.get("source"),
+            confidence="medium",
+            evidence_level=row.get("evidence_level"),
+            evidence_note=row.get("evidence_note"),
+            message=f"WLAN station snapshot {device_label(row)} on {row.get('interface') or 'unknown interface'}",
+            tags=["wifi", "station", "snapshot", outcome, "guest" if truthy(row.get("guest")) else ""],
+            fields=row,
+        )
+
+
+def wlan_station_interval_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
+    if not table_exists(conn, "wlan_station_intervals"):
+        return
+    for row in select_dicts(conn, "SELECT * FROM wlan_station_intervals WHERE run_id = ?", [run_id]):
+        disconnected_at = clean(row.get("disconnected_at"))
+        duration = seconds_between(row.get("connected_at"), disconnected_at)
+        fields = {**row, "duration_seconds": duration}
+        yield normalized_event(
+            record_type="wlan_station_intervals",
+            record_id=row["id"],
+            event_time=row.get("connected_at"),
+            event_category="wifi",
+            event_kind="wifi.station_history_interval",
+            action="station_interval",
+            outcome="completed" if disconnected_at else "open",
+            severity="info",
+            hostname=None,
+            mac=row.get("mac"),
+            ip=None,
+            interface=row.get("interface"),
+            protocol="802.11",
+            source=row.get("source"),
+            confidence="high",
+            evidence_level=row.get("evidence_level"),
+            evidence_note=row.get("evidence_note"),
+            message=(
+                f"WLAN station interval {row.get('mac') or 'unknown station'} on {row.get('interface') or 'unknown interface'} "
+                f"{row.get('connected_at') or '?'} -> {disconnected_at or 'open'}"
+            ),
+            tags=["wifi", "station", "interval", "session", "completed" if disconnected_at else "open"],
+            fields=fields,
+        )
+
+
+def wlan_ap_client_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
+    if not table_exists(conn, "wlan_ap_client_events"):
+        return
+    for row in select_dicts(conn, "SELECT * FROM wlan_ap_client_events WHERE run_id = ?", [run_id]):
+        semantics = ap_client_semantics(row)
+        yield normalized_event(
+            record_type="wlan_ap_client_events",
+            record_id=row["id"],
+            event_time=row.get("event_time"),
+            event_category="wifi",
+            event_kind=semantics["event_kind"],
+            action=semantics["action"],
+            outcome=semantics["outcome"],
+            severity=semantics["severity"],
+            hostname=None,
+            mac=row.get("mac"),
+            ip=None,
+            interface=row.get("interface"),
+            protocol="802.11",
+            source=row.get("source"),
+            confidence=semantics["confidence"],
+            evidence_level=row.get("evidence_level"),
+            evidence_note=row.get("evidence_note"),
+            message=row.get("message") or f"WLAN AP client {row.get('event_kind') or 'event'} {row.get('mac') or ''}",
+            tags=["wifi", "ap_client", *semantics["tags"]],
+            fields=row,
+        )
+
+
+def wlan_event_detail_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
+    if not table_exists(conn, "wlan_event_details"):
+        return
+    for row in select_dicts(conn, "SELECT * FROM wlan_event_details WHERE run_id = ?", [run_id]):
+        yield normalized_event(
+            record_type="wlan_event_details",
+            record_id=row["id"],
+            event_time=row.get("event_time"),
+            event_category="wifi",
+            event_kind="wifi.wlan_event_detail",
+            action="wlan_event_detail",
+            outcome="observed",
+            severity="info",
+            hostname=None,
+            mac=row.get("mac"),
+            ip=None,
+            interface=row.get("interface"),
+            protocol="802.11",
+            source=row.get("source"),
+            confidence="medium",
+            evidence_level=row.get("evidence_level"),
+            evidence_note=row.get("evidence_note"),
+            message=f"WLAN event detail {row.get('event_id') or ''} {row.get('details') or ''}".strip(),
+            tags=["wifi", "diagnostic", "wlan_events"],
+            fields=row,
+        )
+
+
+def dhcp_lease_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
+    if not table_exists(conn, "dhcp_leases"):
+        return
+    for row in select_dicts(conn, "SELECT * FROM dhcp_leases WHERE run_id = ?", [run_id]):
+        active = truthy(row.get("active"))
+        yield normalized_event(
+            record_type="dhcp_leases",
+            record_id=row["id"],
+            event_time=row.get("observed_at"),
+            event_category="network",
+            event_kind="network.dhcp_lease_observed",
+            action="dhcp_lease_observed",
+            outcome="active" if active else "retained",
+            severity="info",
+            hostname=row.get("hostname"),
+            mac=row.get("mac"),
+            ip=row.get("ip"),
+            interface=None,
+            protocol="DHCP",
+            source=row.get("source"),
+            confidence="medium",
+            evidence_level=row.get("evidence_level"),
+            evidence_note=row.get("evidence_note"),
+            message=f"DHCP lease {device_label(row)} {row.get('ip') or ''}".strip(),
+            tags=["network", "dhcp", "lease", "active" if active else "retained"],
+            fields=row,
+        )
+
+
+GENERIC_TYPED_ARTIFACT_EVENT_SPECS = {
+    "aha_device_states": ("iot", "iot.aha_device_state", "observed_at", "aha_device_state"),
+    "telephony_records": ("telephony", "telephony.record", "timestamp", "telephony_record"),
+}
+
+
+def generic_typed_artifact_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
+    for table, (category, kind, time_column, action) in GENERIC_TYPED_ARTIFACT_EVENT_SPECS.items():
+        if not table_exists(conn, table):
+            continue
+        for row in select_dicts(conn, f"SELECT * FROM {table} WHERE run_id = ?", [run_id]):
+            message = row.get("message") or row.get("summary") or row.get("name") or row.get("record_key")
+            yield normalized_event(
+                record_type=table,
+                record_id=row["id"],
+                event_time=row.get(time_column) or row.get("observed_at"),
+                event_category=category,
+                event_kind=kind,
+                action=action,
+                outcome=row.get("state") or "observed",
+                severity="info",
+                hostname=row.get("hostname") or row.get("name"),
+                mac=row.get("mac"),
+                ip=row.get("ip"),
+                interface=row.get("interface"),
+                protocol=None,
+                source=row.get("source"),
+                confidence="medium",
+                evidence_level=row.get("evidence_level"),
+                evidence_note=row.get("evidence_note"),
+                message=str(message or action),
+                tags=[category, action, slug(row.get("source") or "")],
+                fields=row,
+            )
+
+
+def wan_mapping_severity(row: dict[str, Any]) -> str:
+    port = clean(row.get("external_port"))
+    if port in {"22", "80", "443", "3389", "5900", "8080", "8443"}:
+        return "critical"
+    return "high"
+
+
+def security_advisory_kind(row: dict[str, Any]) -> str:
+    advisory_id = slug(row.get("advisory_id") or "advisory")
+    category = slug(row.get("category") or "")
+    text = f"{advisory_id} {category} {row.get('title') or ''} {row.get('subject') or ''}".casefold()
+    if "wan_port_mapping" in advisory_id:
+        return "security.wan_port_mapping_enabled"
+    if "user_remote_rights" in advisory_id or advisory_id in {
+        "query_lua_user_remote_rights",
+        "webui_user_remote_rights",
+    }:
+        return "security.user_remote_rights"
+    if "myfritz" in text:
+        return "security.myfritz_exposure"
+    if "wireguard" in text or "vpn" in text or "ipsec" in text:
+        return "security.vpn_exposure"
+    if (
+        "remote_admin" in advisory_id
+        or "remote_login" in advisory_id
+        or "remote access" in text
+        or "fernzugriff" in text
+    ):
+        return "security.remote_admin_exposure"
+    if "upnp" in advisory_id or "pcp" in advisory_id or "port sharing" in text:
+        return "security.automatic_port_sharing"
+    return f"security.{advisory_id or 'advisory'}"
+
+
+def security_advisory_action(row: dict[str, Any]) -> str:
+    kind = security_advisory_kind(row)
+    if kind == "security.user_remote_rights":
+        return "review_user_rights"
+    if kind in {
+        "security.remote_admin_exposure",
+        "security.myfritz_exposure",
+        "security.vpn_exposure",
+        "security.wan_port_mapping_enabled",
+        "security.automatic_port_sharing",
+    }:
+        return "review_exposure"
+    return "review_advisory"
+
+
+def security_advisory_tags(row: dict[str, Any]) -> list[str]:
+    kind = security_advisory_kind(row)
+    tags = []
+    if kind in {
+        "security.remote_admin_exposure",
+        "security.myfritz_exposure",
+        "security.vpn_exposure",
+        "security.wan_port_mapping_enabled",
+        "security.automatic_port_sharing",
+    }:
+        tags.append("exposure")
+    if kind == "security.user_remote_rights":
+        tags.extend(["user_rights", "remote_access"])
+    if kind == "security.vpn_exposure":
+        tags.append("vpn")
+    if kind == "security.myfritz_exposure":
+        tags.append("myfritz")
+    return tags
+
+
+def ap_client_semantics(row: dict[str, Any]) -> dict[str, Any]:
+    raw_kind = slug(row.get("event_kind") or "")
+    if raw_kind == "ap_sta_connected":
+        return ap_semantics("wifi.ap_sta_connected", "connect", "success", "info", ["connect", "ap_sta"], "high")
+    if raw_kind == "ap_sta_disconnected":
+        return ap_semantics(
+            "wifi.ap_sta_disconnected", "disconnect", "disconnected", "info", ["disconnect", "ap_sta"], "high"
+        )
+    if raw_kind in {"eapol_4way_completed", "wpa_pairwise_handshake", "wpa_group_handshake"}:
+        return ap_semantics("wifi.wpa_key_handshake", "wpa_handshake", "success", "info", ["handshake", "wpa"], "high")
+    if raw_kind == "radius_accounting_start":
+        return ap_semantics(
+            "wifi.radius_accounting_start", "accounting_start", "observed", "info", ["radius"], "medium"
+        )
+    if raw_kind in {"associated", "reassociated", "association_request_observed", "authenticated"}:
+        return ap_semantics("wifi.association_request", "associate", "observed", "info", ["association"], "medium")
+    if raw_kind in {"disassociated", "deauthenticated", "disconnected"}:
+        return ap_semantics(
+            "wifi.disconnected", "disconnect", "disconnected", "info", ["disconnect", "hostapd"], "high"
+        )
+    if "fail" in raw_kind or "reject" in raw_kind:
+        return ap_semantics("wifi.connection_failed", "connect", "failure", "medium", ["failure", "hostapd"], "medium")
+    return ap_semantics(
+        "wifi.ap_client_event", raw_kind or "ap_client_event", "observed", "info", ["hostapd"], "medium"
+    )
+
+
+def ap_semantics(
+    event_kind: str,
+    action: str,
+    outcome: str,
+    severity: str,
+    tags: list[str],
+    confidence: str,
+) -> dict[str, Any]:
+    return {
+        "event_kind": event_kind,
+        "action": action,
+        "outcome": outcome,
+        "severity": severity,
+        "tags": tags,
+        "confidence": confidence,
+    }
 
 
 def raw_artifact_events(conn: sqlite3.Connection, run_id: int) -> Iterable[dict[str, Any]]:
@@ -622,6 +965,8 @@ def insert_siem_event(conn: sqlite3.Connection, run_id: int, event: dict[str, An
             event["searchable"],
         ),
     )
+    if cursor.lastrowid is None:
+        raise RuntimeError("SIEM event insert did not return a row id")
     return int(cursor.lastrowid)
 
 
@@ -631,6 +976,8 @@ def build_siem_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]
         *build_failed_login_burst_correlations(events),
         *build_wifi_failure_burst_correlations(events),
         *build_wifi_session_fragment_correlations(events),
+        *build_station_interval_correlations(events),
+        *build_dhcp_lease_change_correlations(events),
         *build_exposure_correlations(events),
     ]
     return sorted(correlations, key=lambda row: (row["last_seen"] or "", row["event_count"]), reverse=True)
@@ -665,7 +1012,9 @@ def build_entity_rollup_correlations(events: list[dict[str, Any]]) -> list[dict[
 
 
 def build_failed_login_burst_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    failures = [event for event in events if event.get("event_kind") == "auth.login_failure" and event.get("event_time")]
+    failures = [
+        event for event in events if event.get("event_kind") == "auth.login_failure" and event.get("event_time")
+    ]
     return build_burst_correlations(
         failures,
         rule_id="auth.failed_login_burst",
@@ -679,7 +1028,9 @@ def build_failed_login_burst_correlations(events: list[dict[str, Any]]) -> list[
 
 
 def build_wifi_failure_burst_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    failures = [event for event in events if event.get("event_kind") == "wifi.connection_failed" and event.get("event_time")]
+    failures = [
+        event for event in events if event.get("event_kind") == "wifi.connection_failed" and event.get("event_time")
+    ]
     return build_burst_correlations(
         failures,
         rule_id="wifi.connection_failure_burst",
@@ -778,6 +1129,77 @@ def build_wifi_session_fragment_correlations(events: list[dict[str, Any]]) -> li
     return correlations
 
 
+def build_station_interval_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    intervals = [
+        event
+        for event in events
+        if event.get("event_kind") == "wifi.station_history_interval" and event.get("event_time")
+    ]
+    correlations: list[dict[str, Any]] = []
+    for event in intervals:
+        key = primary_correlation_key(event)
+        if not key:
+            continue
+        fields = load_json_dict(event.get("fields_json"))
+        disconnected_at = fields.get("disconnected_at")
+        duration = fields.get("duration_seconds")
+        label = best_entity_label([event]) or key
+        correlations.append(
+            make_correlation(
+                rule_id="wifi.station_history_interval",
+                correlation_type="session_fragment",
+                entity_key=key,
+                entity_label=label,
+                events=[event],
+                severity="info",
+                confidence=event.get("confidence") or "high",
+                summary=f"{label}: retained WLAN station interval from {event.get('event_time')} to {disconnected_at or 'open'}",
+                extra_fields={
+                    "duration_seconds": duration,
+                    "disconnected_at": disconnected_at,
+                    "reason": "FRITZ!Box support-data retained a station-history interval for this WLAN station.",
+                },
+                link_reason="Retained STATION_LIST interval evidence for this station.",
+            )
+        )
+    return correlations
+
+
+def build_dhcp_lease_change_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    leases = [event for event in events if event.get("event_kind") == "network.dhcp_lease_observed"]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in leases:
+        if meaningful_mac(event.get("mac")):
+            grouped[f"mac:{str(event['mac']).casefold()}"].append(event)
+
+    correlations: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        ips = sorted({str(event.get("ip")) for event in items if meaningful_ip(event.get("ip"))})
+        hostnames = sorted({str(event.get("hostname")) for event in items if clean(event.get("hostname"))})
+        if len(ips) < 2 and len(hostnames) < 2:
+            continue
+        label = best_entity_label(items) or key
+        correlations.append(
+            make_correlation(
+                rule_id="network.dhcp_lease_change",
+                correlation_type="rule_match",
+                entity_key=key,
+                entity_label=label,
+                events=items,
+                severity="low",
+                confidence=window_confidence(items),
+                summary=f"{label}: DHCP lease identity changed across retained lease rows",
+                extra_fields={
+                    "ips": ips,
+                    "hostnames": hostnames,
+                    "reason": "Same MAC appears with multiple retained DHCP lease IPs or hostnames in this run.",
+                },
+                link_reason="DHCP lease row included in same-MAC lease-change comparison.",
+            )
+        )
+    return correlations
+
+
 def wifi_session_marker(event: dict[str, Any]) -> bool:
     return is_wifi_connect_event(event) or is_wifi_disconnect_event(event)
 
@@ -788,9 +1210,7 @@ def is_wifi_connect_event(event: dict[str, Any]) -> bool:
     outcome = clean(event.get("outcome")) or ""
     if kind in {"wifi.connected", "wifi.ap_sta_connected"}:
         return True
-    if action in {"connect", "ap_sta_connected"} and outcome in {"success", "connected", "observed"}:
-        return True
-    return False
+    return action in {"connect", "ap_sta_connected"} and outcome in {"success", "connected", "observed"}
 
 
 def is_wifi_disconnect_event(event: dict[str, Any]) -> bool:
@@ -799,18 +1219,15 @@ def is_wifi_disconnect_event(event: dict[str, Any]) -> bool:
     outcome = clean(event.get("outcome")) or ""
     if kind in {"wifi.disconnected", "wifi.ap_sta_disconnected", "wifi.hostapd_disconnected"}:
         return True
-    if action in {"disconnect", "ap_sta_disconnected"} and outcome in {"success", "disconnected", "observed"}:
-        return True
-    return False
+    return action in {"disconnect", "ap_sta_disconnected"} and outcome in {"success", "disconnected", "observed"}
 
 
 def build_exposure_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     exposures = [event for event in events if actionable_exposure_event(event)]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for event in exposures:
-        key = primary_correlation_key(event)
-        if key:
-            grouped[key].append(event)
+        key = primary_correlation_key(event) or router_exposure_key(event)
+        grouped[key].append(event)
 
     correlations: list[dict[str, Any]] = []
     for key, items in grouped.items():
@@ -825,7 +1242,9 @@ def build_exposure_correlations(events: list[dict[str, Any]]) -> list[dict[str, 
                 severity=max((normalize_severity(item.get("severity")) for item in items), key=severity_weight),
                 confidence=window_confidence(items),
                 summary=f"{label}: router exposure indicator observed in {len(items)} events",
-                extra_fields={"reason": "UPnP/PCP/port-sharing or WAN mapping evidence observed."},
+                extra_fields={
+                    "reason": "Remote administration, MyFRITZ, VPN, UPnP/PCP, or WAN mapping evidence observed."
+                },
                 link_reason="Exposure-related event included in rule input.",
             )
         )
@@ -919,6 +1338,8 @@ def insert_siem_correlation(conn: sqlite3.Connection, run_id: int, row: dict[str
             row["searchable"],
         ),
     )
+    if cursor.lastrowid is None:
+        raise RuntimeError("SIEM correlation insert did not return a row id")
     return int(cursor.lastrowid)
 
 
@@ -976,6 +1397,11 @@ def with_update(base: dict[str, Any], **updates: Any) -> dict[str, Any]:
 
 def select_dicts(conn: sqlite3.Connection, sql: str, params: list[Any]) -> list[dict[str, Any]]:
     return [dict(row) for row in conn.execute(sql, params)]
+
+
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [table]).fetchone()
+    return row is not None
 
 
 def observed_table_rows(
@@ -1052,9 +1478,7 @@ def meaningful_ip(value: Any) -> bool:
         return False
     if parts[0] == 127:
         return False
-    if 224 <= parts[0] <= 239:
-        return False
-    return True
+    return not 224 <= parts[0] <= 239
 
 
 def parse_hostname(message: str, mac: str | None, ip: str | None) -> str | None:
@@ -1148,7 +1572,9 @@ def entity_label(hostname: str | None, mac: str | None, ip: str | None) -> str:
 
 
 def device_label(row: dict[str, Any]) -> str:
-    return entity_label(row.get("hostname") or row.get("friendly_name"), row.get("mac"), row.get("ip")) or "unknown device"
+    return (
+        entity_label(row.get("hostname") or row.get("friendly_name"), row.get("mac"), row.get("ip")) or "unknown device"
+    )
 
 
 def searchable_text(row: dict[str, Any]) -> str:
@@ -1171,6 +1597,14 @@ def load_json_list(value: str | None) -> list[str]:
     return [str(item) for item in payload] if isinstance(payload, list) else []
 
 
+def load_json_dict(value: str | None) -> dict[str, Any]:
+    try:
+        payload = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def correlation_event_links(events: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
     links = []
     for event in events:
@@ -1190,15 +1624,17 @@ def correlation_event_links(events: list[dict[str, Any]], reason: str) -> list[d
 
 def event_windows(events: list[dict[str, Any]], window_seconds: int, threshold: int) -> list[list[dict[str, Any]]]:
     windows: list[list[dict[str, Any]]] = []
-    parsed = [(event_time_seconds(event.get("event_time")), event) for event in events]
-    parsed = sorted((timestamp, event) for timestamp, event in parsed if timestamp is not None)
+    parsed: list[tuple[float, dict[str, Any]]] = []
+    for event in events:
+        timestamp = event_time_seconds(event.get("event_time"))
+        if timestamp is not None:
+            parsed.append((timestamp, event))
+    parsed.sort(key=lambda item: item[0])
     index = 0
     while index < len(parsed):
         start_time = parsed[index][0]
         window_pairs = [
-            (timestamp, event)
-            for timestamp, event in parsed[index:]
-            if 0 <= timestamp - start_time <= window_seconds
+            (timestamp, event) for timestamp, event in parsed[index:] if 0 <= timestamp - start_time <= window_seconds
         ]
         window = [event for _timestamp, event in window_pairs]
         if len(window) >= threshold:
@@ -1250,17 +1686,13 @@ def window_confidence(events: list[dict[str, Any]]) -> str:
 def correlation_keys(event: dict[str, Any]) -> list[str]:
     keys = []
     mac = clean(event.get("mac"))
-    if meaningful_mac(mac):
+    if mac and meaningful_mac(mac):
         keys.append(f"mac:{mac.casefold()}")
     ip = clean(event.get("ip"))
-    if meaningful_ip(ip):
+    if ip and meaningful_ip(ip):
         keys.append(f"ip:{ip.casefold()}")
     hostname = clean(event.get("hostname"))
-    if (
-        hostname
-        and event.get("record_type") in HOSTNAME_CORRELATION_RECORD_TYPES
-        and plausible_hostname(hostname)
-    ):
+    if hostname and event.get("record_type") in HOSTNAME_CORRELATION_RECORD_TYPES and plausible_hostname(hostname):
         keys.append(f"host:{hostname.casefold()}")
     return keys
 
@@ -1275,13 +1707,29 @@ def primary_correlation_key(event: dict[str, Any]) -> str | None:
 
 
 def actionable_exposure_event(event: dict[str, Any]) -> bool:
-    if event.get("event_kind") == "security.wan_port_mapping":
+    if event.get("event_kind") in {"security.wan_port_mapping", "security.wan_port_mapping_enabled"}:
         return event.get("outcome") == "enabled"
+    if event.get("event_kind") in {
+        "security.remote_admin_exposure",
+        "security.myfritz_exposure",
+        "security.vpn_exposure",
+        "security.user_remote_rights",
+        "security.automatic_port_sharing",
+    }:
+        return True
     if event.get("event_kind") != "security.exposure_event":
         return False
     if event.get("record_type") in {"wan_port_mappings", "hosts", "security_advisories"}:
         return True
     return bool(meaningful_mac(event.get("mac")) or meaningful_ip(event.get("ip")))
+
+
+def router_exposure_key(event: dict[str, Any]) -> str:
+    kind = clean(event.get("event_kind")) or "security.exposure"
+    if kind == "security.user_remote_rights":
+        subject = slug(event.get("hostname") or event.get("entity") or "")
+        return f"router:user_rights:{subject or 'unknown'}"
+    return f"router:{kind}"
 
 
 def best_entity_label(events: list[dict[str, Any]]) -> str | None:

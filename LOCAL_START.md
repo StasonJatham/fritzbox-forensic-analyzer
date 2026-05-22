@@ -1,6 +1,6 @@
 # Local Start
 
-Use this when running the FRITZ!Box Forensic Analyzer from a fresh checkout.
+Use this when running FRITZ!Box Forensik SIEM from a fresh checkout.
 
 ## 1. Open The Project
 
@@ -48,6 +48,9 @@ Runtime logs are written to `logs/fritzforensic.log`. For deeper acquisition deb
 ```bash
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check .
+.venv/bin/black --check .
+.venv/bin/python -m mypy .
+.venv/bin/pyright fritzbox_*.py tests
 ```
 
 ## 5. Start The Dashboard

@@ -1,19 +1,21 @@
-# FRITZ!Box Forensic Analyzer
+# FRITZ!Box Forensik SIEM
 
 <p align="center">
-  <img src="static/logo.svg" alt="FRITZ!Box Forensic Analyzer logo" width="128">
+  <img src="static/logo.svg" alt="FRITZ!Box Forensik SIEM logo" width="128">
 </p>
 
-Local FRITZ!Box forensic analysis for AVM router logs, WiFi connection history, host tables, TR-064 data, and retained raw evidence. The tool collects the data a FRITZ!Box still exposes, stores it in SQLite with full-text search, and presents it in a clean SOC analyst dashboard for timeline review, entity pivoting, and evidence validation.
+Local-first FRITZ!Box Forensik SIEM for AVM router evidence, retained FRITZ!OS logs, WiFi forensics, TR-064/Web UI artifacts, host history, and incident-response triage. The tool collects the evidence a FRITZ!Box still exposes, preserves raw artifacts, normalizes parser output into SQLite, indexes everything with full-text search, and presents it in a clean SOC analyst dashboard for timeline review, entity pivoting, correlation, and evidence validation.
 
-This project is built for local incident response and home-network forensics. It does not use packet capture and does not need tcpdump.
+This project is built for local incident response, home-network forensics, and small SOC-style router investigations. It is not a cloud SIEM and it does not need tcpdump for historical analysis.
+
+Search terms this project targets: FRITZ!Box SIEM, FritzBox forensics, FRITZ!Box Forensik, FRITZ!OS incident response, AVM router logs, WiFi forensics, TR-064 evidence, local SIEM, router forensic analyzer, home network security investigation.
 
 ## What It Does
 
 - Pulls retained FRITZ!Box logs, host tables, mesh state, WLAN association snapshots, broad read-only TR-064 data, internal Web UI Lua data, telephony call/phonebook artifacts, AHA smart-home state, encrypted configuration export metadata, and support-data diagnostics when available.
-- Stores raw artifacts, parsed events, host records, WiFi observations, and run metadata in SQLite.
-- Provides backend full-text search across logs, hosts, WiFi records, support findings, raw artifacts, entities, and timeline rows.
-- Shows an analyst dashboard with stored-evidence review, explicit acquisition runs, sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, and raw evidence drawers.
+- Stores raw artifacts, parser rows, normalized SIEM events, correlations, host records, WiFi observations, and run metadata in SQLite.
+- Provides backend full-text search across logs, SIEM events, correlations, hosts, WiFi records, support findings, raw artifacts, entities, and timeline rows.
+- Shows an analyst dashboard with stored-evidence review, explicit acquisition runs, sortable virtual tables, infinite scrolling, filters, charts, entity pivots, suspicion signals, SIEM correlations, and raw evidence drawers.
 - Exports raw artifacts and a forensic acquisition package for offline review.
 - Imports previously exported forensic packages or JSON datasets as separate analysis profiles, so analysts can switch between multiple FRITZ!Boxes without merging evidence into one dataset.
 - Preserves evidence confidence labels so exact log entries are not confused with inferred observations.
@@ -37,15 +39,16 @@ python docs/examples/support_data_download.py
 python docs/examples/sqlite_full_text_search.py "failed login"
 ```
 
-## Forensic Scope
+## Forensic SIEM Scope
 
-The analyzer is useful for FRITZ!Box forensic triage when the router is the only available data source. It can help answer questions such as:
+FRITZ!Box Forensik SIEM is useful when the router is the only available evidence source. It can help answer questions such as:
 
 - Which retained router events mention a client, IP address, hostname, MAC address, or login source?
 - Which devices were visible in the current host and mesh tables at acquisition time?
 - When did retained authentication, WAN reconnect, firmware, WLAN, or channel events occur?
 - Which events are exact raw log evidence and which are derived from current state?
 - Which failed login bursts, unknown usernames, unexpected admin sources, or new devices need analyst review?
+- Which typed parser rows were promoted into normalized SIEM events and correlations?
 
 ## Important Limits
 
@@ -153,6 +156,8 @@ The local SQLite database stores:
 - `export_runs`: acquisition metadata, router metadata, timestamp assumptions, and source endpoint inventory.
 - `raw_artifacts`: raw FRITZ!Box responses with SHA-256 hashes.
 - `event_log`: parsed retained router event log rows.
+- `siem_events`: normalized local SIEM events derived from retained logs and typed evidence.
+- `siem_correlations`: local correlation findings for bursts, sessions, exposure, and entity rollups.
 - `wifi_connections`: exact or inferred WiFi-related observations with confidence labels.
 - `hosts`: host table context from acquisition time.
 - `record_observations`: immutable observation snapshots for comparison across runs.

@@ -6,8 +6,8 @@ from fritzbox_log_store import (
     evidence_for_record,
     get_settings,
     ingest_dataset,
-    investigation_snapshot,
     init_db,
+    investigation_snapshot,
     latest_snapshot,
     list_runs,
     query_records,
@@ -1433,6 +1433,132 @@ def test_additional_evidence_extracts_from_raw_artifacts(tmp_path: Path) -> None
     assert risk["rows"][0]["risk_level"] == "medium"
 
 
+def test_webui_aha_and_telephony_artifacts_are_typed_from_raw_exports(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    query_lua = {
+        "wlan_stations": {
+            "ok": True,
+            "data": {
+                "wlan_stations": [
+                    {
+                        "mac": "AA:BB:CC:DD:EE:10",
+                        "ip": "192.0.2.10",
+                        "name": "StationPhone",
+                        "active": "1",
+                        "guest": "0",
+                        "ap": "1",
+                        "ssid": "LabNet",
+                        "rssi": "-51",
+                        "speed": "866",
+                    }
+                ]
+            },
+        },
+        "wlan_known_devices": {
+            "ok": True,
+            "data": {
+                "wlan_known_devices": [
+                    {
+                        "mac": "AA:BB:CC:DD:EE:11",
+                        "name": "KnownTablet",
+                        "active": "0",
+                        "guest": "1",
+                        "ssid": "GuestNet",
+                        "last_connected": "1779271200",
+                        "rssi": "-70",
+                    }
+                ]
+            },
+        },
+        "user_rights": {
+            "ok": True,
+            "data": {
+                "user_rights": [
+                    {
+                        "name": "admin",
+                        "enabled": "1",
+                        "box_admin": "1",
+                        "vpn_access": "1",
+                        "frominternet": "1",
+                    }
+                ]
+            },
+        },
+    }
+    data_lua = {
+        "wlanSta": {
+            "ok": True,
+            "data": {
+                "stations": [
+                    {
+                        "mac": "AA:BB:CC:DD:EE:12",
+                        "ip": "192.0.2.12",
+                        "name": "UiStation",
+                        "ssid": "LabNet",
+                        "rssi": "-48",
+                    }
+                ]
+            },
+        },
+        "netDhcp": {
+            "ok": True,
+            "data": {"leases": [{"hostname": "leasebox", "mac": "AA:BB:CC:DD:EE:13", "ip": "192.0.2.77"}]},
+        },
+        "wlanRadar": {"ok": True, "data": {"radar": {"channel": "52", "state": "active"}}},
+    }
+    phonebooks = {"0": """
+        <phonebooks><phonebook><contact><uniqueid>7</uniqueid><person><realName>Alice Example</realName></person>
+        <telephony><number type="home">+491234</number></telephony></contact></phonebook></phonebooks>
+        """}
+
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.0.2.1"},
+            "summary": {},
+            "raw_exports": {
+                "query_lua_artifacts_json": json.dumps(query_lua),
+                "data_lua_pages_json": json.dumps(data_lua),
+                "aha_device_stats_json": json.dumps(
+                    {"AIN123": "<devicestats><temperature><celsius>225</celsius></temperature></devicestats>"}
+                ),
+                "call_list_xml": """
+                <root><Call><Id>1</Id><Type>1</Type><Caller>+491111</Caller><Called>**1</Called>
+                <Name>Alice Example</Name><Date>20.05.26 12:00</Date><Duration>0:01</Duration></Call></root>
+                """,
+                "phonebooks_xml_json": json.dumps(phonebooks),
+            },
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+        },
+        db,
+    )
+
+    station = query_records(db, "StationPhone", "wlan_associations")
+    known = query_records(db, "KnownTablet", "wlan_associations")
+    ui_station = query_records(db, "UiStation", "wlan_association")
+    dhcp = query_records(db, "leasebox", "network_status")
+    dhcp_typed = query_records(db, "leasebox", "dhcp")
+    radar = query_records(db, "wlanRadar.radar.channel", "network_status")
+    aha = query_records(db, "AIN123 celsius 225", "network_status")
+    telephony = query_records(db, "Alice Example", "network_status")
+    telephony_typed = query_records(db, "Alice Example", "telephony")
+    rights = query_records(db, "admin", "security_advisories")
+
+    assert station["rows"][0]["signal_strength"] == "-51"
+    assert known["rows"][0]["guest"] == "1"
+    assert ui_station["rows"][0]["source"] == "data_lua_page_wlanSta"
+    assert dhcp["rows"][0]["area"] == "dhcp"
+    assert dhcp_typed["rows"][0]["ip"] == "192.0.2.77"
+    assert radar["rows"][0]["value"] == "52"
+    assert aha["rows"][0]["value"] == "225"
+    assert telephony["total"] >= 2
+    assert telephony_typed["total"] >= 2
+    assert rights["rows"][0]["advisory_id"] == "query_lua_user_remote_rights"
+
+
 def test_advertisement_hints_are_extracted_and_searchable(tmp_path: Path) -> None:
     db = tmp_path / "analysis.sqlite3"
     ingest_dataset(
@@ -1490,9 +1616,7 @@ def test_investigation_probe_telemetry_filters_kernel_probe_false_positive(tmp_p
             "window_hours": 100,
             "router": {"address": "192.0.2.1"},
             "summary": {},
-            "raw_exports": {
-                "support_data_txt": "0x80890570 q6v5_wcss_probe+0x18c/0x5e8 phys=0x0cb50000 ioremap"
-            },
+            "raw_exports": {"support_data_txt": "0x80890570 q6v5_wcss_probe+0x18c/0x5e8 phys=0x0cb50000 ioremap"},
             "support_findings": [
                 {
                     "finding_type": "key_value",
@@ -1511,7 +1635,7 @@ def test_investigation_probe_telemetry_filters_kernel_probe_false_positive(tmp_p
                     "timestamp": "2026-05-20T10:20:00+02:00",
                     "category": "wlan",
                     "message": "802.11 Probe Request from AA:BB:CC:DD:EE:FF near radio 1",
-                }
+                },
             ],
             "available_wifi_connections": [],
             "known_hosts": [],

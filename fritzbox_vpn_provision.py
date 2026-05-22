@@ -2,17 +2,16 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import re
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fritzbox_collectors import get_webui_sid
 from fritzbox_wifi_export import load_env_file
-
 
 DDNS_PLACEHOLDERS = ("<domain>", "<username>", "<pass>", "<ipaddr>")
 SENSITIVE_URL_KEY_RE = re.compile(r"(?i)([?&][^=&]*(?:pass|password|pwd|token|secret|key)[^=]*=)([^&#]+)")
@@ -355,9 +354,13 @@ def wireguard_steps(state: RouterVpnState, intent: WireGuardIntent, endpoint_dom
             )
         )
         return steps
-    existing_by_name = [peer for peer in state.wireguard_peers + state.vpn_connections if peer_name(peer) == intent.client_name]
+    existing_by_name = [
+        peer for peer in state.wireguard_peers + state.vpn_connections if peer_name(peer) == intent.client_name
+    ]
     existing_by_key = [
-        peer for peer in state.wireguard_peers if intent.client_public_key and peer.get("public_key") == intent.client_public_key
+        peer
+        for peer in state.wireguard_peers
+        if intent.client_public_key and peer.get("public_key") == intent.client_public_key
     ]
     if existing_by_name or existing_by_key:
         steps.append(
@@ -373,7 +376,8 @@ def wireguard_steps(state: RouterVpnState, intent: WireGuardIntent, endpoint_dom
     udp_rules = [
         rule
         for rule in state.port_rules
-        if str(rule.get("protocol", "")).upper() == "UDP" and str(rule.get("port") or rule.get("fwport")) == str(intent.endpoint_port)
+        if str(rule.get("protocol", "")).upper() == "UDP"
+        and str(rule.get("port") or rule.get("fwport")) == str(intent.endpoint_port)
     ]
     steps.append(
         ProvisionStep(

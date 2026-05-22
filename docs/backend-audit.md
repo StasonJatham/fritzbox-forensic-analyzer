@@ -15,7 +15,7 @@ Scope: FastAPI dashboard routes, acquisition/import helpers, collector URL fetch
 | Medium | Blocking router/network/capture work was performed inside async FastAPI handlers. | Fixed for live capture, polling, settings, and VPN planning by using sync route functions. |
 | Medium | JSON request payloads were raw dicts with route-local casts, causing weak validation and possible 500s. | Fixed: Pydantic request models now validate settings, polling, live capture, and VPN/DynDNS planner payloads. |
 | Low/Medium | Live capture worker could still be closing after a request returned. | Improved: capture bytes are lock-protected and partial data is discarded if the worker does not stop before timeout. |
-| Low | Backend modules are broad, especially `fritzbox_log_store.py`. | Open: current tests pass, but a later split into schema, ingestion, queries, analysis, and settings modules would make review easier. |
+| Low | Backend modules are broad, especially `fritzbox_log_store.py`. | Fixed: `fritzbox_log_store.py` is now a small compatibility facade. FritzBox typed-evidence table registration and aliases are split into `fritzbox_evidence_tables.py`, additional-evidence extraction/advisory derivation is split into `fritzbox_evidence_extractors.py`, local dashboard settings persistence is split into `fritzbox_settings_store.py`, SQLite schema setup/migrations are split into `fritzbox_store_schema.py`, record primitives are split into `fritzbox_store_records.py`, ingestion/write orchestration is split into `fritzbox_store_ingest.py`, search/timeline queries are split into `fritzbox_store_queries.py`, and snapshot views are split into overview, summary, investigation, and entity modules. |
 
 ## Notes
 

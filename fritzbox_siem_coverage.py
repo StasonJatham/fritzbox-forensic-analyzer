@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from argparse import ArgumentParser
 from collections import Counter, defaultdict
-import json
 from pathlib import Path
-import sqlite3
 from typing import Any
 
 from fritzbox_log_store import (
@@ -19,7 +19,6 @@ from fritzbox_log_store import (
 from fritzbox_parsers import FritzLogEntry, parse_data_lua_log, parse_device_log, parse_device_log_xml
 from fritzbox_siem import refresh_siem_views
 from fritzbox_siem_parser import list_parser_rules, parse_fritzbox_log_message
-
 
 EVIDENCE_TABLES = (
     "raw_artifacts",
@@ -36,9 +35,35 @@ EVIDENCE_TABLES = (
     "network_status_snapshots",
     "device_risk_summaries",
     "security_advisories",
+    "wlan_station_state_snapshots",
+    "wlan_station_intervals",
+    "wlan_ap_client_events",
+    "wlan_event_details",
+    "dhcp_leases",
+    "aha_device_states",
+    "telephony_records",
     "siem_events",
     "siem_correlations",
     "siem_correlation_events",
+)
+
+TYPED_ARTIFACT_TABLES = (
+    "host_filter_profiles",
+    "mesh_topology_links",
+    "wan_port_mappings",
+    "wlan_radios",
+    "wlan_associations",
+    "advertisement_hints",
+    "network_status_snapshots",
+    "device_risk_summaries",
+    "security_advisories",
+    "wlan_station_state_snapshots",
+    "wlan_station_intervals",
+    "wlan_ap_client_events",
+    "wlan_event_details",
+    "dhcp_leases",
+    "aha_device_states",
+    "telephony_records",
 )
 
 HIGH_VALUE_RAW_RULE_PREFIXES = ("wifi.", "auth.", "network.", "security.")
@@ -89,6 +114,7 @@ def audit_database(
             "repairs": repairs,
             "tables": table_counts(conn, selected_run_id),
             "raw_artifacts": raw_artifact_coverage(conn, selected_run_id),
+            "typed_artifacts": typed_artifact_coverage(conn, selected_run_id),
             "parser": parser_coverage(conn, selected_run_id),
             "correlation": correlation_coverage(conn, selected_run_id),
             "parser_rules": list_parser_rules(),
@@ -170,7 +196,7 @@ def promote_raw_logs_to_event_log(conn: sqlite3.Connection, run_id: int) -> dict
                     searchable,
                 ),
             )
-            row_id = int(cursor.lastrowid) if cursor.rowcount else None
+            row_id = int(cursor.lastrowid) if cursor.rowcount and cursor.lastrowid is not None else None
             if not row_id:
                 skipped += 1
                 continue
@@ -309,12 +335,127 @@ def raw_artifact_coverage(conn: sqlite3.Connection, run_id: int) -> dict[str, An
     ]
     present = {row["name"] for row in rows}
     error_rows = [row for row in rows if str(row["name"]).endswith("_error")]
+    attempts = acquisition_attempts(conn, run_id)
+    failed_attempts = [attempt for attempt in attempts if not attempt.get("ok")]
     return {
         "total": sum(int(row["count"]) for row in rows),
         "bytes": sum(int(row["bytes"] or 0) for row in rows),
         "present_names": rows,
         "missing_expected_names": [name for name in EXPECTED_RAW_ARTIFACTS if name not in present],
         "error_names": error_rows,
+        "attempt_count": len(attempts),
+        "failed_attempt_count": len(failed_attempts),
+        "failed_attempts": failed_attempts[:100],
+        "attempts_by_artifact": attempts_by_artifact(attempts),
+    }
+
+
+def acquisition_attempts(conn: sqlite3.Connection, run_id: int) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    for row in conn.execute(
+        """
+        SELECT name, content
+        FROM raw_artifacts
+        WHERE run_id = ? AND name IN ('acquisition_manifest_json', 'manifest_jsonl', 'acquisition_manifest_jsonl')
+        ORDER BY id
+        """,
+        [run_id],
+    ):
+        name = str(row["name"])
+        content = row["content"] or ""
+        if name.endswith("_jsonl") or name == "manifest_jsonl":
+            attempts.extend(manifest_jsonl_attempts(content))
+            continue
+        payload = load_json(content)
+        raw_attempts = payload.get("attempts") if isinstance(payload, dict) else []
+        if isinstance(raw_attempts, list):
+            attempts.extend([attempt for attempt in raw_attempts if isinstance(attempt, dict)])
+    return attempts
+
+
+def manifest_jsonl_attempts(content: str) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    for line in content.splitlines():
+        try:
+            attempt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(attempt, dict):
+            attempts.append(attempt)
+    return attempts
+
+
+def attempts_by_artifact(attempts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for attempt in attempts:
+        artifact = str(attempt.get("artifact") or "")
+        if not artifact:
+            continue
+        entry = grouped.setdefault(
+            artifact,
+            {"attempts": 0, "successful": 0, "failed": 0, "surfaces": [], "last_error": None},
+        )
+        entry["attempts"] += 1
+        if attempt.get("ok"):
+            entry["successful"] += 1
+        else:
+            entry["failed"] += 1
+            entry["last_error"] = attempt.get("error") or entry["last_error"]
+        surface = attempt.get("surface")
+        if surface and surface not in entry["surfaces"]:
+            entry["surfaces"].append(surface)
+    return grouped
+
+
+def typed_artifact_coverage(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
+    tables: list[dict[str, Any]] = []
+    for table in TYPED_ARTIFACT_TABLES:
+        if not table_exists(conn, table):
+            tables.append({"table": table, "exists": False, "count": 0, "sources": [], "evidence_levels": []})
+            continue
+        columns = table_columns(conn, table)
+        count = count_table(conn, table, run_id)
+        sources = []
+        if "source" in columns:
+            sources = counter_query(
+                conn,
+                f"""
+                SELECT COALESCE(source, 'unknown') AS label, COUNT(*) AS count
+                FROM {table}
+                WHERE run_id = ?
+                GROUP BY label
+                ORDER BY count DESC, label
+                LIMIT 20
+                """,
+                [run_id],
+            )
+        evidence_levels = []
+        if "evidence_level" in columns:
+            evidence_levels = counter_query(
+                conn,
+                f"""
+                SELECT COALESCE(evidence_level, 'unknown') AS label, COUNT(*) AS count
+                FROM {table}
+                WHERE run_id = ?
+                GROUP BY label
+                ORDER BY count DESC, label
+                """,
+                [run_id],
+            )
+        tables.append(
+            {
+                "table": table,
+                "exists": True,
+                "count": count,
+                "sources": sources,
+                "evidence_levels": evidence_levels,
+            }
+        )
+    return {
+        "tables": tables,
+        "tables_with_rows": [row["table"] for row in tables if row["count"] > 0],
+        "empty_tables": [row["table"] for row in tables if row["exists"] and row["count"] == 0],
+        "missing_tables": [row["table"] for row in tables if not row["exists"]],
     }
 
 
@@ -477,6 +618,7 @@ def audit_findings(audit: dict[str, Any]) -> list[str]:
     raw = audit["raw_artifacts"]
     parser = audit["parser"]
     correlation = audit["correlation"]
+    typed = audit["typed_artifacts"]
 
     if tables.get("raw_artifacts", 0) == 0:
         findings.append("No raw artifacts are stored for the selected run.")
@@ -486,6 +628,15 @@ def audit_findings(audit: dict[str, Any]) -> list[str]:
         findings.append("Parsed evidence exists, but SIEM events/correlations have not been built for this run.")
     if raw["error_names"]:
         findings.append(f"{len(raw['error_names'])} artifact error row(s) were retained; inspect acquisition logs.")
+    if raw["failed_attempt_count"]:
+        findings.append(
+            f"{raw['failed_attempt_count']} acquisition endpoint attempt(s) failed; successful artifacts remain usable."
+        )
+    if typed["tables_with_rows"]:
+        findings.append(
+            f"Typed artifact tables populated: {', '.join(typed['tables_with_rows'][:8])}"
+            + ("." if len(typed["tables_with_rows"]) <= 8 else ", ...")
+        )
     if parser["stored_category_mismatches"]:
         findings.append("Some stored event categories differ from the shared parser classification.")
     if parser["raw_artifact_rule_hits"]["high_value_hits_not_in_event_log"]:
@@ -555,6 +706,12 @@ def format_markdown(audit: dict[str, Any]) -> str:
         f"- Stored artifact bytes: {audit['raw_artifacts']['bytes']}",
         f"- Missing expected artifact names: {len(audit['raw_artifacts']['missing_expected_names'])}",
         f"- Error artifact names: {len(audit['raw_artifacts']['error_names'])}",
+        f"- Failed endpoint attempts in manifest: {audit['raw_artifacts']['failed_attempt_count']}",
+        "",
+        "## Typed Artifacts",
+        f"- Typed tables with rows: {len(audit['typed_artifacts']['tables_with_rows'])}",
+        f"- Empty typed tables: {len(audit['typed_artifacts']['empty_tables'])}",
+        f"- Missing typed tables: {len(audit['typed_artifacts']['missing_tables'])}",
         "",
         "## Parser Coverage",
         f"- Event-log parser rules hit: {len(audit['parser']['event_log_rules'])}",

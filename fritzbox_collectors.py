@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
-from urllib.parse import urlencode, urljoin, urlparse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from urllib.parse import urlencode, urljoin, urlparse
 
 from fritzbox_parsers import parse_device_log_xml
 
@@ -161,7 +161,7 @@ MAX_WEBUI_ARTIFACT_BYTES = 2_000_000
 DEFAULT_WEBUI_TIMEOUT = 8
 DEFAULT_WEBUI_RETRY_TIMEOUT = 20
 DEFAULT_WEBUI_WORKERS = 1
-WEBUI_READONLY_ENDPOINTS = (
+WEBUI_READONLY_ENDPOINTS: tuple[tuple[str, str, dict[str, str]], ...] = (
     ("juis_boxinfo_xml", "/juis_boxinfo.xml", {}),
     ("login_sid_v2", "/login_sid.lua", {"version": "2"}),
     ("menu_data_lua", "/menus/menu_data.lua", {}),
@@ -260,7 +260,11 @@ def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | N
             manifest.add(key, "tr064_export_path", ok=False, service=service, action=action, error="empty path")
             continue
         path = append_query_params(str(path), query_params)
-        content = fetch_avm_path(address, port, path, fc=fc)
+        try:
+            content = fetch_avm_path(address, port, path, fc=fc)
+        except Exception as exc:
+            manifest.add(key, "tr064_export_path", ok=False, service=service, action=action, path=str(path), error=exc)
+            continue
         if content is not None:
             exports[key] = content
         manifest.add(key, "tr064_export_path", ok=content is not None, service=service, action=action, path=str(path))
@@ -292,7 +296,19 @@ def fetch_avm_exports(fc: Any, address: str, port: int, export_password: str | N
                 error="empty path",
             )
             continue
-        content = fetch_avm_path(address, port, str(path), fc=fc)
+        try:
+            content = fetch_avm_path(address, port, str(path), fc=fc)
+        except Exception as exc:
+            manifest.add(
+                key,
+                "tr064_export_path",
+                ok=False,
+                service=f"WLANConfiguration:{index}",
+                action="X_AVM-DE_GetWLANDeviceListPath",
+                path=str(path),
+                error=exc,
+            )
+            continue
         if content is not None:
             exports[key] = content
             wlan_device_lists[str(index)] = content
@@ -434,10 +450,7 @@ def fetch_support_data(fc: Any) -> str | None:
         if getattr(response, "status_code", None) != 200:
             continue
         content = getattr(response, "content", b"")
-        if not content:
-            text = getattr(response, "text", "")
-        else:
-            text = content.decode("utf-8", errors="replace")
+        text = getattr(response, "text", "") if not content else content.decode("utf-8", errors="replace")
         if is_support_data_response(text):
             return text
     return None
@@ -606,7 +619,9 @@ def fetch_webui_text(fc: Any, path: str, params: dict[str, Any], timeout: int | 
     session = getattr(getattr(http, "fc", None), "session", None)
     if session is None:
         return "", "missing HTTP session"
-    request_timeout = timeout or int(os.getenv("FRITZBOX_WEBUI_TIMEOUT", str(DEFAULT_WEBUI_TIMEOUT)) or DEFAULT_WEBUI_TIMEOUT)
+    request_timeout = timeout or int(
+        os.getenv("FRITZBOX_WEBUI_TIMEOUT", str(DEFAULT_WEBUI_TIMEOUT)) or DEFAULT_WEBUI_TIMEOUT
+    )
     url = f"{str(getattr(http, 'router_url', '')).rstrip('/')}/{path.lstrip('/')}"
     try:
         response = session.get(url, params=params, timeout=request_timeout)
@@ -744,7 +759,7 @@ def redacted_params(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def collect_tr064_snapshot(fc: Any) -> dict[str, Any]:
-    actions = [
+    actions: list[tuple[str, str, str, dict[str, Any]]] = [
         ("device_info", "DeviceInfo:1", "GetInfo", {}),
         ("time_info", "Time:1", "GetInfo", {}),
         ("user_interface", "UserInterface:1", "GetInfo", {}),
@@ -947,7 +962,10 @@ def fetch_telephony_exports(fc: Any, address: str, port: int) -> dict[str, str]:
     call_list = safe_call_action(fc, "X_AVM-DE_OnTel:1", "GetCallList", {})
     call_list_url = (call_list.get("response") or {}).get("NewCallListURL")
     if call_list_url:
-        content = fetch_avm_path(address, port, str(call_list_url), fc=fc)
+        try:
+            content = fetch_avm_path(address, port, str(call_list_url), fc=fc)
+        except Exception:
+            content = None
         if content is not None:
             exports["call_list_xml"] = content
 
@@ -959,7 +977,10 @@ def fetch_telephony_exports(fc: Any, address: str, port: int) -> dict[str, str]:
         url = (result.get("response") or {}).get("NewPhonebookURL")
         if not url:
             continue
-        content = fetch_avm_path(address, port, str(url), fc=fc)
+        try:
+            content = fetch_avm_path(address, port, str(url), fc=fc)
+        except Exception:
+            continue
         if content is not None:
             phonebook_exports[phonebook_id] = content
     if phonebook_exports:

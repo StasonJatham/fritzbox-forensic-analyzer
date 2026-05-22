@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from base64 import b64encode
-from dataclasses import dataclass
-from datetime import datetime
 import re
 import struct
 import threading
 import time
+from base64 import b64encode
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from fritzbox_collectors import get_webui_sid
-
 
 CAPTURE_INTERFACE_RE = re.compile(
     r"<th>(?P<label>[^<]+)</th>.*?<button[^>]+name=\"start\"[^>]+value=\"(?P<value>[^\"]+)\"",
@@ -40,10 +39,11 @@ class CaptureInterface:
 def list_capture_interfaces(fc: Any) -> dict[str, Any]:
     page = fetch_capture_page(fc)
     interfaces = parse_capture_interfaces(page)
+    preferred = preferred_capture_interface(interfaces)
     return {
         "available": bool(interfaces),
         "interfaces": [{"label": item.label, "value": item.value} for item in interfaces],
-        "preferred": preferred_capture_interface(interfaces).value if interfaces else "",
+        "preferred": preferred.value if preferred else "",
         "note": (
             "Realtime capture uses the hidden FRITZ!Box capture endpoint. It is live packet evidence only; "
             "it is not historical router log evidence."
@@ -210,9 +210,7 @@ def parse_pcap(data: bytes, observed_at: str) -> dict[str, Any]:
     elif magic not in {b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d"}:
         return {"available": False, "packet_count": 0, "frames": [], "error": "Capture is not a classic PCAP file."}
     try:
-        _version_major, _version_minor, _tz, _sigfigs, _snaplen, linktype = struct.unpack(
-            f"{endian}HHIIII", data[4:24]
-        )
+        _version_major, _version_minor, _tz, _sigfigs, _snaplen, linktype = struct.unpack(f"{endian}HHIIII", data[4:24])
     except struct.error:
         return {"available": False, "packet_count": 0, "frames": [], "error": "PCAP header is truncated."}
     offset = 24
@@ -272,9 +270,9 @@ def parse_80211_payload(
     body = payload[header_offset + 24 :]
     tags = parse_80211_tags(body)
     return {
-        "time": datetime.fromtimestamp(ts_sec + ts_usec / 1_000_000).astimezone().isoformat()
-        if ts_sec
-        else observed_at,
+        "time": (
+            datetime.fromtimestamp(ts_sec + ts_usec / 1_000_000).astimezone().isoformat() if ts_sec else observed_at
+        ),
         "event": event,
         "source_mac": mac_from_bytes(payload[header_offset + 10 : header_offset + 16]),
         "destination_mac": mac_from_bytes(payload[header_offset + 4 : header_offset + 10]),

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import re
-from typing import Any, Pattern
-
+from dataclasses import dataclass, field
+from re import Pattern
+from typing import Any
 
 MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -52,9 +52,7 @@ LOG_PATTERNS: tuple[LogPattern, ...] = (
     ),
     LogPattern(
         rule_id="wifi.eapol_4way_completed",
-        regex=compile_pattern(
-            r"\b(?P<interface>ath\d+|wlan\d+):\s+EAPOL-4WAY-HS-COMPLETED\s+(?P<mac>[0-9a-f:]{17})\b"
-        ),
+        regex=compile_pattern(r"\b(?P<interface>ath\d+|wlan\d+):\s+EAPOL-4WAY-HS-COMPLETED\s+(?P<mac>[0-9a-f:]{17})\b"),
         category="wifi",
         kind="wifi.eapol_4way_completed",
         action="wpa_handshake",
@@ -225,6 +223,23 @@ LOG_PATTERNS: tuple[LogPattern, ...] = (
         tags=("auth", "failure", "soap"),
     ),
     LogPattern(
+        rule_id="auth.fritzbox_ui_failure",
+        regex=compile_pattern(
+            r"(?=.*\b(?:FRITZ!?Box[-\s]?(?:Benutzeroberfl(?:[aä]|ae)che|user interface)|login_sid\.lua|web(?:ui| interface))\b)"
+            r"(?=.*\b(?:Anmeldung|Login|authentication|Kennwort|password)\b)"
+            r"(?=.*\b(?:fehlgeschlagen|gescheitert|falsch|invalid|wrong|failed|incorrect)\b)"
+            r"(?:.*?\b(?:Benutzer|user)\s+(?P<username>[^\s,;:]+))?"
+            r"(?:.*?\b(?:IP-Adresse|IP address|von|from)\s+(?P<ip>(?:\d{1,3}\.){3}\d{1,3}))?"
+        ),
+        category="auth",
+        kind="auth.login_failure",
+        action="login",
+        outcome="failure",
+        severity="medium",
+        tags=("auth", "failure", "fritzbox_ui"),
+        priority=70,
+    ),
+    LogPattern(
         rule_id="auth.digest_failure",
         regex=compile_pattern(r"\bcheck_async_auth\b.*?\bfailed\b.*?(?P<method>Digest|Basic)?"),
         category="auth",
@@ -260,6 +275,58 @@ LOG_PATTERNS: tuple[LogPattern, ...] = (
         outcome="success",
         severity="low",
         tags=("auth", "success"),
+    ),
+    LogPattern(
+        rule_id="security.remote_admin_enabled",
+        regex=compile_pattern(
+            r"\b(?:remote access|internet access to (?:the )?FRITZ!?Box|"
+            r"Zugriff aus dem Internet|Internetzugriff auf die FRITZ!?Box|Fernzugriff|HTTPS-Port)\b"
+            r".*\b(?:enabled|aktiv|eingeschaltet|freigegeben|port\s*(?P<port>\d{2,5}))\b"
+        ),
+        category="security",
+        kind="security.remote_admin_exposure",
+        action="remote_admin_exposure",
+        outcome="enabled",
+        severity="high",
+        tags=("security", "exposure", "remote_admin"),
+        priority=70,
+    ),
+    LogPattern(
+        rule_id="security.myfritz_enabled",
+        regex=compile_pattern(
+            r"\bMyFRITZ!?\b.*\b(?:enabled|aktiv|eingeschaltet|eingerichtet|registered|registriert|freigegeben)\b"
+        ),
+        category="security",
+        kind="security.myfritz_exposure",
+        action="myfritz_exposure",
+        outcome="enabled",
+        severity="medium",
+        tags=("security", "exposure", "myfritz"),
+        priority=75,
+    ),
+    LogPattern(
+        rule_id="security.wireguard_vpn",
+        regex=compile_pattern(r"\bWireGuard\b.*\b(?:enabled|aktiv|peer|handshake|connected|verbunden)\b"),
+        category="security",
+        kind="security.vpn_exposure",
+        action="vpn_exposure",
+        outcome="observed",
+        severity="low",
+        tags=("security", "exposure", "vpn", "wireguard"),
+        priority=75,
+    ),
+    LogPattern(
+        rule_id="security.vpn_enabled",
+        regex=compile_pattern(
+            r"\b(?:VPN|IPsec)\b.*\b(?:enabled|aktiv|connection|Verbindung|connected|verbunden|user)\b"
+        ),
+        category="security",
+        kind="security.vpn_exposure",
+        action="vpn_exposure",
+        outcome="observed",
+        severity="low",
+        tags=("security", "exposure", "vpn"),
+        priority=80,
     ),
     LogPattern(
         rule_id="network.dhcp",

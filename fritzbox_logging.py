@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path
 import re
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
-
 
 LOGGER_NAME = "fritzforensic"
 DEFAULT_LOG_FILE = Path("logs") / "fritzforensic.log"
@@ -55,9 +54,7 @@ def configure_logging(force: bool = False) -> None:
         )
         handler.setLevel(log_level())
         handler.setFormatter(
-            RedactingFormatter(
-                "%(asctime)s %(levelname)s %(name)s [%(process)d:%(threadName)s] %(message)s"
-            )
+            RedactingFormatter("%(asctime)s %(levelname)s %(name)s [%(process)d:%(threadName)s] %(message)s")
         )
         logger.addHandler(handler)
     _CONFIGURED = True

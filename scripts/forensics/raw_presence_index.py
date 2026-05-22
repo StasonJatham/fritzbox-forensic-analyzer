@@ -17,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-
 MAC_RE = r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}"
 IP_RE = r"\d{1,3}(?:\.\d{1,3}){3}"
 DEFAULT_TZ = timezone(timedelta(hours=2))
@@ -143,19 +142,9 @@ def build_host_maps(raw_dir: Path) -> tuple[dict[str, dict[str, str]], dict[str,
 
     def visit(item: Any) -> None:
         if isinstance(item, dict):
-            mac = (
-                item.get("mac")
-                or item.get("NewMACAddress")
-                or item.get("MACAddress")
-                or item.get("mac_address")
-            )
+            mac = item.get("mac") or item.get("NewMACAddress") or item.get("MACAddress") or item.get("mac_address")
             ip = item.get("ip") or item.get("NewIPAddress") or item.get("IPAddress")
-            name = (
-                item.get("name")
-                or item.get("hostname")
-                or item.get("NewHostName")
-                or item.get("HostName")
-            )
+            name = item.get("name") or item.get("hostname") or item.get("NewHostName") or item.get("HostName")
             if isinstance(mac, str) and re.fullmatch(MAC_RE, mac, re.IGNORECASE):
                 entry = by_mac.setdefault(normalize_mac(mac), {})
                 for key, value in {
@@ -515,9 +504,7 @@ def extract_events(
                 mac_match = re.search(rf"\bmac\s*=\s*({MAC_RE})", lines[previous], re.IGNORECASE)
                 if mac_match:
                     mac = mac_match.group(1)
-            observed = datetime.fromisoformat(match.group(1).replace(" ", "T")).replace(
-                tzinfo=DEFAULT_TZ
-            )
+            observed = datetime.fromisoformat(match.group(1).replace(" ", "T")).replace(tzinfo=DEFAULT_TZ)
             if in_window(observed, start, end):
                 add(
                     observed,
@@ -535,9 +522,7 @@ def extract_events(
             re.IGNORECASE,
         )
         if match:
-            observed = datetime.fromisoformat(match.group("ts").replace(" ", "T")).replace(
-                tzinfo=DEFAULT_TZ
-            )
+            observed = datetime.fromisoformat(match.group("ts").replace(" ", "T")).replace(tzinfo=DEFAULT_TZ)
             if in_window(observed, start, end):
                 add(
                     observed,
@@ -550,15 +535,12 @@ def extract_events(
                 )
 
         match = re.search(
-            rf"(?P<ts>2026-05-(?:15|16) \d\d:\d\d:\d\d\.\d+).*"
-            rf"Local STA interface (?P<mac>{MAC_RE}).*drop update",
+            rf"(?P<ts>2026-05-(?:15|16) \d\d:\d\d:\d\d\.\d+).*" rf"Local STA interface (?P<mac>{MAC_RE}).*drop update",
             line,
             re.IGNORECASE,
         )
         if match:
-            observed = datetime.fromisoformat(match.group("ts").replace(" ", "T")).replace(
-                tzinfo=DEFAULT_TZ
-            )
+            observed = datetime.fromisoformat(match.group("ts").replace(" ", "T")).replace(tzinfo=DEFAULT_TZ)
             if in_window(observed, start, end):
                 add(
                     observed,
@@ -655,14 +637,11 @@ def extract_events(
             current["networking_last_seen"] = int(match.group(1))
             current["networking_last_seen_line"] = line_no
         match = re.search(
-            r"(\d+)\s*/\s*(ath\d+)\s*/\s*(202605(?:15|16)-\d{6})\s*"
-            r"\(([^)]*)\)\s*/\s*(?:(202605(?:15|16)-\d{6}))?",
+            r"(\d+)\s*/\s*(ath\d+)\s*/\s*(202605(?:15|16)-\d{6})\s*" r"\(([^)]*)\)\s*/\s*(?:(202605(?:15|16)-\d{6}))?",
             line,
         )
         if match and current.get("mac"):
-            observed = datetime.strptime(match.group(3), "%Y%m%d-%H%M%S").replace(
-                tzinfo=DEFAULT_TZ
-            )
+            observed = datetime.strptime(match.group(3), "%Y%m%d-%H%M%S").replace(tzinfo=DEFAULT_TZ)
             if in_window(observed, start, end):
                 add(
                     observed,
@@ -754,10 +733,7 @@ def extract_events(
     # Neighbour ages.
     section_start, section_end = find_section(lines, "##### BEGIN SECTION neighbours")
     if section_start and section_end:
-        duration_pattern = (
-            r"(?:\d+\s+days?\s+)?\s*\d{1,2}:\d{2}(?::\d{2})?\s+"
-            r"(?:hours?|minutes?)|\d+\s+seconds?"
-        )
+        duration_pattern = r"(?:\d+\s+days?\s+)?\s*\d{1,2}:\d{2}(?::\d{2})?\s+" r"(?:hours?|minutes?)|\d+\s+seconds?"
         for line_no, line in enumerate(lines[section_start - 1 : section_end], section_start):
             macs = re.findall(MAC_RE, line, re.IGNORECASE)
             if not macs:
@@ -805,7 +781,7 @@ def grouped_summary(events: list[PresenceEvent]) -> list[dict[str, Any]]:
         key = event.mac or event.ip or event.device
         grouped[key].append(event)
     rows: list[dict[str, Any]] = []
-    for key, values in grouped.items():
+    for values in grouped.values():
         sorted_values = sorted(values, key=lambda item: item.observed_at)
         rows.append(
             {
@@ -934,15 +910,12 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "source_index.json").write_text(
-        json.dumps([asdict(entry) for entry in index_entries], indent=2, ensure_ascii=False)
-        + "\n"
+        json.dumps([asdict(entry) for entry in index_entries], indent=2, ensure_ascii=False) + "\n"
     )
     (args.out_dir / "presence_events.json").write_text(
         json.dumps([asdict(event) for event in events], indent=2, ensure_ascii=False) + "\n"
     )
-    (args.out_dir / "device_summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
-    )
+    (args.out_dir / "device_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     write_markdown(
         path=args.out_dir / "raw_device_presence_index.md",
         raw_dir=args.raw_dir,

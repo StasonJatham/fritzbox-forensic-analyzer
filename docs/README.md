@@ -1,6 +1,6 @@
-# FRITZ!Box Forensics Documentation
+# FRITZ!Box Forensik SIEM Documentation
 
-This directory documents the FRITZ!Box data surfaces used by this project, how raw artifacts map into SQLite evidence tables, and how to reproduce the important collection paths with small Python scripts.
+This directory documents the FRITZ!Box data surfaces used by FRITZ!Box Forensik SIEM, how raw artifacts map into SQLite evidence tables and normalized SIEM events, and how to reproduce the important collection paths with small Python scripts.
 
 The documentation is written for analysts and maintainers. It deliberately separates:
 

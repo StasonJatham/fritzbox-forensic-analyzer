@@ -10,11 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
-
 
 MAC_RE = r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}"
 IP_RE = r"\d{1,3}(?:\.\d{1,3}){3}"
@@ -198,9 +197,7 @@ def parse_station_histories(
         history_match = history_pattern.search(line)
         if not history_match or not current_mac:
             continue
-        observed = datetime.strptime(history_match.group(2), "%Y%m%d-%H%M%S").replace(
-            tzinfo=start.tzinfo
-        )
+        observed = datetime.strptime(history_match.group(2), "%Y%m%d-%H%M%S").replace(tzinfo=start.tzinfo)
         if start <= observed < end:
             meta = host_names.get(current_mac, {})
             events.append(
@@ -363,9 +360,7 @@ def parse_security_notifications(
         notified_match = re.search(r'notified_at\s*=\s*"([^"]+)";', line)
         if not notified_match or not current_mac:
             continue
-        observed = datetime.strptime(notified_match.group(1), "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=start.tzinfo
-        )
+        observed = datetime.strptime(notified_match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=start.tzinfo)
         if start <= observed < end:
             meta = host_names.get(current_mac, {})
             events.append(
@@ -520,10 +515,7 @@ def parse_neighbours(
     begin, finish = line_window(lines, "##### BEGIN SECTION neighbours", "##### END SECTION neighbours")
     current: dict[str, str | int] | None = None
     header_pattern = re.compile(rf"^\[(?P<mac>{MAC_RE})\](?P<rest>.*)$", re.IGNORECASE)
-    duration_pattern = (
-        r"(?:\d+\s+days?\s+)?\s*\d{1,2}:\d{2}(?::\d{2})?\s+"
-        r"(?:hours?|minutes?)|\d+\s+seconds?"
-    )
+    duration_pattern = r"(?:\d+\s+days?\s+)?\s*\d{1,2}:\d{2}(?::\d{2})?\s+" r"(?:hours?|minutes?)|\d+\s+seconds?"
     ip_pattern = re.compile(
         rf"^\s+(?P<ip>{IP_RE})\s+(?P<age>{duration_pattern})\b.*?\b(?P<mac>{MAC_RE})\b"
         rf"(?:\s+(?P<age2>{duration_pattern}))?",
@@ -627,9 +619,7 @@ def parse_media_discovery(
         match = pattern.search(line)
         if not match:
             continue
-        observed = datetime.fromisoformat(match.group("ts").replace(" ", "T")).replace(
-            tzinfo=start.tzinfo
-        )
+        observed = datetime.fromisoformat(match.group("ts").replace(" ", "T")).replace(tzinfo=start.tzinfo)
         if start <= observed < end:
             ip = match.group("ip")
             mac = mac_by_ip.get(ip, "")

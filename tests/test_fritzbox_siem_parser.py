@@ -17,9 +17,7 @@ def test_parse_hostapd_station_connection() -> None:
 
 
 def test_parse_fritzbox_wifi_connection_with_name_ip_and_mac() -> None:
-    parsed = parse_fritzbox_log_message(
-        "WLAN-Gerat angemeldet: Analyst-iPhone, 192.0.2.30, aa:bb:cc:dd:ee:ff"
-    )
+    parsed = parse_fritzbox_log_message("WLAN-Gerat angemeldet: Analyst-iPhone, 192.0.2.30, aa:bb:cc:dd:ee:ff")
 
     assert parsed["category"] == "wifi"
     assert parsed["kind"] == "wifi.connected"
@@ -37,6 +35,35 @@ def test_parse_support_auth_failure_keeps_source_ip() -> None:
     assert parsed["outcome"] == "failure"
     assert parsed["ip"] == "192.168.178.23"
     assert parsed["severity"] == "medium"
+
+
+def test_parse_fritzbox_ui_auth_failure_keeps_user_and_source_ip() -> None:
+    parsed = parse_fritzbox_log_message("FRITZ!Box-Benutzeroberflaeche: Login failed for user analyst from 192.0.2.42")
+    german = parse_fritzbox_log_message(
+        "Anmeldung an der FRITZ!Box-Benutzeroberflaeche von IP-Adresse 192.0.2.43 gescheitert."
+    )
+
+    assert parsed["category"] == "auth"
+    assert parsed["kind"] == "auth.login_failure"
+    assert parsed["outcome"] == "failure"
+    assert parsed["ip"] == "192.0.2.42"
+    assert parsed["fields"]["username"] == "analyst"
+    assert parsed["fields"]["parser_rule_id"] == "auth.fritzbox_ui_failure"
+    assert german["ip"] == "192.0.2.43"
+    assert german["fields"]["parser_rule_id"] == "auth.fritzbox_ui_failure"
+
+
+def test_parse_remote_access_exposure_rules_before_generic_security() -> None:
+    remote_admin = parse_fritzbox_log_message("Remote access to the FRITZ!Box enabled on HTTPS port 443")
+    myfritz = parse_fritzbox_log_message("MyFRITZ! service enabled for remote access")
+    wireguard = parse_fritzbox_log_message("WireGuard peer phone enabled, last handshake observed")
+
+    assert remote_admin["kind"] == "security.remote_admin_exposure"
+    assert remote_admin["severity"] == "high"
+    assert myfritz["kind"] == "security.myfritz_exposure"
+    assert "myfritz" in myfritz["tags"]
+    assert wireguard["kind"] == "security.vpn_exposure"
+    assert "wireguard" in wireguard["tags"]
 
 
 def test_parse_probe_request_as_nearby_discovery() -> None:
@@ -102,4 +129,6 @@ def test_parser_rule_registry_is_introspectable() -> None:
     assert "wifi.probe_request" in rule_ids
     assert "wifi.radius_accounting_start" in rule_ids
     assert "auth.soap_failure" in rule_ids
+    assert "security.remote_admin_enabled" in rule_ids
+    assert "security.wireguard_vpn" in rule_ids
     assert all("priority" in rule for rule in rules)

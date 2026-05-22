@@ -2,27 +2,28 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
-from datetime import datetime
 import hashlib
 import hmac
 import io
 import json
-from pathlib import Path
+import os
 import re
 import shutil
 import sqlite3
 import tempfile
 import threading
-from types import SimpleNamespace
+import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
-import zipfile
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import fritzbox_wifi_export as exporter
 from fritzbox_api_models import (
     LiveCaptureRequest,
     PollingRequest,
@@ -30,9 +31,7 @@ from fritzbox_api_models import (
     VpnProvisionPlanRequest,
     model_payload,
 )
-import fritzbox_wifi_export as exporter
 from fritzbox_live_capture import list_capture_interfaces, run_wlan_management_capture
-from fritzbox_logging import get_logger
 from fritzbox_log_store import (
     ADDITIONAL_EVIDENCE_TABLES,
     DEFAULT_DB,
@@ -41,8 +40,8 @@ from fritzbox_log_store import (
     evidence_for_record,
     get_settings,
     ingest_dataset,
-    investigation_snapshot,
     init_db,
+    investigation_snapshot,
     latest_snapshot,
     list_runs,
     query_entities,
@@ -51,13 +50,16 @@ from fritzbox_log_store import (
     save_settings,
     siem_search_facets,
 )
+from fritzbox_logging import get_logger
 from fritzbox_siem_parser import list_parser_rules
 from fritzbox_vpn_provision import (
     DynDnsIntent,
     ProvisionIntent,
     WireGuardIntent,
-    build_plan as build_vpn_provision_plan,
     discover_router_vpn_state_from_connection,
+)
+from fritzbox_vpn_provision import (
+    build_plan as build_vpn_provision_plan,
 )
 
 
@@ -83,15 +85,15 @@ logger = get_logger("dashboard")
 
 
 def api_docs_enabled() -> bool:
-    return exporter.os.getenv("FRITZBOX_ENABLE_API_DOCS", "").casefold() in {"1", "true", "yes", "on"}
+    return os.getenv("FRITZBOX_ENABLE_API_DOCS", "").casefold() in {"1", "true", "yes", "on"}
 
 
 def public_bind_allowed() -> bool:
-    return exporter.os.getenv("FRITZBOX_ALLOW_PUBLIC_BIND", "").casefold() in {"1", "true", "yes", "on"}
+    return os.getenv("FRITZBOX_ALLOW_PUBLIC_BIND", "").casefold() in {"1", "true", "yes", "on"}
 
 
 def configured_api_token() -> str:
-    return exporter.os.getenv(API_TOKEN_ENV, "").strip()
+    return os.getenv(API_TOKEN_ENV, "").strip()
 
 
 def api_auth_required() -> bool:
@@ -384,7 +386,9 @@ class AcquisitionJobManager:
             self._jobs[job.job_id] = job
             self._active_job_id = job.job_id
             self._latest_job_id = job.job_id
-            thread = threading.Thread(target=self._run, args=(job.job_id,), name=f"acquisition-{job.job_id[:8]}", daemon=True)
+            thread = threading.Thread(
+                target=self._run, args=(job.job_id,), name=f"acquisition-{job.job_id[:8]}", daemon=True
+            )
             thread.start()
             logger.info("acquisition job queued job_id=%s hours=%s", job.job_id, hours)
             return job.snapshot()
@@ -424,7 +428,9 @@ class AcquisitionJobManager:
             dataset = export_from_stored_settings(
                 self._jobs[job_id].hours,
                 self._jobs[job_id].include_disconnects,
-                progress_callback=lambda stage, status, details: self.update_stage(job_id, f"raw_{stage}", status, details),
+                progress_callback=lambda stage, status, details: self.update_stage(
+                    job_id, f"raw_{stage}", status, details
+                ),
             )
             self.update_stage(job_id, "raw_and_parse", "completed")
 
@@ -432,7 +438,7 @@ class AcquisitionJobManager:
             run_id = ingest_dataset(dataset, DEFAULT_DB)
             self.update_stage(job_id, "sqlite_ingest", "completed", {"run_id": run_id})
             self._mark_completed(job_id, run_id, dataset)
-        except BaseException as exc:
+        except Exception as exc:
             self._mark_failed(job_id, exc)
 
     def _active_job(self) -> AcquisitionJob | None:
@@ -472,7 +478,12 @@ class AcquisitionJobManager:
             job.active_stage = None
             if self._active_job_id == job_id:
                 self._active_job_id = None
-        logger.error("acquisition job failed job_id=%s error=%s", job_id, sanitized_error(exc), exc_info=(type(exc), exc, exc.__traceback__))
+        logger.error(
+            "acquisition job failed job_id=%s error=%s",
+            job_id,
+            sanitized_error(exc),
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 
 acquisition_jobs = AcquisitionJobManager()
@@ -485,7 +496,7 @@ def export_from_stored_settings(
 ) -> dict[str, Any]:
     args = stored_connection_args()
     return exporter.export_dataset(
-        SimpleNamespace(
+        argparse.Namespace(
             **vars(args),
             hours=hours,
             include_disconnects=include_disconnects,
@@ -494,19 +505,14 @@ def export_from_stored_settings(
     )
 
 
-def stored_connection_args() -> SimpleNamespace:
+def stored_connection_args() -> argparse.Namespace:
     exporter.load_env_file(Path(".env"))
     exporter.load_env_file(Path(".fritzbox.env"))
     stored = get_settings(DEFAULT_DB, include_secret=True)
-    args = SimpleNamespace(
-        address=stored.get("address")
-        or exporter.os.getenv("FRITZBOX_ADDRESS")
-        or exporter.os.getenv("FRITZBOX_IP")
-        or "192.168.178.1",
+    args = argparse.Namespace(
+        address=stored.get("address") or os.getenv("FRITZBOX_ADDRESS") or os.getenv("FRITZBOX_IP") or "192.168.178.1",
         user=None,
-        password=stored.get("password")
-        or exporter.os.getenv("FRITZBOX_PASSWORD")
-        or exporter.os.getenv("FRITZBOX_ADMIN_PASS"),
+        password=stored.get("password") or os.getenv("FRITZBOX_PASSWORD") or os.getenv("FRITZBOX_ADMIN_PASS"),
         port=49000,
         tls=False,
     )
@@ -565,16 +571,11 @@ def build_raw_artifacts_zip(path: Path = DEFAULT_DB) -> bytes:
     init_db(path).close()
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    rows = [
-        dict(row)
-        for row in conn.execute(
-            """
+    rows = [dict(row) for row in conn.execute("""
             SELECT id, run_id, name, sha256, content, created_at
             FROM raw_artifacts
             ORDER BY created_at DESC, id DESC
-            """
-        )
-    ]
+            """)]
     conn.close()
     if not rows:
         raise HTTPException(status_code=404, detail="No raw FRITZ!Box artifacts are stored yet. Run a fetch first.")
@@ -773,7 +774,9 @@ def create_app() -> FastAPI:
         if request.url.path.startswith("/api/") and api_auth_required() and not request_has_api_token(request):
             return JSONResponse(
                 status_code=401,
-                content={"detail": f"API token required. Send X-API-Token or Authorization: Bearer from {API_TOKEN_ENV}."},
+                content={
+                    "detail": f"API token required. Send X-API-Token or Authorization: Bearer from {API_TOKEN_ENV}."
+                },
             )
         return await call_next(request)
 
@@ -829,7 +832,9 @@ def create_app() -> FastAPI:
         hours: int = Query(default=24, ge=1, le=10000),
         include_disconnects: bool = True,
     ) -> JSONResponse:
-        logger.info("api export requested as background job hours=%s include_disconnects=%s", hours, include_disconnects)
+        logger.info(
+            "api export requested as background job hours=%s include_disconnects=%s", hours, include_disconnects
+        )
         return JSONResponse(json_safe(acquisition_jobs.start(hours, include_disconnects)), status_code=202)
 
     @app.get("/api/raw-artifacts/download")
@@ -1110,10 +1115,8 @@ def create_app() -> FastAPI:
     def api_get_settings() -> JSONResponse:
         settings = get_settings(DEFAULT_DB)
         if not settings.get("address"):
-            settings["address"] = (
-                exporter.os.getenv("FRITZBOX_ADDRESS") or exporter.os.getenv("FRITZBOX_IP") or "192.168.178.1"
-            )
-        env_has_password = bool(exporter.os.getenv("FRITZBOX_PASSWORD") or exporter.os.getenv("FRITZBOX_ADMIN_PASS"))
+            settings["address"] = os.getenv("FRITZBOX_ADDRESS") or os.getenv("FRITZBOX_IP") or "192.168.178.1"
+        env_has_password = bool(os.getenv("FRITZBOX_PASSWORD") or os.getenv("FRITZBOX_ADMIN_PASS"))
         settings["has_password"] = bool(settings.get("has_password") or env_has_password)
         settings["password_source"] = (
             "saved"

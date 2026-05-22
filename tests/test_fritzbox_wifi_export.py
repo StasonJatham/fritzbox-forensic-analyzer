@@ -5,9 +5,9 @@ from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "fritzbox_wifi_export.py"
 SPEC = importlib.util.spec_from_file_location("fritzbox_wifi_export", MODULE_PATH)
-fritzbox_wifi_export = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None
 assert SPEC.loader is not None
+fritzbox_wifi_export = importlib.util.module_from_spec(SPEC)
 sys.modules["fritzbox_wifi_export"] = fritzbox_wifi_export
 SPEC.loader.exec_module(fritzbox_wifi_export)
 
@@ -81,8 +81,7 @@ def test_parse_support_steering_history_event() -> None:
 
 
 def test_parse_support_station_history_intervals() -> None:
-    observations = fritzbox_wifi_export.parse_support_wifi_observations(
-        """
+    observations = fritzbox_wifi_export.parse_support_wifi_observations("""
 ##### BEGIN SECTION STATION_LIST WLAN client list
   Station management: (is remote station = no)
     mac                     = 2E:3D:37:89:BA:3A
@@ -90,16 +89,66 @@ def test_parse_support_station_history_intervals() -> None:
     (role /         if / connect (status initiator IEEE802.11ReasonCode) / disconnect (status initiator IEEE802.11ReasonCode) / wlan_mode / quality)
       301 /       ath0 /        20260516-111506 (0x00000001 0x09 0x0001) /           20260516-123809 (0x0000001F 0x01 0x0000) /      0x0E /      71
 ##### END SECTION STATION_LIST
-"""
-    )
+""")
     wifi = fritzbox_wifi_export.build_available_wifi_connections(observations, [], [])
 
     assert observations[0]["event"] == "station_history_interval"
     assert observations[0]["mac"] == "2e:3d:37:89:ba:3a"
     assert observations[0]["timestamp"] == "2026-05-16T11:15:06+02:00"
     assert observations[0]["disconnected_at"] == "2026-05-16T12:38:09+02:00"
+    assert observations[0]["duration_seconds"] == 4983
+    assert observations[0]["disconnect_reason_code"] == 0
     assert wifi[0]["derived_time_type"] == "80211_station_history_interval"
     assert wifi[0]["exact_connection_time_available"] is True
+    assert wifi[0]["disconnected_at"] == "2026-05-16T12:38:09+02:00"
+
+
+def test_parse_support_station_state_snapshot_fields() -> None:
+    observations = fritzbox_wifi_export.parse_support_wifi_observations(
+        """
+uptime = 100000
+##### BEGIN SECTION STATION_LIST WLAN client list
+  Station management: (is remote station = no)
+    mac                     = 2E:3D:37:89:BA:3A
+    station_visible         = 1
+    is_active               = true
+    is_guest                = 0
+    role_id                 = 301
+    if_name                 = ath0
+    connect_state           = 0x05
+    type                    = 11ax
+    last_seen               = 99940
+    cnt_connect_success     = 578
+    cnt_connect_fail        = 14
+    cnt_disconnect_forced   = 99
+    time_mean_connect       = 1029
+  Station connection:
+    bssid                   = 34:E1:A9:4D:58:EE
+    rssi                    = -47
+    quality                 = 83
+  Networking infos:
+    last_seen               = 45
+##### END SECTION STATION_LIST
+""",
+        "2026-05-20T12:00:00+02:00",
+    )
+    snapshots = [row for row in observations if row["event"] == "station_state_snapshot"]
+    wifi = fritzbox_wifi_export.build_available_wifi_connections(snapshots, [], [])
+
+    assert snapshots[0]["timestamp"] == "2026-05-20T11:59:15+02:00"
+    assert snapshots[0]["last_seen"] == "2026-05-20T11:59:15+02:00"
+    assert snapshots[0]["is_active"] is True
+    assert snapshots[0]["is_guest"] is False
+    assert snapshots[0]["station_visible"] is True
+    assert snapshots[0]["rssi"] == -47
+    assert snapshots[0]["quality"] == 83
+    assert snapshots[0]["bssid"] == "34:e1:a9:4d:58:ee"
+    assert snapshots[0]["role_id"] == 301
+    assert snapshots[0]["if_name"] == "ath0"
+    assert snapshots[0]["connect_state_id"] == 5
+    assert snapshots[0]["cnt_disconnect_forced"] == 99
+    assert wifi[0]["derived_time_type"] == "80211_station_state_snapshot"
+    assert wifi[0]["last_seen"] == "2026-05-20T11:59:15+02:00"
 
 
 def test_parse_support_wlan_events_table_rows() -> None:
@@ -111,6 +160,12 @@ def test_parse_support_wlan_events_table_rows() -> None:
     assert observations[0]["event"] == "wlan_event_table_row"
     assert observations[0]["mac"] == "ca:04:95:b2:4c:5b"
     assert observations[0]["timestamp"] == "2026-05-16T11:15:01+02:00"
+    assert observations[0]["event_id"] == 30005
+    assert observations[0]["radio_band_id"] == 1
+    assert observations[0]["rate_value"] == 286
+    assert observations[0]["channel_number"] == 0
+    assert observations[0]["details_hex"] == "0x00000601"
+    assert observations[0]["details_int"] == 1537
     assert wifi[0]["derived_time_type"] == "80211_wlan_events_table"
 
 
@@ -167,6 +222,40 @@ def test_parse_support_ap_handshake_and_association_request() -> None:
         "ap_sta_connected",
         "wpa_pairwise_handshake",
     ]
+
+
+def test_parse_support_hostapd_lifecycle_reason_codes() -> None:
+    entries = fritzbox_wifi_export.parse_device_log(
+        "2026-05-19 19:42:02.357 - ath1: STA ca:04:95:b2:4c:5b IEEE 802.11: authenticated\n"
+        "2026-05-19 19:42:02.446 - ath1: STA ca:04:95:b2:4c:5b IEEE 802.11: associated (aid 7)\n"
+        "2026-05-19 19:55:01.100 - ath1: STA ca:04:95:b2:4c:5b IEEE 802.11: reassociated (aid 8)\n"
+        "2026-05-19 19:59:52.227 - ath1: STA ca:04:95:b2:4c:5b IEEE 802.11: disassociated reason=4\n"
+        "2026-05-19 19:59:53.227 - ath1: STA ca:04:95:b2:4c:5b IEEE 802.11: deauthenticated reason=3\n"
+        "2026-05-19 20:00:00.000 - ath1: AP-STA-DISCONNECTED ca:04:95:b2:4c:5b reason=8"
+    )
+    events = [fritzbox_wifi_export.parse_wifi_event(entry, {}) for entry in entries]
+    wifi = fritzbox_wifi_export.build_available_wifi_connections(events, [], [])
+
+    assert [event["hostapd_action"] for event in events] == [
+        "auth",
+        "assoc",
+        "reassoc",
+        "disassoc",
+        "deauth",
+        "disconnected",
+    ]
+    assert events[1]["aid"] == 7
+    assert events[3]["reason_code"] == 4
+    assert events[3]["reason_name"] == "disassociated_due_to_inactivity"
+    assert events[4]["reason_code"] == 3
+    assert events[5]["reason_code"] == 8
+    assert events[5]["reason_name"] == "disassociated_leaving"
+    assert {row["derived_time_type"] for row in wifi} >= {
+        "80211_hostapd_assoc",
+        "80211_hostapd_reassoc",
+        "80211_hostapd_disassoc",
+        "80211_hostapd_deauth",
+    }
 
 
 def test_entry_to_dict_classifies_router_log() -> None:
@@ -245,8 +334,7 @@ def test_landevice_query_derives_ui_last_connected_time() -> None:
 
 
 def test_landevice_query_falls_back_to_query_lua_artifacts() -> None:
-    records = fritzbox_wifi_export.parse_landevice_query(
-        """
+    records = fritzbox_wifi_export.parse_landevice_query("""
         {
           "landevice_all": {
             "ok": true,
@@ -263,8 +351,7 @@ def test_landevice_query_falls_back_to_query_lua_artifacts() -> None:
             }
           }
         }
-        """
-    )
+        """)
 
     assert records[0]["hostname"] == "fallback-phone"
     assert records[0]["last_connected"].startswith("2026-05-02T")
@@ -272,8 +359,7 @@ def test_landevice_query_falls_back_to_query_lua_artifacts() -> None:
 
 def test_wlan_device_list_xml_creates_current_association_rows() -> None:
     records = fritzbox_wifi_export.parse_wlan_device_lists(
-        {
-            "wlan_device_list_xml_2": """
+        {"wlan_device_list_xml_2": """
             <List>
               <TotalAssociations>1</TotalAssociations>
               <Item>
@@ -288,8 +374,7 @@ def test_wlan_device_list_xml_creates_current_association_rows() -> None:
                 <AssociatedDeviceGuest>1</AssociatedDeviceGuest>
               </Item>
             </List>
-            """
-        },
+            """},
         "2026-05-20T12:00:00+02:00",
     )
     wifi = fritzbox_wifi_export.build_available_wifi_connections([], [], records)

@@ -18,7 +18,12 @@ def test_coverage_audit_reports_raw_parser_and_correlation_state(tmp_path: Path)
                 "support_data_txt": (
                     "2026-05-20 12:01:00.000 - ath0: AP-STA-CONNECTED aa:bb:cc:dd:ee:51\n"
                     "2026-05-20 12:02:00.000 - soap:check_async_auth failed from 192.0.2.20:1234\n"
-                )
+                ),
+                "acquisition_manifest_json": (
+                    '{"attempts":[{"artifact":"support_data_txt","surface":"support_data","ok":true},'
+                    '{"artifact":"data_lua_page_wlanSta","surface":"webui_data_lua","ok":false,'
+                    '"error":"timeout"}]}'
+                ),
             },
             "event_log": [
                 {
@@ -35,6 +40,14 @@ def test_coverage_audit_reports_raw_parser_and_correlation_state(tmp_path: Path)
                     "message": "soap:check_async_auth failed from 192.0.2.20:1234",
                 },
             ],
+            "wlan_station_state_snapshots": [
+                {
+                    "observed_at": "2026-05-20T12:03:00+02:00",
+                    "mac": "aa:bb:cc:dd:ee:51",
+                    "hostname": "phone",
+                    "source": "query_lua_wlan_stations",
+                }
+            ],
             "available_wifi_connections": [],
             "known_hosts": [],
         },
@@ -46,13 +59,20 @@ def test_coverage_audit_reports_raw_parser_and_correlation_state(tmp_path: Path)
     event_rules = {row["label"] for row in audit["parser"]["event_log_rules"]}
 
     assert audit["status"] == "ok"
-    assert audit["tables"]["raw_artifacts"] == 1
+    assert audit["tables"]["raw_artifacts"] == 2
     assert audit["tables"]["siem_events"] > 0
     assert "wifi.ap_sta_connected" in raw_rules
     assert "auth.soap_failure" in raw_rules
     assert "wifi.ap_sta_connected" in event_rules
     assert "auth.soap_failure" in event_rules
     assert audit["parser"]["raw_artifact_rule_hits"]["high_value_hits_not_in_event_log"] == []
+    assert audit["raw_artifacts"]["failed_attempt_count"] == 1
+    assert audit["raw_artifacts"]["attempts_by_artifact"]["data_lua_page_wlanSta"]["last_error"] == "timeout"
+    assert "wlan_station_state_snapshots" in audit["typed_artifacts"]["tables_with_rows"]
+    typed_row = next(
+        row for row in audit["typed_artifacts"]["tables"] if row["table"] == "wlan_station_state_snapshots"
+    )
+    assert typed_row["sources"] == [{"label": "query_lua_wlan_stations", "count": 1}]
 
 
 def test_coverage_audit_can_rebuild_missing_siem_views(tmp_path: Path) -> None:
@@ -101,9 +121,7 @@ def test_coverage_audit_can_promote_stored_support_logs_for_legacy_runs(tmp_path
             "window_hours": 100,
             "router": {"address": "192.168.178.1"},
             "summary": {},
-            "raw_exports": {
-                "support_data_txt": "2026-05-20 12:04:00.000 - ath0: AP-STA-CONNECTED aa:bb:cc:dd:ee:51"
-            },
+            "raw_exports": {"support_data_txt": "2026-05-20 12:04:00.000 - ath0: AP-STA-CONNECTED aa:bb:cc:dd:ee:51"},
             "event_log": [],
             "available_wifi_connections": [],
             "known_hosts": [],
