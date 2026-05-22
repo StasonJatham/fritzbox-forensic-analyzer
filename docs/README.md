@@ -14,6 +14,7 @@ The documentation is written for analysts and maintainers. It deliberately separ
 | Document | Purpose |
 |---|---|
 | [Data Sources](data-sources.md) | Endpoint-by-endpoint inventory of official TR-064, AVM export paths, internal Lua surfaces, support data, AHA, telephony, and configuration artifacts. |
+| [Architecture And Flowcharts](architecture.md) | Visual evidence pipeline, storage module map, SIEM normalization flow, analyst workflow, and trust model. |
 | [TR-064 Artifacts](tr064-artifacts.md) | Official service/action reference used by the collector. |
 | [Web UI Artifacts](webui-artifacts.md) | Internal `query.lua`, `data.lua`, and read-only Web UI artifact reference. |
 | [Support Data](support-data.md) | Support bundle sections and parser coverage. |

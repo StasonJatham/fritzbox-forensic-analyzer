@@ -25,6 +25,7 @@ Search terms this project targets: FRITZ!Box SIEM, FritzBox forensics, FRITZ!Box
 The [docs](docs/README.md) directory contains the detailed FRITZ!Box forensics reference:
 
 - [Data Sources](docs/data-sources.md): endpoint-by-endpoint mapping from FRITZ!Box surfaces to raw artifacts, parsed tables, forensic value, and caveats.
+- [Architecture And Flowcharts](docs/architecture.md): visual evidence pipeline, storage module map, SIEM normalization flow, analyst workflow, and source trust model.
 - [Evidence Model](docs/evidence-model.md): how raw artifacts become SQLite rows, FTS records, investigation results, and confidence labels.
 - [Python Examples](docs/python-examples.md): small scripts for TR-064, AVM export paths, `query.lua`, `data.lua`, support data, and SQLite FTS.
 - [Limitations](docs/limitations.md): what can and cannot be proven from retained FRITZ!Box data.

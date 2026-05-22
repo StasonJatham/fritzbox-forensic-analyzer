@@ -61,12 +61,19 @@ When answering “who was connected or seen near the AP between start and end”
 5. Separately show low-confidence discovery/proximity hints.
 6. State gaps and absence-of-evidence warnings.
 
-## Current Parser Priorities
+## Current Parser Coverage
 
-High-value improvements:
+The high-value parser backlog is now mostly implemented:
 
-- Dedicated WLAN observation table with interval start/end.
-- Preserve station state fields from support `STATION_LIST`.
-- Typed hostapd lifecycle table.
-- Typed `WLAN_EVENTS` fields: event ID, band, channel, rate, details.
-- Structured dmesg WLAN management events with low confidence.
+- Support `STATION_LIST` state is normalized into `wlan_station_state_snapshots`.
+- Retained station history intervals are normalized into `wlan_station_intervals` and promoted to `wifi_connections` / SIEM.
+- hostapd lifecycle rows are normalized into `wlan_ap_client_events`.
+- Support `WLAN_EVENTS` rows are normalized into `wlan_event_details`.
+- Common `query.lua` and `data.lua` WLAN station variants are promoted into typed station/association tables where present.
+
+Remaining firmware-dependent work:
+
+- Broaden real FRITZ!OS 7.x/8.x fixtures across more router models.
+- Improve uptime-relative timestamp handling for kernel-only WLAN lines.
+- Add more typed extraction for firmware-specific security pages such as `remoteAccess`, `vpn`, `wireguard`, and `diagnosisSecurity`.
+- Keep multicast and neighbor-table evidence as contextual unless the raw artifact can support a stronger claim.

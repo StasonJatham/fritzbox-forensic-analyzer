@@ -759,7 +759,7 @@ def create_app() -> FastAPI:
     redoc_url = "/redoc" if api_docs_enabled() else None
     openapi_url = "/openapi.json" if api_docs_enabled() else None
     app = FastAPI(
-        title="FRITZ!Box Forensic Analyzer",
+        title="FRITZ!Box Forensik SIEM",
         docs_url=docs_url,
         redoc_url=redoc_url,
         openapi_url=openapi_url,

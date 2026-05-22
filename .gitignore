@@ -31,6 +31,7 @@ acquisition-package*.zip
 
 # Local UI/debug artifacts
 .playwright-cli/
+.dashboard.pid
 output/
 dashboard-screenshot.png
 *.log

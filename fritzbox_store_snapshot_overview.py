@@ -62,6 +62,8 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             ),
             "hosts": int(conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]),
             "support_findings": int(conn.execute("SELECT COUNT(*) FROM support_findings").fetchone()[0]),
+            "siem_events": int(conn.execute("SELECT COUNT(*) FROM siem_events").fetchone()[0]),
+            "siem_correlations": int(conn.execute("SELECT COUNT(*) FROM siem_correlations").fetchone()[0]),
             "active_hosts": int(conn.execute("SELECT COUNT(*) FROM hosts WHERE active_now = 1").fetchone()[0]),
             "hosts_with_last_connected": int(
                 conn.execute(
@@ -104,6 +106,12 @@ def latest_snapshot(path: Path = DEFAULT_DB, run_id: str | int = "latest") -> di
             "wifi_connections": _run_record_count(conn, scoped_run_id, "wifi_connection", "wifi_connections"),
             "hosts": _run_record_count(conn, scoped_run_id, "host", "hosts"),
             "support_findings": _run_record_count(conn, scoped_run_id, "support_finding", "support_findings"),
+            "siem_events": int(
+                conn.execute("SELECT COUNT(*) FROM siem_events WHERE run_id = ?", [scoped_run_id]).fetchone()[0]
+            ),
+            "siem_correlations": int(
+                conn.execute("SELECT COUNT(*) FROM siem_correlations WHERE run_id = ?", [scoped_run_id]).fetchone()[0]
+            ),
             "active_hosts": _run_record_count(conn, scoped_run_id, "host", "hosts", "t.active_now = 1"),
             "hosts_with_last_connected": _run_record_count(
                 conn, scoped_run_id, "host", "hosts", "t.last_connected IS NOT NULL AND t.last_connected != ''"

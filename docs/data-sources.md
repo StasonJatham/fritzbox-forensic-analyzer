@@ -109,8 +109,11 @@ This is evidence that the FRITZ!Box saw a neighboring access point. It is not ev
 
 ## References
 
-- FRITZ! TR-064 overview: https://avm.de/fileadmin/user_upload/Global/Service/Schnittstellen/AVM_TR-064_overview.pdf
-- FRITZ! TR-064 first steps: https://avm.de/fileadmin/user_upload/Global/Service/Schnittstellen/AVM_TR-064_first_steps.pdf
+- FRITZ! development support and interface index: https://fritz.com/en-lu/pages/interfaces
+- FRITZ! TR-064 overview: https://fritz.support/resources/TR-064_Overview.pdf
+- FRITZ! TR-064 first steps: https://fritz.support/resources/TR-064_First_Steps.pdf
 - FRITZ! TR-064 AppSetup: https://fritz.support/resources/TR-064_App_Setup.pdf
 - FRITZ! TR-064 Remote Access: https://fritz.support/resources/TR-064_Remote_Access.pdf
+- FRITZ! AHA HTTP interface: https://fritz.support/resources/AHA-HTTP-Interface.pdf
+- FRITZ! Smart Home REST API: https://fritz.support/resources/SmarthomeRestApiFRITZOS82.html
 - FRITZ!Box Dynamic DNS help: https://help.avm.de/fritzbox.php?topic=hilfe_dyndns
