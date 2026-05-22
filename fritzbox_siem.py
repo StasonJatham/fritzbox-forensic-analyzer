@@ -24,6 +24,22 @@ HOSTNAME_CORRELATION_RECORD_TYPES = {
 MAX_CORRELATION_RECORD_REFS = 200
 MAX_CORRELATION_EVENT_LINKS = 500
 CORRELATION_RULE_VERSION = "1"
+WIFI_DEAUTH_EVENT_KINDS = {
+    "wifi.ap_sta_disconnected",
+    "wifi.deauthenticated",
+    "wifi.disassociated",
+}
+WIFI_DEAUTH_TAGS = {"deauth", "deauthenticated", "disassoc", "disassociated"}
+WIFI_DEAUTH_ACTIONS = {"deauth", "deauthenticate", "deauthenticated", "disassociate", "disassociated"}
+WIFI_DEAUTH_TEXT_MARKERS = (
+    "ap-sta-disconnected",
+    "deauth",
+    "de-auth",
+    "deauthenticated",
+    "disassoc",
+    "dis-associated",
+    "disassociated",
+)
 
 
 def refresh_siem_views(conn: sqlite3.Connection, run_id: int) -> dict[str, int]:
@@ -763,7 +779,12 @@ def ap_client_semantics(row: dict[str, Any]) -> dict[str, Any]:
         return ap_semantics("wifi.ap_sta_connected", "connect", "success", "info", ["connect", "ap_sta"], "high")
     if raw_kind == "ap_sta_disconnected":
         return ap_semantics(
-            "wifi.ap_sta_disconnected", "disconnect", "disconnected", "info", ["disconnect", "ap_sta"], "high"
+            "wifi.ap_sta_disconnected",
+            "disconnect",
+            "disconnected",
+            "info",
+            ["disconnect", "ap_sta", "hostapd", "management_frame"],
+            "high",
         )
     if raw_kind in {"eapol_4way_completed", "wpa_pairwise_handshake", "wpa_group_handshake"}:
         return ap_semantics("wifi.wpa_key_handshake", "wpa_handshake", "success", "info", ["handshake", "wpa"], "high")
@@ -773,7 +794,25 @@ def ap_client_semantics(row: dict[str, Any]) -> dict[str, Any]:
         )
     if raw_kind in {"associated", "reassociated", "association_request_observed", "authenticated"}:
         return ap_semantics("wifi.association_request", "associate", "observed", "info", ["association"], "medium")
-    if raw_kind in {"disassociated", "deauthenticated", "disconnected"}:
+    if raw_kind == "deauthenticated":
+        return ap_semantics(
+            "wifi.deauthenticated",
+            "deauthenticate",
+            "disconnected",
+            "medium",
+            ["disconnect", "deauth", "hostapd", "management_frame"],
+            "high",
+        )
+    if raw_kind == "disassociated":
+        return ap_semantics(
+            "wifi.disassociated",
+            "disassociate",
+            "disconnected",
+            "medium",
+            ["disconnect", "disassoc", "hostapd", "management_frame"],
+            "high",
+        )
+    if raw_kind == "disconnected":
         return ap_semantics(
             "wifi.disconnected", "disconnect", "disconnected", "info", ["disconnect", "hostapd"], "high"
         )
@@ -975,6 +1014,7 @@ def build_siem_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]
         *build_entity_rollup_correlations(events),
         *build_failed_login_burst_correlations(events),
         *build_wifi_failure_burst_correlations(events),
+        *build_wifi_deauth_burst_correlations(events),
         *build_wifi_session_fragment_correlations(events),
         *build_station_interval_correlations(events),
         *build_dhcp_lease_change_correlations(events),
@@ -1040,6 +1080,20 @@ def build_wifi_failure_burst_correlations(events: list[dict[str, Any]]) -> list[
         severity="medium",
         summary_action="WiFi connection failures",
         reason="Three or more WiFi connection failures for the same entity in 30 minutes.",
+    )
+
+
+def build_wifi_deauth_burst_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deauth_events = [event for event in events if is_wifi_deauth_event(event) and event.get("event_time")]
+    return build_burst_correlations(
+        deauth_events,
+        rule_id="wifi.deauth_burst",
+        correlation_type="alert",
+        window_seconds=10 * 60,
+        threshold=3,
+        severity="high",
+        summary_action="802.11 deauthentication/disassociation events",
+        reason="Three or more retained 802.11 deauthentication or disassociation events for the same entity in 10 minutes.",
     )
 
 
@@ -1217,9 +1271,43 @@ def is_wifi_disconnect_event(event: dict[str, Any]) -> bool:
     kind = clean(event.get("event_kind")) or ""
     action = clean(event.get("action")) or ""
     outcome = clean(event.get("outcome")) or ""
-    if kind in {"wifi.disconnected", "wifi.ap_sta_disconnected", "wifi.hostapd_disconnected"}:
+    if kind in {
+        "wifi.disconnected",
+        "wifi.ap_sta_disconnected",
+        "wifi.hostapd_disconnected",
+        "wifi.deauthenticated",
+        "wifi.disassociated",
+    }:
         return True
-    return action in {"disconnect", "ap_sta_disconnected"} and outcome in {"success", "disconnected", "observed"}
+    return action in {"disconnect", "ap_sta_disconnected", *WIFI_DEAUTH_ACTIONS} and outcome in {
+        "success",
+        "disconnected",
+        "observed",
+    }
+
+
+def is_wifi_deauth_event(event: dict[str, Any]) -> bool:
+    kind = clean(event.get("event_kind")) or ""
+    if kind in WIFI_DEAUTH_EVENT_KINDS:
+        return True
+
+    action = slug(event.get("action"))
+    if action in WIFI_DEAUTH_ACTIONS:
+        return True
+
+    tags = {slug(tag) for tag in load_json_list(event.get("tags_json"))}
+    if tags & WIFI_DEAUTH_TAGS:
+        return True
+
+    text = " ".join(
+        clean(value) or ""
+        for value in (
+            event.get("message"),
+            event.get("fields_json"),
+            event.get("searchable"),
+        )
+    ).casefold()
+    return any(marker in text for marker in WIFI_DEAUTH_TEXT_MARKERS)
 
 
 def build_exposure_correlations(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

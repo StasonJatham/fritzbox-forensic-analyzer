@@ -118,6 +118,75 @@ def test_fritzbox_siem_typed_rows_get_specific_semantics_and_correlations(tmp_pa
     assert "security.exposure_indicator" in rule_ids
 
 
+def test_deauthentication_burst_creates_siem_alert(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    station_mac = "aa:bb:cc:dd:ee:10"
+    ingest_dataset(
+        {
+            "generated_at": "2026-05-20T12:00:00+02:00",
+            "window_hours": 100,
+            "router": {"address": "192.168.178.1"},
+            "summary": {},
+            "raw_exports": {"device_log_xml": "<DeviceLog />"},
+            "event_log": [],
+            "available_wifi_connections": [],
+            "known_hosts": [],
+            "wlan_ap_client_events": [
+                {
+                    "event_time": "2026-05-20T12:01:00+02:00",
+                    "event_kind": "deauthenticated",
+                    "mac": station_mac,
+                    "interface": "ath0",
+                    "reason_code": "3",
+                    "source": "support_data_hostapd",
+                    "message": f"ath0: STA {station_mac} IEEE 802.11: deauthenticated reason=3",
+                },
+                {
+                    "event_time": "2026-05-20T12:04:00+02:00",
+                    "event_kind": "disassociated",
+                    "mac": station_mac,
+                    "interface": "ath0",
+                    "reason_code": "8",
+                    "source": "support_data_hostapd",
+                    "message": f"ath0: STA {station_mac} IEEE 802.11: disassociated reason=8",
+                },
+                {
+                    "event_time": "2026-05-20T12:08:00+02:00",
+                    "event_kind": "ap_sta_disconnected",
+                    "mac": station_mac,
+                    "interface": "ath0",
+                    "reason_code": "8",
+                    "source": "support_data_hostapd",
+                    "message": f"ath0: AP-STA-DISCONNECTED {station_mac} reason=8",
+                },
+            ],
+        },
+        db,
+    )
+
+    conn = init_db(db)
+    try:
+        events = fetch_events(conn)
+        alert = conn.execute("""
+            SELECT correlation_type, event_count, severity, summary, fields_json
+            FROM siem_correlations
+            WHERE rule_id = 'wifi.deauth_burst'
+            """).fetchone()
+    finally:
+        conn.close()
+
+    assert events["wifi.deauthenticated"]["action"] == "deauthenticate"
+    assert events["wifi.disassociated"]["action"] == "disassociate"
+    assert alert is not None
+    assert alert["correlation_type"] == "alert"
+    assert alert["event_count"] == 3
+    assert alert["severity"] == "high"
+    assert "deauthentication" in alert["summary"]
+    fields = json.loads(alert["fields_json"])
+    assert fields["threshold"] == 3
+    assert fields["window_seconds"] == 600
+
+
 def fetch_events(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     return {row["event_kind"]: row for row in conn.execute("""
             SELECT event_kind, action, outcome, severity, confidence, evidence_level, protocol, fields_json

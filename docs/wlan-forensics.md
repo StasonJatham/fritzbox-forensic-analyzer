@@ -68,6 +68,7 @@ The high-value parser backlog is now mostly implemented:
 - Support `STATION_LIST` state is normalized into `wlan_station_state_snapshots`.
 - Retained station history intervals are normalized into `wlan_station_intervals` and promoted to `wifi_connections` / SIEM.
 - hostapd lifecycle rows are normalized into `wlan_ap_client_events`.
+- Deauthentication/disassociation evidence is promoted into `wifi.deauthenticated`, `wifi.disassociated`, or AP-side disconnect SIEM events; three events for the same entity in 10 minutes trigger the `wifi.deauth_burst` alert correlation.
 - Support `WLAN_EVENTS` rows are normalized into `wlan_event_details`.
 - Common `query.lua` and `data.lua` WLAN station variants are promoted into typed station/association tables where present.
 
