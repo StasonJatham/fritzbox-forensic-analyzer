@@ -217,4 +217,17 @@ async function togglePolling() {
   await loadPolling();
 }
 
+async function setAlertState(correlationId, status, note = "") {
+  const response = await fetch(
+    `/api/alerts/${encodeURIComponent(correlationId)}/state?profile=${encodeURIComponent(state.profile)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status, note, resolved_by: "local analyst" })
+    }
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
+}
+
 setLoadRowsCallback(loadRows);

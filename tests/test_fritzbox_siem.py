@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
-from fritzbox_log_store import ingest_dataset, init_db
+import fritzbox_alerts
+from fritzbox_alerts import mark_alert_state, save_alert_webhook_settings
+from fritzbox_log_store import ingest_dataset, init_db, query_records
+from fritzbox_siem import refresh_siem_views
 
 
 def test_fritzbox_siem_typed_rows_get_specific_semantics_and_correlations(tmp_path: Path) -> None:
@@ -215,6 +219,69 @@ def test_deauthentication_burst_creates_siem_alert(tmp_path: Path) -> None:
     assert fields["burst_count"] == 3
 
 
+def test_alerts_can_be_resolved_and_reopened(tmp_path: Path) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    ingest_dataset(deauth_alert_dataset("2026-05-20T12:00:00+02:00"), db)
+
+    conn = init_db(db)
+    try:
+        alert_id = conn.execute("""
+            SELECT id
+            FROM siem_correlations
+            WHERE rule_id = 'possible_deauth_attack'
+            """).fetchone()["id"]
+    finally:
+        conn.close()
+
+    resolved = mark_alert_state(correlation_id=alert_id, status="resolved", note="Known test", path=db)
+    correlations = query_records(db, "possible_deauth_attack", "correlations", limit=10, offset=0)
+    row = correlations["rows"][0]
+
+    assert resolved["status"] == "resolved"
+    assert row["alert_status"] == "resolved"
+    assert row["resolution_note"] == "Known test"
+
+    reopened = mark_alert_state(correlation_id=alert_id, status="open", path=db)
+    assert reopened["status"] == "open"
+    assert reopened["resolved_at"] is None
+
+
+def test_alert_webhooks_are_optional_and_deduped(tmp_path: Path, monkeypatch: Any) -> None:
+    db = tmp_path / "analysis.sqlite3"
+    calls: list[dict[str, Any]] = []
+
+    def fake_send(url: str, payload: dict[str, Any]) -> tuple[str, int | None, str]:
+        calls.append({"url": url, "payload": payload})
+        return "delivered", 204, ""
+
+    monkeypatch.setattr(fritzbox_alerts, "send_alert_webhook", fake_send)
+    save_alert_webhook_settings(
+        {"enabled": True, "url": "https://hooks.example.test/fritzbox", "min_severity": "high"},
+        db,
+    )
+    ingest_dataset(deauth_alert_dataset("2026-05-20T12:00:00+02:00"), db)
+    conn = init_db(db)
+    try:
+        run_id = conn.execute("SELECT MAX(id) FROM export_runs").fetchone()[0]
+        refresh_siem_views(conn, run_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = init_db(db)
+    try:
+        deliveries = conn.execute("SELECT status, response_code FROM siem_alert_webhook_deliveries").fetchall()
+    finally:
+        conn.close()
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://hooks.example.test/fritzbox"
+    assert calls[0]["payload"]["rule_id"] == "possible_deauth_attack"
+    assert len(deliveries) == 1
+    assert deliveries[0]["status"] == "delivered"
+    assert deliveries[0]["response_code"] == 204
+
+
 def test_fritzbox_specific_wan_and_dhcp_alerts(tmp_path: Path) -> None:
     db = tmp_path / "analysis.sqlite3"
     ingest_dataset(
@@ -419,6 +486,55 @@ def test_fritzbox_auth_dns_and_wlan_counter_alerts(tmp_path: Path) -> None:
     assert wlan_alert["severity"] == "high"
     assert wlan_alert["entity_key"] == "mac:aa:bb:cc:dd:ee:40"
     assert json.loads(wlan_alert["fields_json"])["value"] == 125
+
+
+def deauth_alert_dataset(generated_at: str) -> dict[str, Any]:
+    station_mac = "aa:bb:cc:dd:ee:10"
+    return {
+        "generated_at": generated_at,
+        "window_hours": 100,
+        "router": {"address": "192.168.178.1"},
+        "summary": {},
+        "raw_exports": {"device_log_xml": "<DeviceLog />"},
+        "event_log": [],
+        "available_wifi_connections": [],
+        "known_hosts": [],
+        "wlan_ap_client_events": [
+            {
+                "event_time": "2026-05-20T12:01:00+02:00",
+                "event_kind": "deauthenticated",
+                "mac": station_mac,
+                "client_mac": station_mac,
+                "source_bssid": "34:e1:a9:4d:58:ee",
+                "channel": "6",
+                "interface": "ath0",
+                "reason_code": "3",
+                "source": "support_data_hostapd",
+                "message": f"ath0: STA {station_mac} IEEE 802.11: deauthenticated reason=3",
+            },
+            {
+                "event_time": "2026-05-20T12:04:00+02:00",
+                "event_kind": "disassociated",
+                "mac": station_mac,
+                "client_mac": station_mac,
+                "source_bssid": "34:e1:a9:4d:58:ee",
+                "channel": "6",
+                "interface": "ath0",
+                "reason_code": "8",
+                "source": "support_data_hostapd",
+                "message": f"ath0: STA {station_mac} IEEE 802.11: disassociated reason=8",
+            },
+            {
+                "event_time": "2026-05-20T12:08:00+02:00",
+                "event_kind": "ap_sta_disconnected",
+                "mac": station_mac,
+                "interface": "ath0",
+                "reason_code": "8",
+                "source": "support_data_hostapd",
+                "message": f"ath0: AP-STA-DISCONNECTED {station_mac} reason=8",
+            },
+        ],
+    }
 
 
 def fetch_events(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:

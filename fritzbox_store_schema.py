@@ -427,6 +427,38 @@ def init_db(
             FOREIGN KEY(event_id) REFERENCES siem_events(id)
         );
 
+        CREATE TABLE IF NOT EXISTS siem_alert_states (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            rule_id TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            window_start TEXT NOT NULL DEFAULT '',
+            window_end TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            resolved_at TEXT,
+            resolved_by TEXT,
+            note TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(run_id, rule_id, entity_key, window_start, window_end),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS siem_alert_webhook_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            rule_id TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            window_start TEXT NOT NULL DEFAULT '',
+            window_end TEXT NOT NULL DEFAULT '',
+            webhook_url_hash TEXT NOT NULL,
+            delivered_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            response_code INTEGER,
+            error TEXT,
+            UNIQUE(run_id, rule_id, entity_key, window_start, window_end, webhook_url_hash),
+            FOREIGN KEY(run_id) REFERENCES export_runs(id)
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
             record_type,
             record_id UNINDEXED,
@@ -712,6 +744,10 @@ def ensure_indexes(
         "CREATE INDEX IF NOT EXISTS idx_siem_correlations_rule ON siem_correlations(rule_id, correlation_type)",
         "CREATE INDEX IF NOT EXISTS idx_siem_correlation_events_correlation ON siem_correlation_events(correlation_id)",
         "CREATE INDEX IF NOT EXISTS idx_siem_correlation_events_event ON siem_correlation_events(event_id)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_alert_states_identity "
+        "ON siem_alert_states(run_id, rule_id, entity_key, window_start, window_end)",
+        "CREATE INDEX IF NOT EXISTS idx_siem_alert_deliveries_identity "
+        "ON siem_alert_webhook_deliveries(run_id, rule_id, entity_key, window_start, window_end)",
     )
     for sql in indexes:
         conn.execute(sql)

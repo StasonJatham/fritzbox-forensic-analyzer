@@ -658,6 +658,8 @@ def query_records(
         rows = [dict(row) for row in conn.execute(sql, params)]
         if table == "hosts":
             enrich_host_activity(conn, rows, scoped_run_id)
+        if table == "siem_correlations":
+            enrich_alert_states(conn, rows)
     else:
         rows, total = _all_evidence_records(
             conn,
@@ -679,6 +681,34 @@ def query_records(
         )
     conn.close()
     return {"rows": rows, "total": total, "limit": limit, "offset": offset}
+
+
+def enrich_alert_states(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if row.get("correlation_type") != "alert":
+            continue
+        state = conn.execute(
+            """
+            SELECT status, resolved_at, resolved_by, note, updated_at
+            FROM siem_alert_states
+            WHERE run_id = ?
+              AND rule_id = ?
+              AND entity_key = ?
+              AND window_start = ?
+              AND window_end = ?
+            """,
+            [
+                row.get("run_id"),
+                row.get("rule_id") or "",
+                row.get("entity_key") or "",
+                row.get("window_start") or "",
+                row.get("window_end") or "",
+            ],
+        ).fetchone()
+        row["alert_status"] = state["status"] if state else "open"
+        row["resolved_at"] = state["resolved_at"] if state else ""
+        row["resolved_by"] = state["resolved_by"] if state else ""
+        row["resolution_note"] = state["note"] if state else ""
 
 
 def query_timeline(

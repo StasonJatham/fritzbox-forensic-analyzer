@@ -8,12 +8,18 @@ async function openEvidence(type, id) {
   const record = cleanRecord(payload.record || {});
   const artifacts = payload.artifacts || [];
   const title = record.message || record.summary || record.hostname || record.mac || record.ip || record.record_type || type;
+  const isAlert = type === "siem_correlations" && record.correlation_type === "alert";
+  const nextAlertState = record.alert_status === "resolved" ? "open" : "resolved";
+  const alertAction = isAlert
+    ? `<button class="row-action" data-action="alert-state" data-record-id="${escapeHtml(id)}" data-alert-status="${escapeHtml(nextAlertState)}">${escapeHtml(nextAlertState === "resolved" ? "Resolve Alert" : "Reopen Alert")}</button>`
+    : "";
   $("drawer-body").innerHTML = `
     <div class="drawer-summary">
       <div><span>Record</span><strong>${escapeHtml(display(title, "Evidence row"))}</strong></div>
       <div><span>Type</span><strong>${escapeHtml(evidenceLabel(type))}</strong></div>
       <div><span>Raw Matches</span><strong>${escapeHtml(artifacts.length)}</strong></div>
     </div>
+    ${alertAction ? `<div class="drawer-actions">${alertAction}</div>` : ""}
     <p class="section-title">Parsed Record</p>
     <pre>${escapeHtml(JSON.stringify(record, null, 2))}</pre>
     <p class="section-title">Raw Evidence</p>

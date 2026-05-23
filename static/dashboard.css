@@ -1613,6 +1613,16 @@
       color: #f4c054;
     }
 
+    .pill.open {
+      border-color: rgba(244, 84, 84, .5);
+      color: #ffaaaa;
+    }
+
+    .pill.resolved {
+      border-color: rgba(39, 166, 68, .45);
+      color: #8fe0a2;
+    }
+
     .pill.raw, .pill.parsed_from_raw {
       border-color: rgba(39, 166, 68, .45);
       color: #8fe0a2;
@@ -1693,6 +1703,12 @@
       color: var(--ink);
       font-size: 13px;
       overflow-wrap: anywhere;
+    }
+
+    .drawer-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin: 12px 0;
     }
 
     .drawer-head {

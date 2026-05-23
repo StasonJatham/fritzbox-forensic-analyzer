@@ -23,6 +23,18 @@ class SettingsRequest(BaseModel):
     tls: bool = False
 
 
+class AlertStateRequest(BaseModel):
+    status: str = Field(default="resolved", pattern="^(open|resolved)$")
+    note: str = Field(default="", max_length=2000)
+    resolved_by: str = Field(default="local analyst", max_length=255)
+
+
+class AlertWebhookSettingsRequest(BaseModel):
+    enabled: bool = False
+    url: str = Field(default="", max_length=4096)
+    min_severity: str = Field(default="high", pattern="^(info|low|medium|high|critical)$")
+
+
 class DynDnsRequest(BaseModel):
     enabled: bool = True
     provider: str = Field(default="user-defined", max_length=128)

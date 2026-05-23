@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
+from fritzbox_alerts import dispatch_alert_webhooks
 from fritzbox_siem_parser import parse_fritzbox_log_message
 
 MAC_RE = re.compile(r"\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b")
@@ -66,7 +67,9 @@ def refresh_siem_views(conn: sqlite3.Connection, run_id: int) -> dict[str, int]:
     correlations = build_siem_correlations(events)
     correlation_event_count = 0
     for correlation in correlations:
+        correlation["run_id"] = run_id
         correlation_id = insert_siem_correlation(conn, run_id, correlation)
+        correlation["siem_correlation_id"] = correlation_id
         correlation_event_count += insert_siem_correlation_events(
             conn,
             run_id,
@@ -74,11 +77,13 @@ def refresh_siem_views(conn: sqlite3.Connection, run_id: int) -> dict[str, int]:
             correlation.get("_event_links", []),
         )
         add_siem_fts(conn, "siem_correlations", correlation_id, correlation["searchable"])
+    webhook_delivery_count = dispatch_alert_webhooks(conn, run_id, correlations)
 
     return {
         "siem_events": len(event_ids),
         "siem_correlations": len(correlations),
         "siem_correlation_events": correlation_event_count,
+        "siem_alert_webhooks": webhook_delivery_count,
     }
 
 

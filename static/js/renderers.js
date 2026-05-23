@@ -487,10 +487,10 @@ function renderAlertPivots(analysis = {}) {
   const rows = [
     {
       label: "SIEM alerts",
-      value: siemAlerts.total || 0,
-      meta: `${siemAlerts.high_or_critical || 0} critical/high correlation alert(s)`,
+      value: siemAlerts.open ?? siemAlerts.total ?? 0,
+      meta: `${siemAlerts.high_or_critical || 0} critical/high open / ${siemAlerts.resolved || 0} resolved`,
       view: "correlations",
-      level: siemAlerts.high_or_critical ? "high" : siemAlerts.total ? "medium" : "low"
+      level: siemAlerts.high_or_critical ? "high" : siemAlerts.open ? "medium" : "low"
     },
     {
       label: "Critical / high",

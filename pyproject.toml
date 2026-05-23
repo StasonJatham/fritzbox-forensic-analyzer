@@ -73,6 +73,7 @@ fritzbox-vpn-provision = "fritzbox_vpn_provision:main"
 [tool.setuptools]
 py-modules = [
   "fritzbox_api_models",
+  "fritzbox_alerts",
   "fritzbox_artifact_normalizers",
   "fritzbox_collectors",
   "fritzbox_evidence_extractors",

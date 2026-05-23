@@ -97,6 +97,8 @@ function evidenceLabel(value) {
     "network.dns_probe_timeout_burst": "DNS timeout burst",
     "wifi.station_high_connect_failures": "high WiFi failures",
     "wifi.station_forced_disconnect_counter": "forced WiFi disconnect counter",
+    open: "open",
+    resolved: "resolved",
     critical: "critical",
     UPnP: "UPnP",
     PCP: "PCP",

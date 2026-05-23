@@ -109,6 +109,18 @@ $("table").addEventListener("click", (event) => {
     openEvidence(action.dataset.recordType, action.dataset.recordId);
     return;
   }
+  if (action?.dataset.action === "alert-state") {
+    const nextStatus = action.dataset.alertStatus || "resolved";
+    setAlertState(action.dataset.recordId, nextStatus)
+      .then(async () => {
+        $("status").textContent = nextStatus === "resolved" ? "Alert marked resolved." : "Alert reopened.";
+        await Promise.all([loadRows(true), loadAnalysis()]);
+      })
+      .catch((error) => {
+        $("status").textContent = error.message || "Could not update alert state.";
+      });
+    return;
+  }
   if (action?.dataset.action === "entity") {
     openEntity(action.dataset.entity);
     return;
@@ -314,6 +326,7 @@ $("download-package").addEventListener("click", () => {
 $("artifact-download-raw").addEventListener("click", () => $("download-raw").click());
 $("artifact-download-package").addEventListener("click", () => $("download-package").click());
 $("save-settings").addEventListener("click", saveSettings);
+$("save-webhook").addEventListener("click", saveWebhookSettings);
 $("plan-vpn")?.addEventListener("click", planVpnProvision);
 $("toggle-poll").addEventListener("click", togglePolling);
 $("table").addEventListener("scroll", () => {
@@ -387,6 +400,20 @@ $("investigation-results")?.addEventListener("click", (event) => {
   openEvidenceFromEvent(event);
 });
 $("drawer-body").addEventListener("click", (event) => {
+  const action = event.target.closest("[data-action='alert-state']");
+  if (action) {
+    const nextStatus = action.dataset.alertStatus || "resolved";
+    setAlertState(action.dataset.recordId, nextStatus)
+      .then(async () => {
+        $("drawer").classList.remove("open");
+        $("status").textContent = nextStatus === "resolved" ? "Alert marked resolved." : "Alert reopened.";
+        await Promise.all([loadRows(true), loadAnalysis()]);
+      })
+      .catch((error) => {
+        $("status").textContent = error.message || "Could not update alert state.";
+      });
+    return;
+  }
   openEvidenceFromEvent(event);
 });
 $("drawer-close").addEventListener("click", () => $("drawer").classList.remove("open"));

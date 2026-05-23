@@ -554,18 +554,35 @@ def analysis_snapshot(
 
 def siem_alert_summary(conn: sqlite3.Connection, run_id: int | None) -> dict[str, Any]:
     params: list[Any] = []
-    where = "WHERE correlation_type = 'alert'"
+    where = "WHERE c.correlation_type = 'alert'"
     if run_id is not None:
-        where += " AND run_id = ?"
+        where += " AND c.run_id = ?"
         params.append(run_id)
-    total = int(conn.execute(f"SELECT COUNT(*) FROM siem_correlations {where}", params).fetchone()[0])
+    state_join = """
+        LEFT JOIN siem_alert_states s
+          ON s.run_id = c.run_id
+         AND s.rule_id = COALESCE(c.rule_id, '')
+         AND s.entity_key = c.entity_key
+         AND s.window_start = COALESCE(c.window_start, '')
+         AND s.window_end = COALESCE(c.window_end, '')
+    """
+    total = int(conn.execute(f"SELECT COUNT(*) FROM siem_correlations c {state_join} {where}", params).fetchone()[0])
+    open_total = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM siem_correlations c {state_join} {where} AND COALESCE(s.status, 'open') = 'open'",
+            params,
+        ).fetchone()[0]
+    )
+    resolved_total = total - open_total
     by_severity = [
         dict(row)
         for row in conn.execute(
             f"""
-            SELECT COALESCE(NULLIF(severity, ''), 'unknown') AS label, COUNT(*) AS count
-            FROM siem_correlations
+            SELECT COALESCE(NULLIF(c.severity, ''), 'unknown') AS label, COUNT(*) AS count
+            FROM siem_correlations c
+            {state_join}
             {where}
+              AND COALESCE(s.status, 'open') = 'open'
             GROUP BY label
             ORDER BY CASE label WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
                      count DESC
@@ -577,12 +594,15 @@ def siem_alert_summary(conn: sqlite3.Connection, run_id: int | None) -> dict[str
         dict(row)
         for row in conn.execute(
             f"""
-            SELECT id, rule_id, severity, entity_label, event_count, summary, first_seen, last_seen
-            FROM siem_correlations
+            SELECT c.id, c.rule_id, c.severity, c.entity_label, c.event_count, c.summary, c.first_seen, c.last_seen,
+                   COALESCE(s.status, 'open') AS alert_status
+            FROM siem_correlations c
+            {state_join}
             {where}
-            ORDER BY CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
-                     COALESCE(last_seen, first_seen, '' ) DESC,
-                     event_count DESC
+              AND COALESCE(s.status, 'open') = 'open'
+            ORDER BY CASE c.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                     COALESCE(c.last_seen, c.first_seen, '' ) DESC,
+                     c.event_count DESC
             LIMIT 8
             """,
             params,
@@ -591,6 +611,8 @@ def siem_alert_summary(conn: sqlite3.Connection, run_id: int | None) -> dict[str
     return {
         "available": total > 0,
         "total": total,
+        "open": open_total,
+        "resolved": resolved_total,
         "high_or_critical": sum(int(row["count"]) for row in by_severity if row.get("label") in {"critical", "high"}),
         "by_severity": by_severity,
         "top": top,

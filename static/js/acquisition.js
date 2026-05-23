@@ -159,6 +159,7 @@ async function loadSettings() {
     : settings.has_password
     ? "Saved local settings include a password. Leave password blank to keep it."
     : "No password saved yet. Settings are stored locally in fritzbox-analysis.sqlite3.";
+  await loadWebhookSettings();
 }
 
 async function saveSettings({ quiet = false } = {}) {
@@ -182,6 +183,37 @@ async function saveSettings({ quiet = false } = {}) {
   $("cfg-password").value = "";
   await loadSettings();
   if (!quiet) $("status").textContent = "Settings saved. Run acquisition when ready.";
+  return true;
+}
+
+async function loadWebhookSettings() {
+  const response = await fetch("/api/alert-webhook");
+  if (!response.ok) return;
+  const settings = await response.json();
+  $("webhook-enabled").checked = Boolean(settings.enabled);
+  $("webhook-url").value = settings.url || "";
+  $("webhook-min-severity").value = settings.min_severity || "high";
+}
+
+async function saveWebhookSettings() {
+  $("settings-note").textContent = "Saving webhook settings...";
+  const payload = {
+    enabled: $("webhook-enabled").checked,
+    url: $("webhook-url").value.trim(),
+    min_severity: $("webhook-min-severity").value
+  };
+  const response = await fetch("/api/alert-webhook", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    $("settings-note").textContent = await readError(response);
+    return false;
+  }
+  await loadWebhookSettings();
+  $("status").textContent = payload.enabled ? "Alert webhook enabled." : "Alert webhook disabled.";
+  $("settings-note").textContent = "Webhook settings are stored locally in fritzbox-analysis.sqlite3.";
   return true;
 }
 

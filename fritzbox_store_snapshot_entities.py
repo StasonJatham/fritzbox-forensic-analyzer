@@ -199,6 +199,28 @@ def evidence_for_record(path: Path = DEFAULT_DB, record_type: str = "", record_i
             )
         ]
         row["linked_events"] = linked
+        state = conn.execute(
+            """
+            SELECT status, resolved_at, resolved_by, note, updated_at
+            FROM siem_alert_states
+            WHERE run_id = ?
+              AND rule_id = ?
+              AND entity_key = ?
+              AND window_start = ?
+              AND window_end = ?
+            """,
+            [
+                row.get("run_id"),
+                row.get("rule_id") or "",
+                row.get("entity_key") or "",
+                row.get("window_start") or "",
+                row.get("window_end") or "",
+            ],
+        ).fetchone()
+        row["alert_status"] = state["status"] if state else ("open" if row.get("correlation_type") == "alert" else "")
+        row["resolved_at"] = state["resolved_at"] if state else ""
+        row["resolved_by"] = state["resolved_by"] if state else ""
+        row["resolution_note"] = state["note"] if state else ""
     if table == "event_log":
         linked = [
             dict(item)

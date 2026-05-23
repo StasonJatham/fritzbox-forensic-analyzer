@@ -33,14 +33,15 @@ const SIEM_EVENT_TABLE_SPEC = {
 
 const SIEM_CORRELATION_TABLE_SPEC = {
   defaultSort: "record_time",
-  widths: [230, 120, 180, 180, 90, 220, 520, 132],
+  widths: [230, 120, 110, 180, 180, 90, 220, 520, 170],
   headers: [
-    ["Entity", ""], ["Severity", "evidence_level"], ["First Seen", "record_time"],
+    ["Entity", ""], ["Severity", "evidence_level"], ["Status", ""], ["First Seen", "record_time"],
     ["Last Seen", ""], ["Events", ""], ["Categories", "record_type"],
     ["Summary", ""], ["Inspect", ""]
   ],
   rowCells: (row) => [
     row.entity_label || row.entity_key || siemEntity(row), pill(siemSeverity(row), siemSeverity(row)),
+    row.correlation_type === "alert" ? pill(row.alert_status || "open", row.alert_status || "open") : "",
     formatTime(row.first_seen || row.record_time), formatTime(row.last_seen || row.record_time),
     row.event_count || "", siemTags(row.categories_json || row.record_class),
     row.summary || siemMessage(row), rowAction(row)
@@ -282,9 +283,16 @@ function renderTable() {
 function rowAction(row) {
   const type = recordTypeForView(state.view, row);
   const id = recordIdForView(state.view, row, type);
+  const isAlert = type === "siem_correlations" && row.correlation_type === "alert";
+  const alertState = row.alert_status || "open";
+  const nextAlertState = alertState === "resolved" ? "open" : "resolved";
+  const alertButton = isAlert
+    ? `<button class="row-action" data-action="alert-state" data-record-id="${escapeHtml(id)}" data-alert-status="${escapeHtml(nextAlertState)}">${escapeHtml(nextAlertState === "resolved" ? "Resolve" : "Reopen")}</button>`
+    : "";
   return `
     <div class="row-actions">
       <button class="row-action" data-action="evidence" data-record-type="${escapeHtml(type)}" data-record-id="${escapeHtml(id)}">Inspect</button>
+      ${alertButton}
       <button class="row-action row-details-toggle" data-action="row-details" type="button" aria-expanded="false">Details</button>
     </div>
   `;

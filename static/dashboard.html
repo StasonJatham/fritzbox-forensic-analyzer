@@ -7,7 +7,7 @@
   <link rel="icon" href="/static/logo.svg?v=clean-logo" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/logo-192.png?v=clean-logo">
   <title>FRITZ!Box Forensik SIEM</title>
-  <link rel="stylesheet" href="/static/dashboard.css?v=mini-siem9">
+  <link rel="stylesheet" href="/static/dashboard.css?v=mini-siem10">
 </head>
 <body>
   <header>
@@ -47,6 +47,16 @@
         <label>Acquisition Window<select id="hours"><option value="24">24h</option><option value="168">7d</option><option value="720">30d</option><option value="3000" selected>All retained</option></select></label>
         <button id="save-settings" type="button">Save Settings</button>
         <button id="run-acquisition" type="button">Run Acquisition</button>
+        <label class="check-row"><input id="webhook-enabled" type="checkbox"> Alert webhook</label>
+        <label>Webhook URL<input id="webhook-url" type="url" placeholder="https://example.invalid/fritzbox-alerts"></label>
+        <label>Webhook Severity<select id="webhook-min-severity">
+          <option value="critical">Critical</option>
+          <option value="high" selected>High and above</option>
+          <option value="medium">Medium and above</option>
+          <option value="low">Low and above</option>
+          <option value="info">All alerts</option>
+        </select></label>
+        <button id="save-webhook" type="button">Save Webhook</button>
       </form>
       <div class="command-grid">
         <label>Profile<select id="profile"><option value="local">Local workspace</option></select></label>
@@ -446,16 +456,16 @@
     </div>
   </div>
   <!-- Classic scripts are intentionally ordered: state/utils -> table/renderers -> feature APIs -> navigation/app boot. -->
-  <script src="/static/js/state.js?v=mini-siem9"></script>
-  <script src="/static/js/utils.js?v=mini-siem9"></script>
-  <script src="/static/js/table.js?v=mini-siem9"></script>
-  <script src="/static/js/renderers.js?v=mini-siem9"></script>
-  <script src="/static/js/acquisition.js?v=mini-siem9"></script>
-  <script src="/static/js/live_capture.js?v=mini-siem9"></script>
-  <script src="/static/js/investigation_actions.js?v=mini-siem9"></script>
-  <script src="/static/js/api.js?v=mini-siem9"></script>
-  <script src="/static/js/drawer.js?v=mini-siem9"></script>
-  <script src="/static/js/navigation.js?v=mini-siem9"></script>
-  <script src="/static/js/app.js?v=mini-siem9"></script>
+  <script src="/static/js/state.js?v=mini-siem10"></script>
+  <script src="/static/js/utils.js?v=mini-siem10"></script>
+  <script src="/static/js/table.js?v=mini-siem10"></script>
+  <script src="/static/js/renderers.js?v=mini-siem10"></script>
+  <script src="/static/js/acquisition.js?v=mini-siem10"></script>
+  <script src="/static/js/live_capture.js?v=mini-siem10"></script>
+  <script src="/static/js/investigation_actions.js?v=mini-siem10"></script>
+  <script src="/static/js/api.js?v=mini-siem10"></script>
+  <script src="/static/js/drawer.js?v=mini-siem10"></script>
+  <script src="/static/js/navigation.js?v=mini-siem10"></script>
+  <script src="/static/js/app.js?v=mini-siem10"></script>
 </body>
 </html>

@@ -24,7 +24,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import fritzbox_wifi_export as exporter
+from fritzbox_alerts import get_alert_webhook_settings, mark_alert_state, save_alert_webhook_settings
 from fritzbox_api_models import (
+    AlertStateRequest,
+    AlertWebhookSettingsRequest,
     LiveCaptureRequest,
     PollingRequest,
     SettingsRequest,
@@ -716,6 +719,7 @@ def sqlite_backup_bytes(path: Path) -> bytes:
         source.execute("PRAGMA busy_timeout = 30000")
         source.backup(target)
         target.execute("UPDATE settings SET value = '[redacted from forensic package]' WHERE key = 'password'")
+        target.execute("UPDATE settings SET value = '[redacted from forensic package]' WHERE key = 'alert_webhook_url'")
         target.commit()
         return target.serialize()
     finally:
@@ -1128,6 +1132,35 @@ def create_app() -> FastAPI:
     @app.post("/api/settings")
     def api_save_settings(payload: SettingsRequest) -> JSONResponse:
         return JSONResponse(save_settings(model_payload(payload), DEFAULT_DB))
+
+    @app.get("/api/alert-webhook")
+    def api_get_alert_webhook() -> JSONResponse:
+        return JSONResponse(get_alert_webhook_settings(DEFAULT_DB))
+
+    @app.post("/api/alert-webhook")
+    def api_save_alert_webhook(payload: AlertWebhookSettingsRequest) -> JSONResponse:
+        try:
+            return JSONResponse(save_alert_webhook_settings(model_payload(payload), DEFAULT_DB))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/alerts/{correlation_id}/state")
+    def api_set_alert_state(
+        correlation_id: int, payload: AlertStateRequest, profile: str = PROFILE_LOCAL
+    ) -> JSONResponse:
+        try:
+            state = mark_alert_state(
+                correlation_id=correlation_id,
+                status=payload.status,
+                note=payload.note,
+                resolved_by=payload.resolved_by,
+                path=db_for_profile(profile),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(json_safe(state))
 
     @app.post("/api/vpn-provision/plan")
     def api_vpn_provision_plan(payload: VpnProvisionPlanRequest) -> JSONResponse:
